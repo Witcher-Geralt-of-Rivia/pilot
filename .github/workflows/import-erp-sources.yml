@@ -1,0 +1,79 @@
+name: Import attributed ERP source snapshots
+
+on:
+  push:
+    paths:
+      - .github/workflows/import-erp-sources.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  import-snapshots:
+    if: github.repository == 'Witcher-Geralt-of-Rivia/pilot'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out destination
+        uses: actions/checkout@v4
+
+      - name: Clone upstream source and preserve notices
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p projects
+          today="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          cat > SOURCES.md <<EOF
+          # Imported source provenance
+
+          These are **third-party codebases**. Their licenses, notices, credits, and copyright belong to the original projects and contributors. Each license applies separately.
+
+          Import time (UTC): ${today}
+
+          | Directory | Original upstream | Upstream commit | License |
+          | --- | --- | --- | --- |
+          EOF
+
+          import_repo() {
+            local folder="$1"
+            local remote="$2"
+            local license="$3"
+            local tmp
+            tmp="$(mktemp -d)"
+            git clone --depth 1 --single-branch "$remote" "$tmp/repository"
+            local sha
+            sha="$(git -C "$tmp/repository" rev-parse HEAD)"
+            rm -rf "projects/$folder"
+            mkdir -p "projects/$folder"
+            rm -rf "$tmp/repository/.git"
+            cp -a "$tmp/repository/." "projects/$folder/"
+            printf '| `projects/%s/` | %s | `%s` | %s |\n' "$folder" "$remote" "$sha" "$license" >> SOURCES.md
+            rm -rf "$tmp"
+          }
+
+          import_repo myerp https://github.com/amerfathullah/MyERP.git MIT
+          import_repo accountgo https://github.com/AccountGo/accountgo.git AGPL-3.0-only
+          import_repo mini-erp https://github.com/vsiqueiravh-cell/mini-erp.git MIT
+
+          for project in myerp accountgo mini-erp; do
+            test -f "projects/$project/LICENSE" || { echo "Missing upstream license: $project" >&2; exit 1; }
+          done
+
+          cat >> SOURCES.md <<'EOF'
+
+          The folder structure is not a relicensing or a transfer of exclusive ownership. This repository does not grant any new rights beyond the original projects' licenses. For software distribution, web hosting, commercial licensing, and modifications, inspect and comply with each project's license and associated notices. In particular, review AccountGo's AGPL network-use obligations.
+          EOF
+
+      - name: Commit imported source snapshots
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f -A -- projects SOURCES.md
+          if git diff --cached --quiet; then
+            echo "No source changes"
+            exit 0
+          fi
+          git commit -m "Import attributed source snapshots of three ERP projects"
+          git push origin HEAD:"$GITHUB_REF_NAME"
