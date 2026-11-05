@@ -1,0 +1,601 @@
+import { Component, inject, OnInit, signal } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { ReactiveFormsModule, FormsModule, FormBuilder, FormArray, Validators } from '@angular/forms';
+import { ActivatedRoute, Router } from '@angular/router';
+import { TaxChargesTemplateService } from '../../proxy/tax/tax-charges-template.service';
+import { PageModule } from '@abp/ng.components/page';
+import { LocalizationPipe, LocalizationService } from '@abp/ng.core';
+import { ToasterService } from '@abp/ng.theme.shared';
+import { InvoiceItemGridComponent } from '../../sales/sales-invoices/components/invoice-item-grid.component';
+import { TaxCalculationService, TaxCalculationResult } from '../../shared/services/tax-calculation.service';
+import { PurchaseInvoiceService } from '../../proxy/purchasing/purchase-invoice.service';
+import { SupplierService } from '../../proxy/purchasing/supplier.service';
+import { WarehouseService } from '../../proxy/inventory/warehouse.service';
+import { PaymentTermsTemplateService } from '../../proxy/accounting/payment-terms-template.service';
+import type { CreatePurchaseInvoiceDto } from '../../proxy/purchasing/models';
+
+import { AutoValidationDirective } from '../../shared/directives/auto-validation.directive';
+import { SaveShortcutDirective } from '../../shared/directives/save-shortcut.directive';
+import { CompanyContextService } from '../../shared/services/company-context.service';
+import { PartyDetailsService } from '../../proxy/core/party-details.service';
+import { TaxCategoryService } from '../../proxy/tax/tax-category.service';
+import { TaxRuleService } from '../../proxy/tax/tax-rule.service';
+import type { TaxRuleDto as TaxRuleModel } from '../../proxy/tax/models';
+import { CurrencyExchangeService } from '../../proxy/accounting/currency-exchange.service';
+import { PriceListService } from '../../proxy/inventory/price-list.service';
+import { Subject } from 'rxjs';
+import { debounceTime, distinctUntilChanged, filter, switchMap } from 'rxjs/operators';
+
+@Component({
+  selector: 'app-purchase-invoice-form',
+  standalone: true,
+  imports: [
+    CommonModule,
+    ReactiveFormsModule,
+    FormsModule,
+    PageModule,
+    LocalizationPipe,
+    InvoiceItemGridComponent,
+    AutoValidationDirective,
+    SaveShortcutDirective],
+  templateUrl: './purchase-invoice-form.component.html',
+  styleUrls: ['./purchase-invoice-form.component.scss'],
+})
+export class PurchaseInvoiceFormComponent implements OnInit {
+  private fb = inject(FormBuilder);
+  private router = inject(Router);
+  private route = inject(ActivatedRoute);
+  private taxCalc = inject(TaxCalculationService);
+  private service = inject(PurchaseInvoiceService);
+  private supplierService = inject(SupplierService);
+  private companyContext = inject(CompanyContextService);
+  private warehouseService = inject(WarehouseService);
+  private paymentTermsService = inject(PaymentTermsTemplateService);
+  private toaster = inject(ToasterService);
+  private l = inject(LocalizationService);
+  private partyDetailsService = inject(PartyDetailsService);
+  private taxCategoryService = inject(TaxCategoryService);
+  private taxRuleService = inject(TaxRuleService);
+  private taxTemplateService = inject(TaxChargesTemplateService);
+  private currencyExchangeService = inject(CurrencyExchangeService);
+  private priceListService = inject(PriceListService);
+
+  /** Multi-currency: true when selected currency differs from company base (MYR) */
+  isMultiCurrency = signal(false);
+
+  suppliers = signal<any[]>([]);
+  priceLists = signal<any[]>([]);
+  taxCategories = signal<any[]>([]);
+  taxTemplates = signal<any[]>([]);
+  selectedTaxRules = signal<TaxRuleModel[]>([]);
+  supplierAddress = signal<string>('');
+  warehouses = signal<any[]>([]);
+  paymentTermsTemplates = signal<any[]>([]);
+  isLoadingPOItems = signal(false);
+  isLoadingPRItems = signal(false);
+
+  // Real-time duplicate supplier invoice detection
+  duplicateWarning = signal<{ invoiceNumber: string; invoiceDate: string; amount: number } | null>(null);
+  private invoiceNumberCheck$ = new Subject<string>();
+
+  // Document-level discount
+  discountOn: 'GrandTotal' | 'NetTotal' = 'GrandTotal';
+  discountPercent = 0;
+  discountAmount = signal(0);
+
+  form = this.fb.group({
+    invoiceNumber: [''],
+    companyId: ['', Validators.required],
+    supplierId: ['', Validators.required],
+    supplierName: [''],
+    supplierTin: [''],
+    supplierInvoiceNumber: [''],
+    issueDate: [new Date().toISOString().split('T')[0], Validators.required],
+    dueDate: [''],
+    paymentTermsTemplateId: [''],
+    priceListId: [''],
+    currencyCode: ['MYR'],
+    exchangeRate: [1],
+    useTransactionDateExchangeRate: [false],
+    notes: [''],
+    isReturn: [false],
+    returnAgainstId: [null as string | null],
+    updateBilledAmountInPurchaseOrder: [true],
+    updateStock: [false],
+    warehouseId: [''],
+    items: this.fb.array([]),
+  });
+
+  isEditMode = false;
+  entityId: string | null = null;
+
+  calcResult: TaxCalculationResult = {
+    netTotal: 0,
+    taxLines: [],
+    totalTax: 0,
+    grandTotal: 0,
+  };
+
+  get items(): FormArray {
+    return this.form.get('items') as FormArray;
+  }
+
+  ngOnInit(): void {
+    this.supplierService.getList({ skipCount: 0, maxResultCount: 200, sorting: '' }).subscribe(
+      res => this.suppliers.set(res.items ?? [])
+    );
+    this.warehouseService.getList({ skipCount: 0, maxResultCount: 200, sorting: 'name asc' }).subscribe(
+      res => this.warehouses.set((res.items ?? []).filter((w: any) => !w.isGroup))
+    );
+    this.paymentTermsService.getList({ skipCount: 0, maxResultCount: 50, sorting: 'name asc' })
+      .subscribe({ next: res => this.paymentTermsTemplates.set(res.items ?? []), error: () => {} });
+
+    this.priceListService.getList({ skipCount: 0, maxResultCount: 100, sorting: 'name asc' })
+      .subscribe({ next: res => this.priceLists.set((res.items ?? []).filter((p: any) => p.isBuying && p.isActive)), error: () => {} });
+
+    // Load tax categories for tax template selector
+    this.taxCategoryService.getList({ skipCount: 0, maxResultCount: 50, sorting: 'name asc' })
+      .subscribe({ next: res => this.taxCategories.set((res.items ?? []).filter((c: any) => c.isActive)), error: () => {} });
+
+    // Load purchase tax templates
+    this.loadTaxTemplates();
+
+    // Auto-resolve supplier details when supplier selection changes
+    this.form.get('supplierId')?.valueChanges.subscribe(supplierId => {
+      if (supplierId) {
+        this.onSupplierChanged(supplierId);
+        this.resolveSupplierDetails(supplierId);
+      }
+    });
+
+    // Debounced duplicate supplier invoice number check (500ms, advisory)
+    this.invoiceNumberCheck$.pipe(
+      debounceTime(500),
+      distinctUntilChanged(),
+      filter(v => v.length >= 2),
+      switchMap(invoiceNo => {
+        const supplierId = this.form.get('supplierId')?.value;
+        const companyId = this.form.get('companyId')?.value;
+        if (!supplierId || !companyId) return [];
+        return this.service.checkDuplicateSupplierInvoice(supplierId, companyId, invoiceNo, this.entityId ?? '');
+      })
+    ).subscribe({
+      next: (result) => {
+        if (result?.isDuplicate) {
+          this.duplicateWarning.set({
+            invoiceNumber: result.existingInvoiceNumber,
+            invoiceDate: result.existingInvoiceDate?.split('T')[0] ?? '',
+            amount: result.existingInvoiceAmount ?? 0
+          });
+        } else {
+          this.duplicateWarning.set(null);
+        }
+      },
+      error: () => this.duplicateWarning.set(null)
+    });
+
+    // Refetch exchange rate when issue date changes on documents using transaction date rate (PR #60180)
+    this.form.get('issueDate')?.valueChanges.subscribe(() => {
+      if (this.form.get('useTransactionDateExchangeRate')?.value) {
+        this.onCurrencyChanged();
+      }
+    });
+
+    // Wire supplierInvoiceNumber input to the check stream
+    this.form.get('supplierInvoiceNumber')?.valueChanges.subscribe(val => {
+      if (val) this.invoiceNumberCheck$.next(val);
+      else this.duplicateWarning.set(null);
+    });
+    this.entityId = this.route.snapshot.paramMap.get('id');
+    this.isEditMode = !!this.entityId;
+
+    // Auto-set companyId from company context for new documents
+    if (!this.isEditMode && !this.form?.get?.('companyId')?.value) {
+      const cid = this.companyContext.currentCompanyId();
+      if (cid) this.form.patchValue({ companyId: cid });
+    }
+
+    if (this.isEditMode) {
+      this.service.get(this.entityId!).subscribe((invoice) => {
+        this.form.patchValue({
+          invoiceNumber: invoice.invoiceNumber,
+          companyId: invoice.companyId,
+          supplierId: invoice.supplierId,
+          supplierTin: invoice.supplierTin,
+          issueDate: invoice.issueDate,
+          dueDate: invoice.dueDate,
+          priceListId: invoice.priceListId ?? '',
+          currencyCode: invoice.currencyCode ?? 'MYR',
+          exchangeRate: invoice.exchangeRate ?? 1,
+          useTransactionDateExchangeRate: invoice.useTransactionDateExchangeRate ?? false,
+          isReturn: invoice.isReturn ?? false,
+          returnAgainstId: invoice.returnAgainstId ?? null,
+          updateBilledAmountInPurchaseOrder: invoice.updateBilledAmountInPurchaseOrder ?? true,
+        });
+        if (invoice.currencyCode && invoice.currencyCode !== 'MYR') {
+          this.isMultiCurrency.set(true);
+        }
+        invoice.items?.forEach((item: any) => this.addItemRow(item));
+      });
+    } else {
+      const returnAgainst = this.route.snapshot.queryParams['returnAgainst'];
+      if (returnAgainst) {
+        this.service.get(returnAgainst).subscribe((source: any) => {
+          this.form.patchValue({
+            companyId: source.companyId,
+            supplierId: source.supplierId,
+            supplierTin: source.supplierTin,
+            issueDate: new Date().toISOString().split('T')[0],
+            currencyCode: source.currencyCode,
+            notes: `Debit Note against ${source.invoiceNumber}`,
+            isReturn: true,
+            returnAgainstId: returnAgainst,
+            updateBilledAmountInPurchaseOrder: true,
+            priceListId: source.priceListId ?? '',
+          });
+          (source.items ?? []).forEach((item: any) => {
+            if (item) this.addItemRow({ ...item, quantity: -(item.quantity ?? 0) });
+          });
+          this.recalculate();
+        });
+      }
+    }
+  }
+
+  addItemRow(item?: any): void {
+    this.items.push(this.fb.group({
+      itemId: [item?.itemId ?? '', Validators.required],
+      description: [item?.description ?? '', Validators.required],
+      quantity: [item?.quantity ?? 1, [Validators.required]],
+      unitPrice: [item?.unitPrice ?? 0, [Validators.required, Validators.min(0)]],
+      taxAmount: [item?.taxAmount ?? 0],
+      uom: [item?.uom ?? 'EA'],
+      purchaseOrderItemId: [item?.purchaseOrderItemId ?? null],
+      purchaseReceiptItemId: [item?.purchaseReceiptItemId ?? null],
+    }));
+  }
+
+  /**
+   * Auto-resolves supplier TIN and name when supplier is selected.
+   * Per LHDN: self-billed e-invoices require supplier TIN for submission.
+   * Per ERPNext party.py: supplier details auto-populated on selection.
+   */
+  onSupplierChanged(supplierId: string): void {
+    const supplier = this.suppliers().find((s: any) => s.id === supplierId);
+    if (supplier) {
+      this.form.patchValue({
+        supplierName: supplier.name || supplier.supplierName || '',
+        supplierTin: supplier.tin || supplier.taxIdentificationNumber || '',
+      });
+    }
+  }
+
+  /** Fetches exchange rate from backend when currency changes from MYR. Per ERPNext: foreign purchases auto-resolve rate. */
+  onCurrencyChanged(): void {
+    const currency = this.form.get('currencyCode')?.value;
+    const baseCurrency = 'MYR';
+    if (!currency || currency === baseCurrency) {
+      this.isMultiCurrency.set(false);
+      this.form.patchValue({ exchangeRate: 1 });
+      return;
+    }
+    this.isMultiCurrency.set(true);
+    const issueDate = this.form.get('issueDate')?.value || new Date().toISOString().split('T')[0];
+    this.currencyExchangeService.getRate(currency, baseCurrency, issueDate).subscribe({
+      next: (result) => {
+        if (result?.rate) {
+          this.form.patchValue({ exchangeRate: result.rate });
+        }
+      },
+      error: () => { /* Non-blocking: user can manually enter exchange rate */ }
+    });
+  }
+
+  recalculate(): void {
+    const itemValues = this.items.controls.map(c => ({
+      qty: c.get('quantity')?.value ?? 0,
+      rate: c.get('unitPrice')?.value ?? 0,
+      discountPercent: 0,
+    }));
+
+    const taxRules = this.selectedTaxRules().map(r => ({
+      taxName: r.description || `Tax ${r.rate}%`,
+      rate: r.rate ?? 0,
+      chargeType: 'OnNetTotal' as const,
+    }));
+
+    let result = this.taxCalc.calculate(itemValues, taxRules);
+
+    // Apply document-level discount per ERPNext ApplyDiscountOn logic
+    const discountAmt = this.discountAmount();
+    if (discountAmt > 0) {
+      if (this.discountOn === 'NetTotal') {
+        const reducedNet = Math.max(0, result.netTotal - discountAmt);
+        const ratio = result.netTotal > 0 ? reducedNet / result.netTotal : 0;
+        const newTaxLines = result.taxLines.map(t => ({
+          ...t,
+          taxAmount: Math.round(t.taxAmount * ratio * 100) / 100,
+        }));
+        const totalTax = newTaxLines.reduce((s, t) => s + t.taxAmount, 0);
+        result = { ...result, netTotal: reducedNet, taxLines: newTaxLines, totalTax, grandTotal: reducedNet + totalTax };
+      } else {
+        result = { ...result, grandTotal: Math.max(0, result.grandTotal - discountAmt) };
+      }
+    }
+
+    this.calcResult = result;
+  }
+
+  /** Discount percentage changed → compute amount */
+  onDiscountPercentChanged(): void {
+    const base = this.discountOn === 'NetTotal' ? this.calcResult.netTotal : this.calcResult.grandTotal;
+    const amount = Math.round(base * this.discountPercent / 100 * 100) / 100;
+    this.discountAmount.set(amount);
+    this.recalculate();
+  }
+
+  /** Discount amount directly entered */
+  onDiscountAmountChanged(value: string): void {
+    const amount = Math.max(0, parseFloat(value) || 0);
+    this.discountAmount.set(amount);
+    const base = this.discountOn === 'NetTotal' ? this.calcResult.netTotal : this.calcResult.grandTotal;
+    this.discountPercent = base > 0 ? Math.round(amount / base * 100 * 100) / 100 : 0;
+    this.recalculate();
+  }
+
+  /** Discount-On mode changed */
+  onDiscountChanged(): void {
+    if (this.discountPercent > 0) {
+      this.onDiscountPercentChanged();
+    } else {
+      this.recalculate();
+    }
+  }
+
+  onTaxCategoryChanged(categoryId: string): void {
+    if (!categoryId) {
+      this.selectedTaxRules.set([]);
+      this.recalculate();
+      return;
+    }
+    this.taxRuleService.getList(categoryId, { skipCount: 0, maxResultCount: 50, sorting: 'priority asc' })
+      .subscribe({
+        next: res => {
+          const rules = (res.items ?? []).filter(
+            (r: any) => r.isActive
+          );
+          this.selectedTaxRules.set(rules);
+          this.recalculate();
+        },
+        error: () => {},
+      });
+  }
+
+  /** Load available purchase tax templates for this company. */
+  loadTaxTemplates(): void {
+    const companyId = this.companyContext?.currentCompanyId?.() ?? '';
+    const params: any = { skipCount: '0', maxResultCount: '50', templateType: '1' }; // 1 = Buying
+    if (companyId) params.companyId = companyId;
+    this.taxTemplateService.getList({ skipCount: 0, maxResultCount: 100 } as any).subscribe({
+      next: res => {
+        const templates = (res.items ?? []).filter((t: any) => t.isEnabled);
+        this.taxTemplates.set(templates);
+        if (!this.isEditMode) {
+          const defaultTmpl = templates.find((t: any) => t.isDefault);
+          if (defaultTmpl) this.applyTaxTemplate(defaultTmpl);
+        }
+      },
+      error: () => {},
+    });
+  }
+
+  /** Apply a tax charges template to populate tax rules. */
+  onTaxTemplateChanged(templateId: string): void {
+    if (!templateId) { this.selectedTaxRules.set([]); this.recalculate(); return; }
+    const template = this.taxTemplates().find((t: any) => t.id === templateId);
+    if (template) this.applyTaxTemplate(template);
+  }
+
+  private applyTaxTemplate(template: any): void {
+    const rules = (template.rows ?? []).map((row: any) => ({
+      id: row.id, rate: row.rate,
+      description: row.description || `Tax @ ${row.rate}%`,
+      chargeType: row.chargeType, taxCategory: row.taxCategory,
+      accountId: row.accountId, accountName: row.accountName,
+      isActive: true,
+    }));
+    this.selectedTaxRules.set(rules);
+    this.recalculate();
+  }
+
+  private resolveSupplierDetails(supplierId: string): void {
+    const companyId = this.form.get('companyId')?.value || undefined;
+    this.partyDetailsService.getSupplierDetails({ partyId: supplierId, companyId }).subscribe({
+      next: (details: any) => {
+        if (details.tin) {
+          this.form.patchValue({ supplierTin: details.tin });
+        }
+        if (details.billingAddress) {
+          const addr = details.billingAddress;
+          const parts = [addr.addressLine1, addr.city, addr.state, addr.postalCode].filter(Boolean);
+          this.supplierAddress.set(parts.join(', '));
+        }
+        // Price list fallback reset (ERPNext PR #58893)
+        this.form.patchValue({ priceListId: details.priceListId ?? '' });
+
+        if (details.defaultPaymentTermsTemplateId && !this.form.get('paymentTermsTemplateId')?.value) {
+          this.form.patchValue({ paymentTermsTemplateId: details.defaultPaymentTermsTemplateId });
+        }
+      },
+      error: () => {},
+    });
+  }
+
+  save(): void {
+    if (this.form.invalid) {
+      this.form.markAllAsTouched();
+      return;
+    }
+    this.recalculate();
+    const raw = this.form.getRawValue() as any;
+    // Map item fields: handles both grid-added (qty/rate/itemName) and pre-loaded (quantity/unitPrice/description)
+    const dto: CreatePurchaseInvoiceDto = {
+      ...raw,
+      paymentTermsTemplateId: raw.paymentTermsTemplateId || undefined,
+      dueDate: raw.dueDate || undefined,
+      warehouseId: raw.warehouseId || undefined,
+      returnAgainstId: raw.returnAgainstId || undefined,
+      updateBilledAmountInPurchaseOrder: raw.updateBilledAmountInPurchaseOrder ?? true,
+      discountAmount: this.discountAmount() > 0 ? this.discountAmount() : undefined,
+      applyDiscountOn: this.discountAmount() > 0 ? this.discountOn : undefined,
+      items: (raw.items ?? []).map((item: any) => ({
+        itemId: item.itemId,
+        description: item.description || item.itemName || '',
+        quantity: item.quantity ?? item.qty ?? 0,
+        unitPrice: item.unitPrice ?? item.rate ?? 0,
+        taxAmount: item.taxAmount ?? 0,
+        uom: item.uom ?? 'Unit',
+        purchaseOrderItemId: item.purchaseOrderItemId || undefined,
+        purchaseReceiptItemId: item.purchaseReceiptItemId || undefined,
+      })),
+    };
+    if (this.isEditMode) {
+      this.service.update(this.entityId!, dto).subscribe({
+        next: () => { this.form.markAsPristine(); this.router.navigate(['/purchasing/invoices', this.entityId]); },
+        error: () => {},
+      });
+      return;
+    }
+    this.service.create(dto).subscribe({
+      next: () => { this.form.markAsPristine(); this.router.navigate(['/purchasing/invoices']); },
+      error: () => { /* handled by global error interceptor */ },
+    });
+  }
+
+  cancel(): void {
+    this.router.navigate(['/purchasing/invoices']);
+  }
+
+  getItemsFromPO(): void {
+    const supplierId = this.form.get('supplierId')?.value;
+    if (!supplierId) return;
+    this.isLoadingPOItems.set(true);
+    const companyId = this.form.get('companyId')?.value || undefined;
+    this.service.getUnbilledPurchaseOrderItems(supplierId, companyId).subscribe({
+      next: (items: any[]) => {
+        this.isLoadingPOItems.set(false);
+        if (!items || items.length === 0) {
+          this.toaster.info('::NoUnbilledOrderItems');
+          return;
+        }
+
+        // Compute quantities already mapped into the target form to prevent duplicate rows (ERPNext PR #58617)
+        const mappedQtyByPoItem = new Map<string, number>();
+        this.items.controls.forEach(c => {
+          const poItemId = c.get('purchaseOrderItemId')?.value;
+          const qty = Number(c.get('quantity')?.value) || 0;
+          if (poItemId) {
+            mappedQtyByPoItem.set(poItemId, (mappedQtyByPoItem.get(poItemId) || 0) + qty);
+          }
+        });
+
+        let loadedCount = 0;
+        items.forEach((item: any) => {
+          const poItemId = item.purchaseOrderItemId ?? item.id;
+          const alreadyMapped = mappedQtyByPoItem.get(poItemId) || 0;
+          const totalPending = item.unbilledQty ?? item.quantity ?? 1;
+          const remainingQty = totalPending - alreadyMapped;
+
+          if (remainingQty > 0) {
+            this.addItemRow({
+              itemId: item.itemId,
+              description: item.itemName || '',
+              quantity: remainingQty,
+              unitPrice: item.rate ?? item.unitPrice ?? 0,
+              uom: item.uom ?? 'Unit',
+              purchaseOrderItemId: poItemId,
+            });
+            mappedQtyByPoItem.set(poItemId, alreadyMapped + remainingQty);
+            loadedCount++;
+          }
+        });
+
+        if (loadedCount > 0) {
+          this.recalculate();
+          this.toaster.success(this.l.instant('::ItemsLoadedFromPO', loadedCount.toString()));
+        } else {
+          this.toaster.info(this.l.instant('::AllItemsAlreadyBilled'));
+        }
+      },
+      error: () => {
+        this.isLoadingPOItems.set(false);
+      },
+    });
+  }
+
+  getItemsFromPR(): void {
+    const supplierId = this.form.get('supplierId')?.value;
+    if (!supplierId) return;
+    this.isLoadingPRItems.set(true);
+    const companyId = this.form.get('companyId')?.value || undefined;
+    this.service.getUnbilledPurchaseReceiptItems(supplierId, companyId).subscribe({
+      next: (items: any[]) => {
+        this.isLoadingPRItems.set(false);
+        if (!items || items.length === 0) {
+          this.toaster.info('::NoUnbilledReceiptItems');
+          return;
+        }
+
+        // Compute quantities already mapped into the target form to prevent duplicate rows (ERPNext PR #58617)
+        const mappedQtyByPrItem = new Map<string, number>();
+        this.items.controls.forEach(c => {
+          const prItemId = c.get('purchaseReceiptItemId')?.value;
+          const qty = Number(c.get('quantity')?.value) || 0;
+          if (prItemId) {
+            mappedQtyByPrItem.set(prItemId, (mappedQtyByPrItem.get(prItemId) || 0) + qty);
+          }
+        });
+
+        let loadedCount = 0;
+        items.forEach((item: any) => {
+          const prItemId = item.purchaseReceiptItemId ?? item.id;
+          const alreadyMapped = mappedQtyByPrItem.get(prItemId) || 0;
+          const totalPending = item.quantity ?? 1;
+          const remainingQty = totalPending - alreadyMapped;
+
+          if (remainingQty > 0) {
+            this.addItemRow({
+              itemId: item.itemId,
+              description: item.itemName || '',
+              quantity: remainingQty,
+              unitPrice: item.rate ?? item.unitPrice ?? 0,
+              uom: item.uom ?? 'Unit',
+              purchaseReceiptItemId: prItemId,
+              purchaseOrderItemId: item.purchaseOrderItemId ?? null,
+            });
+            mappedQtyByPrItem.set(prItemId, alreadyMapped + remainingQty);
+            loadedCount++;
+          }
+        });
+
+        if (loadedCount > 0) {
+          // Mirror ERPNext PR #60230 / commit 637fadfee9: disable update stock for invoice created from receipt
+          this.form.patchValue({ updateStock: false });
+          this.recalculate();
+          this.toaster.success(this.l.instant('::ItemsLoadedFromPR', loadedCount.toString()));
+        } else {
+          this.toaster.info(this.l.instant('::AllItemsAlreadyBilled'));
+        }
+      },
+      error: () => {
+        this.isLoadingPRItems.set(false);
+      },
+    });
+  }
+
+  hasPurchaseReceiptItems(): boolean {
+    return this.items.controls.some(c => !!c.get('purchaseReceiptItemId')?.value);
+  }
+
+  hasUnsavedChanges(): boolean { return this.form.dirty; }
+}

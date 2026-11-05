@@ -1,0 +1,271 @@
+using System;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Core.Entities;
+using MyERP.Inventory;
+using MyERP.Inventory.DomainServices;
+using MyERP.Inventory.Entities;
+using MyERP.Manufacturing.Entities;
+using Shouldly;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Modularity;
+using Xunit;
+
+namespace MyERP.Manufacturing;
+
+/// <summary>
+/// Regression coverage for CreateDisassemblyStockEntryAsync's 3-tier RM source resolution
+/// (76th migration session): a real posted Manufacture Stock Entry must win over the WO's
+/// planned RequiredItems whenever one exists, since actual consumption can differ from plan.
+/// </summary>
+public abstract class DisassemblySourceResolutionTests<TStartupModule> : MyERPApplicationTestBase<TStartupModule>
+    where TStartupModule : IAbpModule
+{
+    [Fact]
+    public async Task SingleManufactureEntry_AutoSelected_UsesActualConsumedQtyNotPlannedQty()
+    {
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var companyRepository = GetRequiredService<IRepository<Company, Guid>>();
+            var itemRepository = GetRequiredService<IRepository<Item, Guid>>();
+            var warehouseRepository = GetRequiredService<IRepository<Warehouse, Guid>>();
+            var woRepository = GetRequiredService<IRepository<WorkOrder, Guid>>();
+            var seRepository = GetRequiredService<IRepository<StockEntry, Guid>>();
+            var seriesRepository = GetRequiredService<IRepository<DocumentSeries, Guid>>();
+            var fiscalYearRepository = GetRequiredService<IRepository<MyERP.Accounting.Entities.FiscalYear, Guid>>();
+            var accountRepository = GetRequiredService<IRepository<MyERP.Accounting.Entities.Account, Guid>>();
+            var manufacturingAppService = GetRequiredService<IManufacturingAppService>();
+            var stockPostingService = GetRequiredService<StockPostingService>();
+            var sleRepository = GetRequiredService<IRepository<StockLedgerEntry, Guid>>();
+
+            var company = await companyRepository.InsertAsync(new Company(Guid.NewGuid(), "Disassembly Tier Test Co"), autoSave: true);
+            await SeedStockEntryGlRulesAsync(companyRepository, accountRepository, company.Id, suffix: "1");
+            var fgItem = await itemRepository.InsertAsync(
+                new Item(Guid.NewGuid(), company.Id, "FG-001", "Finished Widget", ItemType.Goods), autoSave: true);
+            var rmItem = await itemRepository.InsertAsync(
+                new Item(Guid.NewGuid(), company.Id, "RM-001", "Raw Bolt", ItemType.Goods), autoSave: true);
+            var fgWarehouse = await warehouseRepository.InsertAsync(new Warehouse(Guid.NewGuid(), company.Id, "FG Store"), autoSave: true);
+            var sourceWarehouse = await warehouseRepository.InsertAsync(new Warehouse(Guid.NewGuid(), company.Id, "RM Store"), autoSave: true);
+            await seriesRepository.InsertAsync(new DocumentSeries(Guid.NewGuid(), company.Id, "SE Series", "SE", "SE-"), autoSave: true);
+            await fiscalYearRepository.InsertAsync(
+                new MyERP.Accounting.Entities.FiscalYear(Guid.NewGuid(), company.Id, "FY-Test",
+                    new DateTime(2020, 1, 1), new DateTime(2030, 12, 31)),
+                autoSave: true);
+
+            // WO planned 100 units, requiring 5 bolts/unit → 500 planned. Actual production
+            // (via the Manufacture Stock Entry below) only consumed 3 bolts/unit — a real-world
+            // process-loss/substitution divergence from plan.
+            var wo = new WorkOrder(Guid.NewGuid(), company.Id, "WO-0001", fgItem.Id, Guid.NewGuid(), quantity: 100m)
+            {
+                FgWarehouseId = fgWarehouse.Id,
+                SourceWarehouseId = sourceWarehouse.Id,
+            };
+            wo.RequiredItems.Add(new WorkOrderItem(Guid.NewGuid(), wo.Id, rmItem.Id, "Raw Bolt", requiredQuantity: 500m)
+            {
+                SourceWarehouseId = sourceWarehouse.Id,
+            });
+            wo.Submit();
+            wo.Start();
+            wo.RecordProduction(100m);
+            await woRepository.InsertAsync(wo, autoSave: true);
+
+            // Seed enough RM stock for the Manufacture entry below to actually consume — its own
+            // AddItem-supplied rate (2.00) is what the disassembly assertion checks, not this
+            // starting balance's rate, so the exact seeded rate here doesn't matter.
+            await sleRepository.InsertAsync(new StockLedgerEntry(
+                Guid.NewGuid(), company.Id, rmItem.Id, sourceWarehouse.Id,
+                DateTime.UtcNow.Date.AddDays(-1), quantityChange: 300m, valuationRate: 2.00m,
+                balanceQuantity: 300m, balanceValue: 600m)
+            {
+                StockQueue = "[[300,2.00]]",
+            }, autoSave: true);
+
+            // The actual Manufacture Stock Entry: 100 FG produced, only 300 RM actually consumed
+            // (3/unit, not the planned 5/unit), at a real rate of 2.00/unit.
+            var manufactureEntry = new StockEntry(Guid.NewGuid(), company.Id, StockEntryType.Manufacture, DateTime.UtcNow.Date, company.TenantId)
+            {
+                WorkOrderId = wo.Id,
+                EntryNumber = "SE-MFG-0001",
+                FgCompletedQty = 100m,
+            };
+            manufactureEntry.AddItem(rmItem.Id, 300m, sourceWarehouseId: sourceWarehouse.Id, targetWarehouseId: null, valuationRate: 2.00m);
+            manufactureEntry.AddItem(fgItem.Id, 100m, sourceWarehouseId: null, targetWarehouseId: fgWarehouse.Id, valuationRate: 6.00m);
+            manufactureEntry.Submit();
+            manufactureEntry.Post();
+            // Must actually post the stock movement (not just insert the entity) — the later
+            // disassembly step consumes real FG stock via the FIFO-aware ledger path, which needs
+            // a real posted SLE/StockQueue to draw from, not just an in-memory StockEntry row.
+            await stockPostingService.PostStockEntryAsync(manufactureEntry);
+            await seRepository.InsertAsync(manufactureEntry, autoSave: true);
+
+            // Act: disassemble 10 of the 100 produced units (10% of actual production).
+            var result = await manufacturingAppService.CreateDisassemblyStockEntryAsync(new CreateDisassemblyDto
+            {
+                WorkOrderId = wo.Id,
+                Quantity = 10m,
+            });
+
+            var disassembleEntry = await seRepository.GetAsync(result.StockEntryId);
+            var rmLine = disassembleEntry.Items.Single(i => i.ItemId == rmItem.Id);
+
+            // Correct (Tier 1, from the real Manufacture SE): 300 × (10/100) = 30, at rate 2.00.
+            // Wrong (old behavior, from wo.RequiredItems): 500 × (10/100) = 50.
+            rmLine.Quantity.ShouldBe(30m);
+            rmLine.ValuationRate.ShouldBe(2.00m);
+        });
+    }
+
+    [Fact]
+    public async Task MultipleManufactureEntries_AggregatesQtyWeightedAverage()
+    {
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var companyRepository = GetRequiredService<IRepository<Company, Guid>>();
+            var itemRepository = GetRequiredService<IRepository<Item, Guid>>();
+            var warehouseRepository = GetRequiredService<IRepository<Warehouse, Guid>>();
+            var woRepository = GetRequiredService<IRepository<WorkOrder, Guid>>();
+            var seRepository = GetRequiredService<IRepository<StockEntry, Guid>>();
+            var seriesRepository = GetRequiredService<IRepository<DocumentSeries, Guid>>();
+            var fiscalYearRepository = GetRequiredService<IRepository<MyERP.Accounting.Entities.FiscalYear, Guid>>();
+            var accountRepository = GetRequiredService<IRepository<MyERP.Accounting.Entities.Account, Guid>>();
+            var manufacturingAppService = GetRequiredService<IManufacturingAppService>();
+            var stockPostingService = GetRequiredService<StockPostingService>();
+            var sleRepository = GetRequiredService<IRepository<StockLedgerEntry, Guid>>();
+
+            var company = await companyRepository.InsertAsync(new Company(Guid.NewGuid(), "Disassembly Tier Test Co 2"), autoSave: true);
+            await SeedStockEntryGlRulesAsync(companyRepository, accountRepository, company.Id, suffix: "2");
+            var fgItem = await itemRepository.InsertAsync(
+                new Item(Guid.NewGuid(), company.Id, "FG-002", "Finished Widget 2", ItemType.Goods), autoSave: true);
+            var rmItem = await itemRepository.InsertAsync(
+                new Item(Guid.NewGuid(), company.Id, "RM-002", "Raw Screw", ItemType.Goods), autoSave: true);
+            var fgWarehouse = await warehouseRepository.InsertAsync(new Warehouse(Guid.NewGuid(), company.Id, "FG Store 2"), autoSave: true);
+            var sourceWarehouse = await warehouseRepository.InsertAsync(new Warehouse(Guid.NewGuid(), company.Id, "RM Store 2"), autoSave: true);
+            await seriesRepository.InsertAsync(new DocumentSeries(Guid.NewGuid(), company.Id, "SE Series 2", "SE", "SE2-"), autoSave: true);
+            await fiscalYearRepository.InsertAsync(
+                new MyERP.Accounting.Entities.FiscalYear(Guid.NewGuid(), company.Id, "FY-Test-2",
+                    new DateTime(2020, 1, 1), new DateTime(2030, 12, 31)),
+                autoSave: true);
+
+            var wo = new WorkOrder(Guid.NewGuid(), company.Id, "WO-0002", fgItem.Id, Guid.NewGuid(), quantity: 100m)
+            {
+                FgWarehouseId = fgWarehouse.Id,
+                SourceWarehouseId = sourceWarehouse.Id,
+            };
+            wo.Submit();
+            wo.Start();
+            wo.RecordProduction(100m);
+            await woRepository.InsertAsync(wo, autoSave: true);
+
+            // Seed enough RM stock for both production runs below to actually consume (120 + 80 =
+            // 200 total) — their own AddItem-supplied rates are what the disassembly assertions
+            // check, not this starting balance's rate.
+            await sleRepository.InsertAsync(new StockLedgerEntry(
+                Guid.NewGuid(), company.Id, rmItem.Id, sourceWarehouse.Id,
+                DateTime.UtcNow.Date.AddDays(-1), quantityChange: 200m, valuationRate: 3.00m,
+                balanceQuantity: 200m, balanceValue: 600m)
+            {
+                StockQueue = "[[200,3.00]]",
+            }, autoSave: true);
+
+            // Two separate production runs at different costs: 60 units @ rate 3.00, 40 units @ rate 4.50.
+            var run1 = new StockEntry(Guid.NewGuid(), company.Id, StockEntryType.Manufacture, DateTime.UtcNow.Date, company.TenantId)
+            { WorkOrderId = wo.Id, EntryNumber = "SE-MFG-0002A", FgCompletedQty = 60m };
+            run1.AddItem(rmItem.Id, 120m, sourceWarehouseId: sourceWarehouse.Id, targetWarehouseId: null, valuationRate: 3.00m);
+            run1.AddItem(fgItem.Id, 60m, sourceWarehouseId: null, targetWarehouseId: fgWarehouse.Id, valuationRate: 6.00m);
+            run1.Submit();
+            run1.Post();
+            await stockPostingService.PostStockEntryAsync(run1);
+            await seRepository.InsertAsync(run1, autoSave: true);
+
+            var run2 = new StockEntry(Guid.NewGuid(), company.Id, StockEntryType.Manufacture, DateTime.UtcNow.Date, company.TenantId)
+            { WorkOrderId = wo.Id, EntryNumber = "SE-MFG-0002B", FgCompletedQty = 40m };
+            run2.AddItem(rmItem.Id, 80m, sourceWarehouseId: sourceWarehouse.Id, targetWarehouseId: null, valuationRate: 4.50m);
+            run2.AddItem(fgItem.Id, 40m, sourceWarehouseId: null, targetWarehouseId: fgWarehouse.Id, valuationRate: 6.00m);
+            run2.Submit();
+            run2.Post();
+            await stockPostingService.PostStockEntryAsync(run2);
+            await seRepository.InsertAsync(run2, autoSave: true);
+
+            // Act: disassemble 20 of the 100 total produced (20% of the aggregated 100 FG qty).
+            var result = await manufacturingAppService.CreateDisassemblyStockEntryAsync(new CreateDisassemblyDto
+            {
+                WorkOrderId = wo.Id,
+                Quantity = 20m,
+            });
+
+            var disassembleEntry = await seRepository.GetAsync(result.StockEntryId);
+            var rmLine = disassembleEntry.Items.Single(i => i.ItemId == rmItem.Id);
+
+            // Aggregated RM qty = 120 + 80 = 200, scale factor = 20/100 = 0.2 → 40.
+            // Qty-weighted avg rate = (120×3.00 + 80×4.50) / 200 = (360+360)/200 = 3.60.
+            rmLine.Quantity.ShouldBe(40m);
+            rmLine.ValuationRate.ShouldBe(3.60m);
+        });
+    }
+
+    /// <summary>
+    /// Test-only GL scaffolding: DocumentPostingOrchestrator.PostStockEntryAsync resolves each
+    /// item's stock account via WarehouseAccountService, which falls back to
+    /// Company.DefaultInventoryAccountId when no per-warehouse override is configured. Setting
+    /// that (plus DefaultStockAdjustmentAccountId, needed for Disassemble's valuation-residual
+    /// plug) is enough to let real GL posting complete — this is not asserting anything about
+    /// Stock Entry GL correctness itself, only unblocking the posting pipeline so the RM-item
+    /// resolution logic under test actually runs end to end.
+    /// </summary>
+    private static async Task SeedStockEntryGlRulesAsync(
+        IRepository<Company, Guid> companyRepository,
+        IRepository<MyERP.Accounting.Entities.Account, Guid> accountRepository,
+        Guid companyId,
+        string suffix)
+    {
+        var stockAccount = await accountRepository.InsertAsync(
+            new MyERP.Accounting.Entities.Account(Guid.NewGuid(), companyId, $"9{suffix}01", "Test Stock", MyERP.Accounting.AccountType.Asset),
+            autoSave: true);
+        var adjustmentAccount = await accountRepository.InsertAsync(
+            new MyERP.Accounting.Entities.Account(Guid.NewGuid(), companyId, $"9{suffix}02", "Test Stock Adjustment", MyERP.Accounting.AccountType.Equity),
+            autoSave: true);
+
+        var company = await companyRepository.GetAsync(companyId);
+        company.DefaultInventoryAccountId = stockAccount.Id;
+        company.DefaultStockAdjustmentAccountId = adjustmentAccount.Id;
+        await companyRepository.UpdateAsync(company, autoSave: true);
+    }
+
+    [Fact]
+    public async Task ExplicitSourceEntry_FromAnotherWorkOrder_Throws()
+    {
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var company = await GetRequiredService<IRepository<Company, Guid>>().InsertAsync(new Company(Guid.NewGuid(), "Disassembly Source Guard Co"), autoSave: true);
+            var fgItem = await GetRequiredService<IRepository<Item, Guid>>().InsertAsync(
+                new Item(Guid.NewGuid(), company.Id, "FG-GUARD", "Guard Widget", ItemType.Goods), autoSave: true);
+            var warehouse = await GetRequiredService<IRepository<Warehouse, Guid>>().InsertAsync(new Warehouse(Guid.NewGuid(), company.Id, "Guard Store"), autoSave: true);
+            await GetRequiredService<IRepository<DocumentSeries, Guid>>().InsertAsync(new DocumentSeries(Guid.NewGuid(), company.Id, "SE Series G", "SE", "SEG-"), autoSave: true);
+
+            var wo = new WorkOrder(Guid.NewGuid(), company.Id, "WO-GUARD-1", fgItem.Id, Guid.NewGuid(), quantity: 10m) { FgWarehouseId = warehouse.Id };
+            wo.Submit();
+            wo.Start();
+            wo.RecordProduction(10m);
+            await GetRequiredService<IRepository<WorkOrder, Guid>>().InsertAsync(wo, autoSave: true);
+
+            var foreignEntry = new StockEntry(Guid.NewGuid(), company.Id, StockEntryType.Manufacture, DateTime.UtcNow.Date, company.TenantId)
+            {
+                WorkOrderId = Guid.NewGuid(),
+                EntryNumber = "SE-FOREIGN-1",
+                FgCompletedQty = 10m,
+            };
+            foreignEntry.AddItem(fgItem.Id, 10m, sourceWarehouseId: null, targetWarehouseId: warehouse.Id, valuationRate: 5m);
+            foreignEntry.Submit();
+            await GetRequiredService<IRepository<StockEntry, Guid>>().InsertAsync(foreignEntry, autoSave: true);
+
+            var ex = await Should.ThrowAsync<Volo.Abp.BusinessException>(() =>
+                GetRequiredService<IManufacturingAppService>().CreateDisassemblyStockEntryAsync(new CreateDisassemblyDto
+                {
+                    WorkOrderId = wo.Id,
+                    Quantity = 5m,
+                    SourceStockEntryId = foreignEntry.Id,
+                }));
+            ex.Code.ShouldBe(MyERPDomainErrorCodes.ValidationFailed);
+        });
+    }
+}

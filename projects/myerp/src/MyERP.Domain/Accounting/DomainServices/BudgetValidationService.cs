@@ -1,0 +1,424 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Accounting.Entities;
+using Volo.Abp;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Domain.Services;
+
+namespace MyERP.Accounting.DomainServices;
+
+/// <summary>
+/// Validates transactions against submitted budgets.
+/// Enforcement hierarchy: MR (Level 1) → PO (Level 2) → Actual GL (Level 3).
+/// Per ERPNext: budget validation fires on document submit when budget action is "Stop".
+/// </summary>
+public class BudgetValidationService : DomainService
+{
+    private readonly IRepository<Budget, Guid> _budgetRepository;
+    private readonly IRepository<JournalEntry, Guid> _journalEntryRepository;
+    private readonly IRepository<FiscalYear, Guid> _fiscalYearRepository;
+
+    public BudgetValidationService(
+        IRepository<Budget, Guid> budgetRepository,
+        IRepository<JournalEntry, Guid> journalEntryRepository,
+        IRepository<FiscalYear, Guid> fiscalYearRepository)
+    {
+        _budgetRepository = budgetRepository;
+        _journalEntryRepository = journalEntryRepository;
+        _fiscalYearRepository = fiscalYearRepository;
+    }
+
+    /// <summary>
+    /// Validates a Purchase Order's amount against budget at Level 2.
+    /// Checks each PO item's expense account against budget limits.
+    /// </summary>
+    public async Task ValidateForPurchaseOrderAsync(
+        Guid companyId, Guid fiscalYearId, DateTime postingDate,
+        IEnumerable<BudgetCheckItem> items, Guid? tenantId)
+    {
+        await ValidateAsync(companyId, fiscalYearId, postingDate, items,
+            BudgetLevel.PurchaseOrder, tenantId);
+    }
+
+    /// <summary>
+    /// Validates a Material Request's amount against budget at Level 1.
+    /// </summary>
+    public async Task ValidateForMaterialRequestAsync(
+        Guid companyId, Guid fiscalYearId, DateTime postingDate,
+        IEnumerable<BudgetCheckItem> items, Guid? tenantId)
+    {
+        await ValidateAsync(companyId, fiscalYearId, postingDate, items,
+            BudgetLevel.MaterialRequest, tenantId);
+    }
+
+    /// <summary>
+    /// Validates actual GL posting against budget at Level 3.
+    /// </summary>
+    public async Task ValidateForActualExpenseAsync(
+        Guid companyId, Guid fiscalYearId, DateTime postingDate,
+        IEnumerable<BudgetCheckItem> items, Guid? tenantId)
+    {
+        await ValidateAsync(companyId, fiscalYearId, postingDate, items,
+            BudgetLevel.Actual, tenantId);
+    }
+
+    private async Task ValidateAsync(
+        Guid companyId, Guid fiscalYearId, DateTime postingDate,
+        IEnumerable<BudgetCheckItem> items, BudgetLevel level, Guid? tenantId)
+    {
+        // Get all submitted budgets for this company and fiscal year
+        var budgetQueryable = await _budgetRepository.GetQueryableAsync();
+        var budgets = budgetQueryable
+            .Where(b => b.CompanyId == companyId
+                     && b.FiscalYearId == fiscalYearId
+                     && b.Status == Core.DocumentStatus.Submitted)
+            .ToList();
+
+        if (!budgets.Any()) return;
+
+        // Get actual GL spend for comparison
+        var actualSpend = await GetActualSpendAsync(companyId, fiscalYearId, tenantId);
+
+        foreach (var item in items)
+        {
+            // Per ERPNext commit fa34ebea94: skip budget validation when cancelling GL entries or reversing spend
+            if (item.Amount <= 0) continue;
+
+            foreach (var budget in budgets)
+            {
+                var budgetAccount = budget.Accounts
+                    .FirstOrDefault(a => a.AccountId == item.AccountId);
+
+                if (budgetAccount == null) continue;
+
+                var (annualAction, monthlyAction) = GetActionsForLevel(budget, level);
+
+                // Per ERPNext commit 58556c82bb:
+                // Exception budget approver role downgrades Stop to Warn
+                if (await IsUserBudgetExceptionApproverAsync(companyId))
+                {
+                    if (annualAction == BudgetAction.Stop) annualAction = BudgetAction.Warn;
+                    if (monthlyAction == BudgetAction.Stop) monthlyAction = BudgetAction.Warn;
+                }
+
+                // Calculate total spend: actual + this transaction
+                var currentSpend = actualSpend.GetValueOrDefault(item.AccountId, 0m);
+                var totalAfter = currentSpend + item.Amount;
+
+                // 1. Annual budget check
+                // Per ERPNext PR #61988 (commit fe95375b98 / f6f18a9ca2): round comparison to budget amount precision
+                if (annualAction != BudgetAction.Ignore && Math.Round(totalAfter - budgetAccount.BudgetAmount, 2) > 0)
+                {
+                    if (annualAction == BudgetAction.Stop)
+                    {
+                        throw new BusinessException(MyERPDomainErrorCodes.BudgetExceeded)
+                            .WithData("account", budgetAccount.AccountName ?? item.AccountId.ToString())
+                            .WithData("budget", budgetAccount.BudgetAmount)
+                            .WithData("spent", currentSpend)
+                            .WithData("requested", item.Amount)
+                            .WithData("limitType", "Annual");
+                    }
+                }
+
+                // 2. Accumulated monthly budget check (ERPNext commit 388d901668 & PR #61988)
+                if (monthlyAction != BudgetAction.Ignore)
+                {
+                    var accumulatedMonthlyBudget = await CalculateAccumulatedMonthlyBudgetAsync(
+                        budget, budgetAccount.BudgetAmount, postingDate, fiscalYearId);
+
+                    if (Math.Round(totalAfter - accumulatedMonthlyBudget, 2) > 0)
+                    {
+                        if (monthlyAction == BudgetAction.Stop)
+                        {
+                            throw new BusinessException(MyERPDomainErrorCodes.BudgetExceeded)
+                                .WithData("account", budgetAccount.AccountName ?? item.AccountId.ToString())
+                                .WithData("budget", accumulatedMonthlyBudget)
+                                .WithData("spent", currentSpend)
+                                .WithData("requested", item.Amount)
+                                .WithData("limitType", "AccumulatedMonthly");
+                        }
+                    }
+                }
+
+                // 3. Cumulative expense check (Purchase Order + Material Request + Actual Expense)
+                // Per ERPNext commits 45368f983b / 3eb07fba2a & PR #61988
+                if (budget.ApplicableOnCumulativeExpense)
+                {
+                    var cumulativeAnnualAction = budget.ActionIfAnnualExceededOnCumulativeExpense;
+                    var cumulativeMonthlyAction = budget.ActionIfAccumulatedMonthlyExceededOnCumulativeExpense;
+
+                    if (await IsUserBudgetExceptionApproverAsync(companyId))
+                    {
+                        if (cumulativeAnnualAction == BudgetAction.Stop) cumulativeAnnualAction = BudgetAction.Warn;
+                        if (cumulativeMonthlyAction == BudgetAction.Stop) cumulativeMonthlyAction = BudgetAction.Warn;
+                    }
+
+                    if (cumulativeAnnualAction != BudgetAction.Ignore || cumulativeMonthlyAction != BudgetAction.Ignore)
+                    {
+                        var cumulativeSpend = await GetCumulativeSpendAsync(companyId, fiscalYearId, tenantId);
+                        var totalCumulativeAfter = cumulativeSpend.GetValueOrDefault(item.AccountId, 0m) + item.Amount;
+
+                        if (cumulativeAnnualAction != BudgetAction.Ignore && Math.Round(totalCumulativeAfter - budgetAccount.BudgetAmount, 2) > 0)
+                        {
+                            if (cumulativeAnnualAction == BudgetAction.Stop)
+                            {
+                                throw new BusinessException(MyERPDomainErrorCodes.BudgetExceeded)
+                                    .WithData("account", budgetAccount.AccountName ?? item.AccountId.ToString())
+                                    .WithData("budget", budgetAccount.BudgetAmount)
+                                    .WithData("spent", cumulativeSpend.GetValueOrDefault(item.AccountId, 0m))
+                                    .WithData("requested", item.Amount)
+                                    .WithData("limitType", "CumulativeAnnual");
+                            }
+                        }
+
+                        if (cumulativeMonthlyAction != BudgetAction.Ignore)
+                        {
+                            var accumulatedMonthlyBudget = await CalculateAccumulatedMonthlyBudgetAsync(
+                                budget, budgetAccount.BudgetAmount, postingDate, fiscalYearId);
+
+                            if (Math.Round(totalCumulativeAfter - accumulatedMonthlyBudget, 2) > 0)
+                            {
+                                if (cumulativeMonthlyAction == BudgetAction.Stop)
+                                {
+                                    throw new BusinessException(MyERPDomainErrorCodes.BudgetExceeded)
+                                        .WithData("account", budgetAccount.AccountName ?? item.AccountId.ToString())
+                                        .WithData("budget", accumulatedMonthlyBudget)
+                                        .WithData("spent", cumulativeSpend.GetValueOrDefault(item.AccountId, 0m))
+                                        .WithData("requested", item.Amount)
+                                        .WithData("limitType", "CumulativeMonthly");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private async Task<Dictionary<Guid, decimal>> GetActualSpendAsync(
+        Guid companyId, Guid fiscalYearId, Guid? tenantId)
+    {
+        var fiscalYear = await _fiscalYearRepository.FindAsync(fiscalYearId);
+        var result = new Dictionary<Guid, decimal>();
+        if (fiscalYear == null) return result;
+
+        // Query posted JEs within the fiscal year's date range to get actual spend per account
+        // (per ERPNext budget.get_actual_expense: GL entries are scoped to budget_start_date..budget_end_date)
+        var jeQueryable = await _journalEntryRepository.GetQueryableAsync();
+        var postedEntries = jeQueryable
+            .Where(je => je.CompanyId == companyId
+                      && je.Status == Core.DocumentStatus.Posted
+                      && je.PostingDate >= fiscalYear.StartDate
+                      && je.PostingDate <= fiscalYear.EndDate);
+
+        foreach (var je in postedEntries)
+        {
+            foreach (var line in je.Lines)
+            {
+                // Debit = expense (add to spend)
+                if (line.IsDebit && line.Amount > 0 && line.AccountId != Guid.Empty)
+                {
+                    if (!result.ContainsKey(line.AccountId))
+                        result[line.AccountId] = 0;
+                    result[line.AccountId] += line.Amount;
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private async Task<Dictionary<Guid, decimal>> GetCumulativeSpendAsync(
+        Guid companyId, Guid fiscalYearId, Guid? tenantId)
+    {
+        // 1. Actual GL spend
+        var result = await GetActualSpendAsync(companyId, fiscalYearId, tenantId);
+
+        // 2. Ordered spend in POs (submitted and not cancelled, within fiscal year)
+        var poRepo = LazyServiceProvider.LazyGetService<IRepository<Purchasing.Entities.PurchaseOrder, Guid>>();
+        var fiscalYear = await _fiscalYearRepository.FindAsync(fiscalYearId);
+        if (poRepo != null && fiscalYear != null)
+        {
+            var companyRepo = LazyServiceProvider.LazyGetService<IRepository<Core.Entities.Company, Guid>>();
+            var itemRepo = LazyServiceProvider.LazyGetService<IRepository<Inventory.Entities.Item, Guid>>();
+            var company = companyRepo != null ? await companyRepo.FindAsync(companyId) : null;
+
+            var poQuery = await poRepo.GetQueryableAsync();
+            var activePos = poQuery
+                .Where(po => po.CompanyId == companyId
+                          && po.Status == Core.DocumentStatus.Submitted
+                          && po.OrderDate >= fiscalYear.StartDate
+                          && po.OrderDate <= fiscalYear.EndDate)
+                .ToList();
+
+            Dictionary<Guid, Guid?>? itemAccountMap = null;
+            if (activePos.Any() && itemRepo != null)
+            {
+                var itemIds = activePos.SelectMany(p => p.Items).Select(i => i.ItemId).Distinct().ToList();
+                var itemsQuery = await itemRepo.GetQueryableAsync();
+                itemAccountMap = itemsQuery
+                    .Where(i => itemIds.Contains(i.Id))
+                    .ToDictionary(i => i.Id, i => i.DefaultExpenseAccountId);
+            }
+
+            foreach (var po in activePos)
+            {
+                var conversionRate = po.ExchangeRate > 0 ? po.ExchangeRate : 1m;
+                foreach (var item in po.Items)
+                {
+                    // Per ERPNext PR #61988 (commit b5a4734a8d): skip closed PO item rows in budget commitments
+                    if (item.IsClosed) continue;
+
+                    var unbilledQty = Math.Max(0, item.Quantity - item.BilledQty);
+                    if (unbilledQty <= 0) continue;
+
+                    var accId = item.ExpenseAccountId
+                                ?? (itemAccountMap != null && itemAccountMap.TryGetValue(item.ItemId, out var defaultAcc) ? defaultAcc : null)
+                                ?? company?.DefaultExpenseAccountId;
+
+                    if (accId.HasValue && accId.Value != Guid.Empty)
+                    {
+                        // Per ERPNext PR #59161 (commit 5dec6d6464): convert foreign currency PO unbilled amount to company currency
+                        result[accId.Value] = result.GetValueOrDefault(accId.Value, 0m) + (unbilledQty * item.UnitPrice * conversionRate);
+                    }
+                }
+            }
+        }
+
+        // 3. Requested spend in Material Requests (submitted Purchase MRs within fiscal year)
+        // Per ERPNext PR #61988 (commits 298b4fe202, b5a4734a8d, cba938004e):
+        // Material Request un-ordered commitments check across all items per expense account
+        var mrRepo = LazyServiceProvider.LazyGetService<IRepository<Purchasing.Entities.MaterialRequest, Guid>>();
+        if (mrRepo != null && fiscalYear != null)
+        {
+            var companyRepo = LazyServiceProvider.LazyGetService<IRepository<Core.Entities.Company, Guid>>();
+            var itemRepo = LazyServiceProvider.LazyGetService<IRepository<Inventory.Entities.Item, Guid>>();
+            var company = companyRepo != null ? await companyRepo.FindAsync(companyId) : null;
+
+            var mrQuery = await mrRepo.GetQueryableAsync();
+            var activeMrs = mrQuery
+                .Where(mr => mr.CompanyId == companyId
+                          && mr.Status == Core.DocumentStatus.Submitted
+                          && mr.RequestType == Purchasing.MaterialRequestType.Purchase
+                          && mr.RequestDate >= fiscalYear.StartDate
+                          && mr.RequestDate <= fiscalYear.EndDate)
+                .ToList();
+
+            if (activeMrs.Any() && itemRepo != null)
+            {
+                var mrItemIds = activeMrs.SelectMany(m => m.Items).Select(i => i.ItemId).Distinct().ToList();
+                var itemsQuery = await itemRepo.GetQueryableAsync();
+                var itemDetails = itemsQuery
+                    .Where(i => mrItemIds.Contains(i.Id))
+                    .ToDictionary(i => i.Id, i => (Account: i.DefaultExpenseAccountId, Rate: i.StandardBuyingPrice ?? 0m));
+
+                foreach (var mr in activeMrs)
+                {
+                    foreach (var item in mr.Items)
+                    {
+                        var conversion = item.ConversionFactor > 0 ? item.ConversionFactor : 1m;
+                        var unorderedStockQty = Math.Max(0, item.StockQty - (item.OrderedQuantity * conversion));
+                        if (unorderedStockQty <= 0) continue;
+
+                        itemDetails.TryGetValue(item.ItemId, out var detail);
+                        var accId = detail.Account ?? company?.DefaultExpenseAccountId;
+
+                        if (accId.HasValue && accId.Value != Guid.Empty && detail.Rate > 0)
+                        {
+                            // Per ERPNext PR #61988 (commit cba938004e): count requested budget amounts in the purchase UOM
+                            var amount = (unorderedStockQty / conversion) * detail.Rate;
+                            result[accId.Value] = result.GetValueOrDefault(accId.Value, 0m) + amount;
+                        }
+                    }
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private async Task<decimal> CalculateAccumulatedMonthlyBudgetAsync(
+        Budget budget, decimal budgetAmount, DateTime postingDate, Guid fiscalYearId)
+    {
+        var fiscalYear = await _fiscalYearRepository.FindAsync(fiscalYearId);
+        if (fiscalYear == null) return budgetAmount;
+
+        // Determine months elapsed from start of fiscal year to posting date
+        int elapsedMonths = (postingDate.Year - fiscalYear.StartDate.Year) * 12 + postingDate.Month - fiscalYear.StartDate.Month + 1;
+        if (elapsedMonths <= 0) elapsedMonths = 1;
+        if (elapsedMonths > 12) elapsedMonths = 12;
+
+        if (budget.MonthlyDistributionId.HasValue)
+        {
+            var monthlyDistributionRepo = LazyServiceProvider.LazyGetService<IRepository<MonthlyDistribution, Guid>>();
+            if (monthlyDistributionRepo != null)
+            {
+                var distribution = (await monthlyDistributionRepo.WithDetailsAsync(d => d.Percentages))
+                    .FirstOrDefault(d => d.Id == budget.MonthlyDistributionId.Value);
+
+                if (distribution != null && distribution.Percentages.Any())
+                {
+                    decimal accumulatedPercentage = distribution.Percentages
+                        .Where(p => p.Month <= elapsedMonths)
+                        .Sum(p => p.PercentageAllocation);
+
+                    return Math.Round(budgetAmount * accumulatedPercentage / 100m, 2);
+                }
+            }
+        }
+
+        // Default: even distribution across 12 months
+        decimal defaultPercentage = Math.Min(100m, elapsedMonths * (100m / 12m));
+        return Math.Round(budgetAmount * defaultPercentage / 100m, 2);
+    }
+
+    private static (BudgetAction Annual, BudgetAction Monthly) GetActionsForLevel(Budget budget, BudgetLevel level)
+    {
+        return level switch
+        {
+            BudgetLevel.MaterialRequest => (budget.ActionIfAnnualBudgetExceededOnMr, budget.ActionIfAccumulatedMonthlyBudgetExceededOnMr),
+            BudgetLevel.PurchaseOrder => (budget.ActionIfAnnualBudgetExceededOnPo, budget.ActionIfAccumulatedMonthlyBudgetExceededOnPo),
+            BudgetLevel.Actual => (budget.ActionIfAnnualBudgetExceeded, budget.ActionIfAccumulatedMonthlyBudgetExceeded),
+            _ => (BudgetAction.Ignore, BudgetAction.Ignore)
+        };
+    }
+
+    private async Task<bool> IsUserBudgetExceptionApproverAsync(Guid companyId)
+    {
+        var currentUser = LazyServiceProvider.LazyGetService<Volo.Abp.Users.ICurrentUser>();
+        if (currentUser?.IsAuthenticated != true) return false;
+
+        var companyRepo = LazyServiceProvider.LazyGetService<IRepository<MyERP.Core.Entities.Company, Guid>>();
+        if (companyRepo == null) return false;
+
+        var company = await companyRepo.FindAsync(companyId);
+        if (company == null || string.IsNullOrWhiteSpace(company.ExceptionBudgetApproverRole))
+            return false;
+
+        return currentUser.IsInRole(company.ExceptionBudgetApproverRole);
+    }
+}
+
+public enum BudgetLevel
+{
+    MaterialRequest = 1,
+    PurchaseOrder = 2,
+    Actual = 3
+}
+
+/// <summary>
+/// Input model for budget validation: maps a transaction line to its expense account.
+/// </summary>
+public class BudgetCheckItem
+{
+    public Guid AccountId { get; set; }
+    public decimal Amount { get; set; }
+
+    public BudgetCheckItem(Guid accountId, decimal amount)
+    {
+        AccountId = accountId;
+        Amount = amount;
+    }
+}

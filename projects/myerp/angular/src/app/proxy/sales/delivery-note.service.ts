@@ -1,0 +1,121 @@
+import type { CreateDeliveryNoteDto, DeliveryNoteDto, SalesTeamAllocationInputDto } from './models';
+import { RestService, Rest } from '@abp/ng.core';
+import type { PagedResultDto } from '@abp/ng.core';
+import { Injectable, inject } from '@angular/core';
+import type { BulkOperationResultDto, CompanyFilteredPagedRequestDto } from '../shared/models';
+
+@Injectable({
+  providedIn: 'root',
+})
+export class DeliveryNoteService {
+  private restService = inject(RestService);
+  apiName = 'Default';
+  
+
+  amend = (id: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, DeliveryNoteDto>({
+      method: 'POST',
+      url: `/api/app/delivery-note/${id}/amend`,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  bulkSubmit = (ids: string[], config?: Partial<Rest.Config>) =>
+    this.restService.request<any, BulkOperationResultDto>({
+      method: 'POST',
+      url: '/api/app/delivery-note/bulk-submit',
+      body: ids,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  cancel = (id: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, DeliveryNoteDto>({
+      method: 'POST',
+      url: `/api/app/delivery-note/${id}/cancel`,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  close = (id: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, DeliveryNoteDto>({
+      method: 'POST',
+      url: `/api/app/delivery-note/${id}/close`,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  closeItem = (id: string, itemId: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, DeliveryNoteDto>({
+      method: 'POST',
+      url: `/api/app/delivery-note/${id}/close-item/${itemId}`,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  create = (input: CreateDeliveryNoteDto, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, DeliveryNoteDto>({
+      method: 'POST',
+      url: '/api/app/delivery-note',
+      body: input,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  get = (id: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, DeliveryNoteDto>({
+      method: 'GET',
+      url: `/api/app/delivery-note/${id}`,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  getList = (input: CompanyFilteredPagedRequestDto, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, PagedResultDto<DeliveryNoteDto>>({
+      method: 'GET',
+      url: '/api/app/delivery-note',
+      params: { companyId: input.companyId, filter: input.filter, status: input.status, fromDate: input.fromDate, toDate: input.toDate, sorting: input.sorting, skipCount: input.skipCount, maxResultCount: input.maxResultCount },
+    },
+    { apiName: this.apiName,...config });
+  
+
+  reopen = (id: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, DeliveryNoteDto>({
+      method: 'POST',
+      url: `/api/app/delivery-note/${id}/reopen`,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  reopenItem = (id: string, itemId: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, DeliveryNoteDto>({
+      method: 'POST',
+      url: `/api/app/delivery-note/${id}/reopen-item/${itemId}`,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  submit = (id: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, DeliveryNoteDto>({
+      method: 'POST',
+      url: `/api/app/delivery-note/${id}/submit`,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  update = (id: string, input: CreateDeliveryNoteDto, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, DeliveryNoteDto>({
+      method: 'PUT',
+      url: `/api/app/delivery-note/${id}`,
+      body: input,
+    },
+    { apiName: this.apiName,...config });
+  updateSalesTeam = (id: string, input: SalesTeamAllocationInputDto[], config?: Partial<Rest.Config>) =>
+    this.restService.request<any, DeliveryNoteDto>({
+      method: 'PUT',
+      url: `/api/app/delivery-note/${id}/sales-team`,
+      body: input,
+    },
+    { apiName: this.apiName,...config });
+
+}

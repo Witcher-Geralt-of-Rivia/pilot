@@ -1,0 +1,261 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Purchasing.Entities;
+using Volo.Abp;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Domain.Services;
+
+namespace MyERP.Purchasing.DomainServices;
+
+/// <summary>
+/// Domain service for Material Request business rules.
+/// Manages MR fulfillment tracking, type-specific validations, and over-fulfillment prevention.
+/// </summary>
+public class MaterialRequestManager : DomainService
+{
+    private readonly IRepository<MaterialRequest, Guid> _mrRepository;
+
+    public MaterialRequestManager(IRepository<MaterialRequest, Guid> mrRepository)
+    {
+        _mrRepository = mrRepository;
+    }
+
+    /// <summary>
+    /// Validates that a Material Request can be submitted.
+    /// Must have at least one item.
+    /// </summary>
+    public void ValidateForSubmission(MaterialRequest mr)
+    {
+        if (!mr.Items.Any())
+            throw new BusinessException(MyERPDomainErrorCodes.DocumentMustHaveItems);
+    }
+
+    /// <summary>
+    /// Validates that a Material Request is submitted and not stopped/closed before creating downstream documents.
+    /// Per ERPNext PR #60432 (commit 1dc5b8d3be): stopped Material Requests cannot create downstream documents.
+    /// </summary>
+    public void ValidateCanCreateDownstream(MaterialRequest mr)
+    {
+        if (mr.Status == Core.DocumentStatus.Closed)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("requestNumber", mr.RequestNumber)
+                .WithData("detail", $"Material Request {mr.RequestNumber} is stopped/closed and cannot be processed further.");
+        }
+
+        if (mr.Status != Core.DocumentStatus.Submitted)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("requestNumber", mr.RequestNumber)
+                .WithData("detail", $"Material Request {mr.RequestNumber} must be submitted before creating downstream documents.");
+        }
+    }
+
+    /// <summary>
+    /// Updates ordered/transferred/received quantities on MR items when downstream documents (e.g.
+    /// Stock Entries pulled from a Transfer/Issue-type MR) are submitted or cancelled.
+    /// Batches by affected MR the same way PurchaseOrderManager.UpdateMaterialRequestOrderedQtyAsync
+    /// does for the Purchase side, since a caller only knows MaterialRequestItemId per line (not
+    /// the owning MaterialRequestId).
+    /// Per DO-NOT: "Allow Material Request over-fulfillment beyond mr_qty_allowance percentage"
+    /// </summary>
+    public async Task UpdateFulfillmentForItemsAsync(
+        IEnumerable<(Guid MaterialRequestItemId, decimal Quantity)> lines, bool reverse = false)
+    {
+        var lineList = lines.ToList();
+        if (!lineList.Any()) return;
+
+        var mrItemIds = lineList.Select(l => l.MaterialRequestItemId).Distinct().ToList();
+        var mrQuery = await _mrRepository.GetQueryableAsync();
+        var affectedMRs = mrQuery
+            .Where(mr => mr.Items.Any(i => mrItemIds.Contains(i.Id)))
+            .ToList();
+
+        var binService = LazyServiceProvider?.LazyGetService<MyERP.Inventory.DomainServices.BinService>();
+
+        foreach (var mr in affectedMRs)
+        {
+            var typeSign = mr.RequestType == MaterialRequestType.MaterialIssue ? -1 : 1;
+
+            foreach (var line in lineList)
+            {
+                var mrItem = mr.Items.FirstOrDefault(i => i.Id == line.MaterialRequestItemId);
+                if (mrItem == null) continue;
+
+                var delta = reverse ? -line.Quantity : line.Quantity;
+                mrItem.OrderedQuantity = Math.Max(0, mrItem.OrderedQuantity + delta);
+
+                if (binService != null && mrItem.WarehouseId.HasValue)
+                {
+                    // Downstream fulfillment decrements pending inward indented qty towards 0 (or increments outward toward 0).
+                    // Reversing fulfillment (cancel) restores pending indented qty.
+                    var indentedChange = (reverse ? 1 : -1) * typeSign * line.Quantity;
+                    await binService.UpdateIndentedQtyAsync(
+                        mrItem.ItemId, mrItem.WarehouseId.Value, indentedChange, mr.TenantId);
+                }
+            }
+            mr.UpdateFulfillmentStatus();
+            await _mrRepository.UpdateAsync(mr);
+        }
+    }
+
+    /// <summary>
+    /// Updates received quantities on MR items when downstream receipts (Purchase Receipts or
+    /// stock-updating Purchase Invoices) are submitted or cancelled.
+    /// Supports combining receipt quantities on mixed receipts per ERPNext PR #60208 / commit ba48a9d0ad.
+    /// </summary>
+    public async Task UpdateReceiptFulfillmentForItemsAsync(
+        IEnumerable<(Guid MaterialRequestItemId, decimal Quantity)> lines, bool reverse = false)
+    {
+        var lineList = lines.ToList();
+        if (!lineList.Any()) return;
+
+        var mrItemIds = lineList.Select(l => l.MaterialRequestItemId).Distinct().ToList();
+        var mrQuery = await _mrRepository.GetQueryableAsync();
+        var affectedMRs = mrQuery
+            .Where(mr => mr.Items.Any(i => mrItemIds.Contains(i.Id)))
+            .ToList();
+
+        foreach (var mr in affectedMRs)
+        {
+            foreach (var line in lineList)
+            {
+                var mrItem = mr.Items.FirstOrDefault(i => i.Id == line.MaterialRequestItemId);
+                if (mrItem == null) continue;
+
+                var delta = reverse ? -line.Quantity : line.Quantity;
+                mrItem.ReceivedQuantity = Math.Max(0, mrItem.ReceivedQuantity + delta);
+            }
+            mr.UpdateFulfillmentStatus();
+            await _mrRepository.UpdateAsync(mr);
+        }
+    }
+
+    /// <summary>
+    /// Validates ordered/transferred quantity against allowed MR quantity.
+    /// Per ERPNext PR #53049 / commit 30c3ff2efe: uses StockQty instead of transaction Qty for allowed threshold calculation.
+    /// </summary>
+    public void ValidateOrderedQty(MaterialRequestItem item, decimal attemptingOrderedQty, decimal mrQtyAllowancePct = 0m)
+    {
+        var stockQty = item.StockQty > 0 ? item.StockQty : item.Quantity;
+        var allowedQty = stockQty + (stockQty * (mrQtyAllowancePct / 100m));
+        if (attemptingOrderedQty > allowedQty)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.OverTransfer)
+                .WithData("item", item.ItemName)
+                .WithData("maxAllowed", allowedQty)
+                .WithData("attempted", attemptingOrderedQty)
+                .WithData("alreadyTransferred", item.OrderedQuantity);
+        }
+    }
+
+    /// <summary>
+    /// Checks if a Material Request is fully fulfilled (all items ordered/transferred or received).
+    /// Uses 99.99% threshold for float tolerance (per ERPNext per_ordered/per_received rounding).
+    /// Per ERPNext PR #56621: if PerReceived >= 99.99m, it is fulfilled even if PerOrdered is less.
+    /// </summary>
+    public bool IsFullyFulfilled(MaterialRequest mr)
+    {
+        if (!mr.Items.Any()) return false;
+
+        var allReceived = mr.Items.All(item =>
+        {
+            if (item.Quantity <= 0) return true;
+            var perReceived = (item.ReceivedQuantity / item.Quantity) * 100;
+            return perReceived >= 99.99m;
+        });
+
+        if (allReceived) return true;
+
+        return mr.Items.All(item =>
+        {
+            if (item.Quantity <= 0) return true;
+            var perOrdered = (item.OrderedQuantity / item.Quantity) * 100;
+            return perOrdered >= 99.99m;
+        });
+    }
+
+    /// <summary>
+    /// Gets the pending (unfulfilled) quantity for an MR item.
+    /// Per ERPNext PR #47012 / commit 5a524854de: based on OrderedQuantity (or ReceivedQuantity if higher).
+    /// </summary>
+    public static decimal GetPendingQty(MaterialRequestItem item)
+    {
+        var orderedOrReceived = item.OrderedQuantity > 0 ? item.OrderedQuantity : item.ReceivedQuantity;
+        return Math.Max(0, item.Quantity - orderedOrReceived);
+    }
+
+    /// <summary>
+    /// Validates that Material Request items linked to a Sales Order line match the item, company, UOM, and conversion factor (gotcha PR #58443).
+    /// </summary>
+    public async Task ValidateWithSalesOrderAsync(MaterialRequest mr, IRepository<Sales.Entities.SalesOrder, Guid> soRepository)
+    {
+        var soItems = mr.Items.Where(i => i.SalesOrderId.HasValue).ToList();
+        if (!soItems.Any()) return;
+
+        var soIds = soItems.Select(i => i.SalesOrderId!.Value).Distinct().ToList();
+        foreach (var soId in soIds)
+        {
+            var so = await soRepository.FindAsync(soId);
+            if (so == null) continue;
+
+            if (so.CompanyId != mr.CompanyId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Material Request company does not match Sales Order {so.OrderNumber} company.");
+            }
+
+            var soItemRows = soItems.Where(i => i.SalesOrderId == soId).ToList();
+            foreach (var mrItem in soItemRows)
+            {
+                if (mrItem.SalesOrderItemId.HasValue)
+                {
+                    var targetSoItem = so.Items.FirstOrDefault(i => i.Id == mrItem.SalesOrderItemId.Value);
+                    if (targetSoItem != null)
+                    {
+                        if (targetSoItem.ItemId != mrItem.ItemId)
+                        {
+                            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                                .WithData("detail", "Material Request item does not match linked Sales Order item row.");
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(mrItem.Uom) && !string.IsNullOrWhiteSpace(targetSoItem.Uom) &&
+                            !string.Equals(mrItem.Uom, targetSoItem.Uom, StringComparison.OrdinalIgnoreCase))
+                        {
+                            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                                .WithData("detail", $"Material Request item UOM '{mrItem.Uom}' does not match linked Sales Order item UOM '{targetSoItem.Uom}'.");
+                        }
+
+                        if (mrItem.ConversionFactor > 0 && targetSoItem.ConversionFactor > 0 &&
+                            mrItem.ConversionFactor != targetSoItem.ConversionFactor)
+                        {
+                            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                                .WithData("detail", "Material Request conversion factor does not match linked Sales Order item row.");
+                        }
+                    }
+                }
+            }
+
+            // Validate combined requested qty per SO line item (ERPNext PR #59615 / commit ee3346fe4f)
+            var itemsBySoItem = soItemRows.Where(i => i.SalesOrderItemId.HasValue).GroupBy(i => i.SalesOrderItemId!.Value);
+            foreach (var group in itemsBySoItem)
+            {
+                var targetSoItem = so.Items.FirstOrDefault(i => i.Id == group.Key);
+                if (targetSoItem != null)
+                {
+                    var availableToRequest = Math.Max(0, targetSoItem.Quantity - targetSoItem.RequestedQty);
+                    var totalRequestedInThisMr = group.Sum(i => i.Quantity);
+                    if (totalRequestedInThisMr > availableToRequest)
+                    {
+                        throw new BusinessException(MyERPDomainErrorCodes.QtyExceedsPendingSalesOrder)
+                            .WithData("item", targetSoItem.Description ?? targetSoItem.ItemId.ToString())
+                            .WithData("maxAllowed", availableToRequest)
+                            .WithData("requested", totalRequestedInThisMr);
+                    }
+                }
+            }
+        }
+    }
+}

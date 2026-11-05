@@ -1,0 +1,44 @@
+using System;
+using Volo.Abp.Application.Dtos;
+
+namespace MyERP.Sales;
+
+public class CustomerDto : FullAuditedEntityDto<Guid>
+{
+    public Guid CompanyId { get; set; }
+    public string Name { get; set; } = null!;
+    public string? CustomerCode { get; set; }
+    public string? Tin { get; set; }
+    public string? RegistrationNumber { get; set; }
+    public string? SstRegistrationNumber { get; set; }
+    public string? IdType { get; set; }
+    public string? IdValue { get; set; }
+    public string? ContactPerson { get; set; }
+    public string? Phone { get; set; }
+    public string? Email { get; set; }
+    public string? Website { get; set; }
+    public string? Address { get; set; }
+    public string? City { get; set; }
+    public string? State { get; set; }
+    public string? PostalCode { get; set; }
+    public string? Country { get; set; }
+    public Guid? DefaultReceivableAccountId { get; set; }
+    public bool IsActive { get; set; }
+    public decimal CreditLimit { get; set; }
+    public Guid? RepresentsCompanyId { get; set; }
+    public Guid? CustomerGroupId { get; set; }
+    public Guid? TerritoryId { get; set; }
+    public Guid? LoyaltyProgramId { get; set; }
+    public Guid? DefaultPaymentTermsTemplateId { get; set; }
+    public Guid? DefaultPriceListId { get; set; }
+    public bool RestrictToCompanies { get; set; }
+    public bool SoRequired { get; set; }
+    public bool IsFrozen { get; set; }
+    public bool DnRequired { get; set; }
+    public bool OnHold { get; set; }
+    public DateTime? ReleaseDate { get; set; }
+    public bool IsBlocked { get; set; }
+    public Guid? LeadId { get; set; }
+    public Guid? OpportunityId { get; set; }
+    public Guid? ProspectId { get; set; }
+}

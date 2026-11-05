@@ -1,0 +1,82 @@
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using Volo.Abp.Application.Services;
+
+namespace MyERP.Sales;
+
+/// <summary>
+/// Handles document-to-document conversion along the sales and purchase pipelines.
+/// Mirrors ERPNext's "Make" button functionality.
+/// </summary>
+public interface IDocumentConversionAppService : IApplicationService
+{
+    /// <summary>Convert a submitted Quotation into a Sales Order.</summary>
+    Task<SalesOrderDto> ConvertQuotationToSalesOrderAsync(Guid quotationId, List<Guid>? selectedItemIds = null);
+
+    /// <summary>Convert a submitted Quotation into a Sales Invoice (ERPNext PR #62623 / commit bddb16e1a3).</summary>
+    Task<SalesInvoiceDto> ConvertQuotationToSalesInvoiceAsync(Guid quotationId, List<Guid>? selectedItemIds = null);
+
+    /// <summary>Convert a submitted Sales Order into a Delivery Note. When selectedItems is empty, delivers all pending items.</summary>
+    Task<DeliveryNoteDto> ConvertSalesOrderToDeliveryNoteAsync(Guid salesOrderId, List<PartialDeliveryItemDto>? selectedItems = null);
+
+    /// <summary>Convert SO items due by a cutoff date into a Delivery Note (scheduled delivery filter).</summary>
+    /// <param name="salesOrderId">Sales Order ID</param>
+    /// <param name="untilDeliveryDate">Only include items with DeliveryDate on or before this date. Per ERPNext SO→DN mapper: delivery_date cutoff filter for partial scheduled deliveries.</param>
+    Task<DeliveryNoteDto> ConvertSalesOrderToDeliveryNoteByDateAsync(Guid salesOrderId, DateTime untilDeliveryDate);
+
+    /// <summary>Convert a submitted Sales Order into a Sales Invoice.</summary>
+    Task<SalesInvoiceDto> ConvertSalesOrderToSalesInvoiceAsync(Guid salesOrderId);
+
+    /// <summary>Convert a submitted Delivery Note into a Sales Invoice.</summary>
+    Task<SalesInvoiceDto> ConvertDeliveryNoteToSalesInvoiceAsync(Guid deliveryNoteId);
+
+    /// <summary>Convert an Open/Replied Opportunity into a Quotation.</summary>
+    Task<QuotationDto> ConvertOpportunityToQuotationAsync(Guid opportunityId);
+
+    /// <summary>Convert a submitted Sales Order's pending items into a Material Request.</summary>
+    Task<Guid> ConvertSalesOrderToMaterialRequestAsync(Guid salesOrderId);
+
+    /// <summary>
+    /// Convert a submitted Sales Order's open, warehouse-delivered items (including decomposed Product Bundles)
+    /// into a Draft Pick List (ERPNext selling/doctype/sales_order/mapper.py create_pick_list, commit 754475b51a).
+    /// </summary>
+    Task<Guid> ConvertSalesOrderToPickListAsync(Guid salesOrderId);
+
+    /// <summary>
+    /// Create a draft Purchase Order per supplier from the selected rows of a submitted Sales Order
+    /// (ERPNext Sales Order → Make → Purchase Order). Returns the new Purchase Order ids; an empty
+    /// selection returns an empty list.
+    /// </summary>
+    Task<List<Guid>> ConvertSalesOrderToPurchaseOrdersAsync(Guid salesOrderId, List<SalesOrderPurchaseItemSelectionDto> selectedItems);
+
+}
+
+/// <summary>
+/// One Sales Order row picked for purchasing, with the supplier to order it from.
+/// Rows are identified by id (not item code) so repeated item codes stay distinct.
+/// </summary>
+public class SalesOrderPurchaseItemSelectionDto
+{
+    /// <summary>Sales Order Item ID to order.</summary>
+    public Guid SalesOrderItemId { get; set; }
+
+    /// <summary>Supplier to create the Purchase Order for.</summary>
+    public Guid SupplierId { get; set; }
+}
+
+/// <summary>
+/// DTO for partial delivery item selection.
+/// Per ERPNext: users select which items and quantities to deliver from an order.
+/// </summary>
+public class PartialDeliveryItemDto
+{
+    /// <summary>Sales Order Item ID to deliver.</summary>
+    public Guid SalesOrderItemId { get; set; }
+
+    /// <summary>Quantity to deliver (must be > 0 and ≤ PendingDeliveryQty).</summary>
+    public decimal Quantity { get; set; }
+
+    /// <summary>Optional warehouse override (defaults to SO item warehouse).</summary>
+    public Guid? WarehouseId { get; set; }
+}

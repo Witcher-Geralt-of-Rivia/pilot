@@ -1,0 +1,84 @@
+<abp-page [title]="'::Companies' | abpLocalization">
+  <div class="d-flex justify-content-end gap-2 mb-3">
+    <button class="btn btn-primary btn-sm" (click)="createCompany()">
+      <i class="fa fa-plus me-1"></i>
+      {{ '::NewCompany' | abpLocalization }}
+    </button>
+  </div>
+
+  <div class="card">
+    <div class="card-body">
+      <!-- Filter row -->
+      <div class="row mb-3 align-items-center">
+        <div class="col">
+          <span class="text-muted small">{{ companies.length }} {{ '::Results' | abpLocalization }}</span>
+        </div>
+        <div class="col-auto">
+          <div class="input-group input-group-sm" style="width: 250px;">
+            <span class="input-group-text"><i class="fa fa-search"></i></span>
+            <input type="text" class="form-control"
+              [placeholder]="'::Search' | abpLocalization" />
+          </div>
+        </div>
+      </div>
+
+      @if (isLoading) {
+        <div class="d-flex justify-content-center py-5">
+          <div class="spinner-border text-primary" role="status">
+            <span class="visually-hidden">Loading...</span>
+          </div>
+        </div>
+      } @else if (companies.length === 0) {
+        <div class="text-center py-5">
+          <i class="fa fa-building fa-3x text-muted mb-3 d-block"></i>
+          <h6 class="text-muted">{{ '::NoRecordsFound' | abpLocalization }}</h6>
+          <p class="text-muted small mb-3">{{ '::NoCompaniesYet' | abpLocalization }}</p>
+          <button class="btn btn-primary btn-sm" (click)="createCompany()">
+            <i class="fa fa-plus me-1"></i>{{ '::NewCompany' | abpLocalization }}
+          </button>
+        </div>
+      } @else {
+        <div class="table-responsive">
+                    <table class="table table-hover w-100">
+            <thead>
+              <tr>
+                <th style="min-width: 180px;">{{ '::Name' | abpLocalization }}</th>
+                <th style="width: 140px;">{{ '::TIN' | abpLocalization }}</th>
+                <th class="d-none d-md-table-cell" style="width: 140px;">{{ '::SSTRegistration' | abpLocalization }}</th>
+                <th style="width: 90px;">{{ '::Currency' | abpLocalization }}</th>
+                <th style="width: 100px;">{{ '::Status' | abpLocalization }}</th>
+                <th class="text-end" style="width: 80px;"></th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (company of companies; track company.id ?? $index) {
+                <tr>
+                  <td class="fw-semibold">
+                    <span class="d-inline-block text-truncate" style="max-width: 220px;"
+                    [title]="company.name">
+                    {{ company.name }}
+                    </span>
+                  </td>
+                  <td class="font-monospace small">{{ company.taxId }}</td>
+                  <td class="d-none d-md-table-cell font-monospace small">{{ company.sstRegistrationNumber }}</td>
+                  <td>{{ company.currencyCode }}</td>
+                  <td><app-status-badge [status]="company.isActive ? 'Active' : 'Inactive'" /></td>
+                  <td class="text-end">
+                    <div class="btn-group btn-group-sm">
+                    <button class="btn btn-outline-primary" [routerLink]="[company.id, 'edit']"
+                    title="Edit" aria-label="Edit">
+                    <i class="fa fa-pencil"></i>
+                    </button>
+                    </div>
+                  </td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        </div>
+      }
+    </div>
+  </div>
+
+  <app-pagination [totalCount]="totalCount" [pageSize]="pageSize" [currentPage]="currentPage" (pageChange)="onPageChange($event)" />
+</abp-page>

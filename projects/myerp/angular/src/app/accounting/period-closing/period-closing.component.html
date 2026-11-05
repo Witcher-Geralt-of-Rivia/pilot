@@ -1,0 +1,149 @@
+<abp-page [title]="'::PeriodClosing' | abpLocalization">
+  <div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+      <h5 class="mb-0">{{ '::PeriodClosingVouchers' | abpLocalization }}</h5>
+      <button class="btn btn-primary btn-sm" (click)="toggleCreateForm()">
+        <i class="fa fa-plus me-1"></i>{{ '::New' | abpLocalization }}
+      </button>
+    </div>
+
+    @if (showCreateForm()) {
+      <div class="card-body border-bottom bg-light">
+        <h6>{{ '::CreatePeriodClosingVoucher' | abpLocalization }}</h6>
+        <div class="row g-2 align-items-end">
+          <div class="col-md-2">
+            <label class="form-label">{{ '::Company' | abpLocalization }}</label>
+            <select class="form-select form-select-sm" [(ngModel)]="form.companyId" (change)="onCompanyChanged(form.companyId)">
+              <option value="">{{ '::SelectCompany' | abpLocalization }}</option>
+              @for (c of companies(); track c.id) {
+                <option [value]="c.id">{{ c.name }}</option>
+              }
+            </select>
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">{{ '::PostingDate' | abpLocalization }}</label>
+            <input type="date" class="form-control form-control-sm" [(ngModel)]="form.postingDate" />
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">{{ '::ClosingAccount' | abpLocalization }}</label>
+            <select class="form-select form-select-sm" [(ngModel)]="form.closingAccountId">
+              <option value="">{{ '::SelectAccount' | abpLocalization }}</option>
+              @for (a of accounts(); track a.id) {
+                <option [value]="a.id">{{ a.accountCode }} - {{ a.accountName }}</option>
+              }
+            </select>
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">{{ '::FiscalYear' | abpLocalization }}</label>
+            <select class="form-select form-select-sm" [(ngModel)]="form.fiscalYearId">
+              <option value="">{{ '::SelectFiscalYear' | abpLocalization }}</option>
+              @for (fy of fiscalYears(); track fy.id) {
+                <option [value]="fy.id">{{ fy.name }}</option>
+              }
+            </select>
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">{{ '::Remarks' | abpLocalization }}</label>
+            <input type="text" class="form-control form-control-sm" [(ngModel)]="form.remarks" />
+          </div>
+          <div class="col-md-2">
+            <button class="btn btn-success btn-sm" (click)="create()">
+              <i class="fa fa-check me-1"></i>{{ '::Create' | abpLocalization }}
+            </button>
+            <button class="btn btn-outline-secondary btn-sm ms-1" (click)="toggleCreateForm()">
+              {{ '::Cancel' | abpLocalization }}
+            </button>
+          </div>
+        </div>
+      </div>
+    }
+
+    <div class="card-body">
+      @if (isLoading()) {
+        <app-loading-overlay />
+      }
+
+      @if (!isLoading() && items().length === 0) {
+        <div class="text-center py-4 text-muted">
+          <i class="fa fa-book fa-2x mb-2"></i>
+          <p>{{ '::NoPeriodClosingVouchersYet' | abpLocalization }}</p>
+          <button class="btn btn-primary btn-sm" (click)="toggleCreateForm()">
+            <i class="fa fa-plus me-1"></i>{{ '::CreatePeriodClosingVoucher' | abpLocalization }}
+          </button>
+        </div>
+      } @else if (items().length > 0) {
+        <div class="table-responsive">
+          <table class="table table-hover table-sm">
+            <thead>
+              <tr>
+                <th>{{ '::PostingDate' | abpLocalization }}</th>
+                <th>{{ '::ClosingAccount' | abpLocalization }}</th>
+                <th class="text-end">{{ '::TotalAmount' | abpLocalization }}</th>
+                <th class="text-end">{{ '::AcceptedStockDifference' | abpLocalization }}</th>
+                <th>{{ '::Status' | abpLocalization }}</th>
+                <th>{{ '::Remarks' | abpLocalization }}</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (item of items(); track item.id) {
+                <tr>
+                  <td>{{ item.postingDate | date:'dd/MM/yyyy' }}</td>
+                  <td>{{ getAccountName(item.closingAccountId) }}</td>
+                  <td class="text-end fw-bold">{{ item.totalClosingAmount | number:'1.2-2' }}</td>
+                  <td class="text-end text-muted">@if (item.stockValueDifference) { {{ item.stockValueDifference | number:'1.2-2' }} } @else { — }</td>
+                  <td><app-status-badge [status]="getStatusLabel(item.status)" /></td>
+                  <td>{{ item.remarks }}</td>
+                  <td class="text-end">
+                    <div class="btn-group btn-group-sm">
+                      @if (item.status === 0) {
+                        <button class="btn btn-outline-success" (click)="submit(item.id!)" title="Submit">
+                          <i class="fa fa-paper-plane"></i>
+                        </button>
+                      }
+                      @if (item.status === 1) {
+                        <button class="btn btn-outline-info" (click)="toggleGlEntries(item.id!)" title="View GL Entries">
+                          <i class="fa" [class.fa-eye]="expandedPcvId() !== item.id" [class.fa-eye-slash]="expandedPcvId() === item.id"></i>
+                        </button>
+                        <button class="btn btn-outline-danger" (click)="cancel(item.id!)" title="Cancel">
+                          <i class="fa fa-times"></i>
+                        </button>
+                      }
+                    </div>
+                  </td>
+                </tr>
+                @if (expandedPcvId() === item.id && glEntries().length > 0) {
+                  <tr>
+                    <td colspan="7" class="p-0">
+                      <div class="bg-light p-3">
+                        <h6 class="mb-2"><i class="fa fa-list-ol me-1"></i>{{ '::LedgerEntries' | abpLocalization }} ({{ glEntries().length }})</h6>
+                        <table class="table table-sm table-bordered mb-0">
+                          <thead class="table-secondary">
+                            <tr>
+                              <th>{{ '::Account' | abpLocalization }}</th>
+                              <th class="text-end">{{ '::Debit' | abpLocalization }}</th>
+                              <th class="text-end">{{ '::Credit' | abpLocalization }}</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            @for (gl of glEntries(); track gl.accountId) {
+                              <tr>
+                                <td>{{ gl.accountName }}</td>
+                                <td class="text-end">@if (gl.debit) { {{ gl.debit | number:'1.2-2' }} }</td>
+                                <td class="text-end">@if (gl.credit) { {{ gl.credit | number:'1.2-2' }} }</td>
+                              </tr>
+                            }
+                          </tbody>
+                        </table>
+                      </div>
+                    </td>
+                  </tr>
+                }
+              }
+            </tbody>
+          </table>
+        </div>
+      }
+    </div>
+  </div>
+</abp-page>

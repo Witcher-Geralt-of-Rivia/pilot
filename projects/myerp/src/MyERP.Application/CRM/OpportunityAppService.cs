@@ -1,0 +1,666 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Core;
+using MyERP.CRM.Entities;
+using MyERP.Permissions;
+using MyERP.Sales.Entities;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+
+namespace MyERP.CRM;
+
+[Authorize(MyERPPermissions.Opportunities.Default)]
+public class OpportunityAppService : ApplicationService, IOpportunityAppService
+{
+    private readonly IRepository<Opportunity, Guid> _repository;
+    private readonly IRepository<Quotation, Guid> _quotationRepository;
+    private readonly IRepository<CompetitorDetail, Guid> _competitorDetailRepository;
+    private readonly IRepository<CrmNote, Guid> _noteRepository;
+
+    public OpportunityAppService(
+        IRepository<Opportunity, Guid> repository,
+        IRepository<Quotation, Guid> quotationRepository,
+        IRepository<CompetitorDetail, Guid> competitorDetailRepository,
+        IRepository<CrmNote, Guid> noteRepository)
+    {
+        _repository = repository;
+        _quotationRepository = quotationRepository;
+        _competitorDetailRepository = competitorDetailRepository;
+        _noteRepository = noteRepository;
+    }
+
+    public async Task<OpportunityDto> GetAsync(Guid id)
+    {
+        var opp = await _repository.GetAsync(id, includeDetails: true);
+        var dto = ObjectMapper.Map<Opportunity, OpportunityDto>(opp);
+        dto.Competitors = (await _competitorDetailRepository.GetListAsync(
+                c => c.ParentType == "Opportunity" && c.ParentId == id))
+            .Select(c => new CompetitorDetailDto
+            {
+                Id = c.Id,
+                ParentType = c.ParentType,
+                ParentId = c.ParentId,
+                CompetitorId = c.CompetitorId,
+            }).ToList();
+        return dto;
+    }
+
+    // --- Competitors ---
+
+    [Authorize(MyERPPermissions.Opportunities.Edit)]
+    public async Task<CompetitorDetailDto> CreateCompetitorAsync(AddCompetitorDetailDto input)
+    {
+        var exists = await _competitorDetailRepository.AnyAsync(
+            c => c.ParentType == input.ParentType && c.ParentId == input.ParentId && c.CompetitorId == input.CompetitorId);
+        if (exists)
+            throw new BusinessException(MyERPDomainErrorCodes.DuplicateRecord)
+                .WithData("entity", "Competitor Detail");
+
+        var detail = new CompetitorDetail(GuidGenerator.Create(), input.ParentType, input.ParentId, input.CompetitorId, CurrentTenant.Id);
+        await _competitorDetailRepository.InsertAsync(detail);
+
+        return new CompetitorDetailDto
+        {
+            Id = detail.Id,
+            ParentType = detail.ParentType,
+            ParentId = detail.ParentId,
+            CompetitorId = detail.CompetitorId,
+        };
+    }
+
+    [Authorize(MyERPPermissions.Opportunities.Edit)]
+    public async Task DeleteCompetitorAsync(Guid competitorDetailId)
+    {
+        await _competitorDetailRepository.DeleteAsync(competitorDetailId);
+    }
+
+    public async Task<PagedResultDto<OpportunityDto>> GetListAsync(GetOpportunityListDto input)
+    {
+        var query = await _repository.GetQueryableAsync();
+
+        if (input.Status.HasValue)
+            query = query.Where(o => o.Status == input.Status.Value);
+        if (input.OpportunityType.HasValue)
+            query = query.Where(o => o.OpportunityType == input.OpportunityType.Value);
+        if (input.CompanyId.HasValue)
+            query = query.Where(o => o.CompanyId == input.CompanyId.Value);
+        if (input.LeadId.HasValue)
+            query = query.Where(o => o.LeadId == input.LeadId.Value);
+        if (!string.IsNullOrWhiteSpace(input.Filter))
+        {
+            var filter = input.Filter;
+            query = query.Where(o =>
+                o.Title.Contains(filter) ||
+                (o.ContactName != null && o.ContactName.Contains(filter)) ||
+                o.OpportunityNumber.Contains(filter));
+        }
+
+        var totalCount = query.Count();
+
+        if (!string.IsNullOrWhiteSpace(input.Sorting))
+            query = ApplySorting(query, input.Sorting);
+        else
+            query = query.OrderByDescending(o => o.CreationTime);
+
+        var items = query.Skip(input.SkipCount).Take(input.MaxResultCount).ToList();
+
+        return new PagedResultDto<OpportunityDto>(totalCount, items.Select(x => ObjectMapper.Map<Opportunity, OpportunityDto>(x)).ToList());
+    }
+
+    [Authorize(MyERPPermissions.Opportunities.Create)]
+    public async Task<OpportunityDto> CreateAsync(CreateOpportunityDto input)
+    {
+        var itemIds = input.Items.Where(i => i.ItemId.HasValue).Select(i => i.ItemId!.Value).Distinct().ToArray();
+        if (itemIds.Length > 0)
+        {
+            var itemValidation = LazyServiceProvider.LazyGetRequiredService<MyERP.Inventory.DomainServices.ItemTransactionValidationService>();
+            await itemValidation.ValidateItemsForTransactionAsync(itemIds);
+        }
+
+        if (input.CustomerId.HasValue)
+        {
+            var customerRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.Customer, Guid>>();
+            var customer = await customerRepo.FindAsync(input.CustomerId.Value);
+            if (customer != null)
+            {
+                if (!customer.IsActive)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.PartyDisabled)
+                        .WithData("partyType", "Customer")
+                        .WithData("partyName", customer.Name);
+                }
+                if (customer.CompanyId != input.CompanyId)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                        .WithData("customerCompany", customer.CompanyId)
+                        .WithData("opportunityCompany", input.CompanyId);
+                }
+            }
+        }
+
+        if (input.LeadId.HasValue)
+        {
+            var leadRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<CRM.Entities.Lead, Guid>>();
+            var lead = await leadRepo.FindAsync(input.LeadId.Value);
+            if (lead != null && lead.CompanyId != input.CompanyId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("leadCompany", lead.CompanyId)
+                    .WithData("opportunityCompany", input.CompanyId);
+            }
+        }
+
+        var restrictionService = LazyServiceProvider.LazyGetRequiredService<MyERP.Core.DomainServices.CompanyRestrictionValidationService>();
+        await restrictionService.ValidateTransactionCompanyAsync(
+            "Opportunity",
+            input.CompanyId,
+            itemIds: itemIds,
+            customerIds: input.CustomerId.HasValue ? new[] { input.CustomerId.Value } : null);
+
+        var oppNumber = $"OPP-{DateTime.UtcNow:yyyyMMdd}-{Guid.NewGuid().ToString()[..6].ToUpper()}";
+        var opp = new Opportunity(
+            GuidGenerator.Create(),
+            input.CompanyId,
+            oppNumber,
+            input.Title,
+            CurrentTenant.Id)
+        {
+            OpportunityType = input.OpportunityType,
+            LeadId = input.LeadId,
+            CustomerId = input.CustomerId,
+            ContactName = input.ContactName,
+            ContactEmail = input.ContactEmail,
+            ContactPhone = input.ContactPhone,
+            SalesStage = input.SalesStage ?? "Prospecting",
+            Probability = input.Probability,
+            ExpectedClosingDate = input.ExpectedClosingDate,
+            OpportunityAmount = input.OpportunityAmount,
+            CurrencyCode = input.CurrencyCode,
+            AssignedUserId = input.AssignedUserId,
+            Territory = input.Territory,
+            Notes = input.Notes,
+            CampaignName = input.CampaignName,
+            UtmCampaign = input.UtmCampaign,
+            UtmSource = input.UtmSource,
+            UtmMedium = input.UtmMedium,
+            ConversionRate = input.ConversionRate > 0 ? input.ConversionRate : 1.0m,
+        };
+
+        foreach (var item in input.Items)
+        {
+            opp.Items.Add(new OpportunityItem(
+                GuidGenerator.Create(),
+                opp.Id,
+                item.Description,
+                item.Quantity,
+                item.UnitPrice)
+            {
+                ItemId = item.ItemId,
+                Uom = item.Uom,
+            });
+        }
+        opp.ValidateItems();
+        opp.RecalculateAmount();
+
+        await _repository.InsertAsync(opp);
+        return ObjectMapper.Map<Opportunity, OpportunityDto>(opp);
+    }
+
+    [Authorize(MyERPPermissions.Opportunities.Edit)]
+    public async Task<OpportunityDto> UpdateAsync(Guid id, UpdateOpportunityDto input)
+    {
+        var opp = await _repository.GetAsync(id, includeDetails: true);
+
+        if (opp.Status is OpportunityStatus.Converted or OpportunityStatus.Closed)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("documentType", "Opportunity")
+                .WithData("status", opp.Status.ToString());
+        }
+
+        if (opp.CustomerId.HasValue)
+        {
+            var customerRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.Customer, Guid>>();
+            var customer = await customerRepo.FindAsync(opp.CustomerId.Value);
+            if (customer != null)
+            {
+                if (!customer.IsActive)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.PartyDisabled)
+                        .WithData("partyType", "Customer")
+                        .WithData("partyName", customer.Name);
+                }
+                if (customer.CompanyId != opp.CompanyId)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                        .WithData("customerCompany", customer.CompanyId)
+                        .WithData("opportunityCompany", opp.CompanyId);
+                }
+            }
+        }
+
+        if (opp.LeadId.HasValue)
+        {
+            var leadRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<CRM.Entities.Lead, Guid>>();
+            var lead = await leadRepo.FindAsync(opp.LeadId.Value);
+            if (lead != null && lead.CompanyId != opp.CompanyId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("leadCompany", lead.CompanyId)
+                    .WithData("opportunityCompany", opp.CompanyId);
+            }
+        }
+
+        var itemIds = input.Items.Where(i => i.ItemId.HasValue).Select(i => i.ItemId!.Value).Distinct().ToArray();
+        if (itemIds.Length > 0)
+        {
+            var itemValidation = LazyServiceProvider.LazyGetRequiredService<MyERP.Inventory.DomainServices.ItemTransactionValidationService>();
+            await itemValidation.ValidateItemsForTransactionAsync(itemIds);
+        }
+
+        var restrictionService = LazyServiceProvider.LazyGetRequiredService<MyERP.Core.DomainServices.CompanyRestrictionValidationService>();
+        await restrictionService.ValidateTransactionCompanyAsync(
+            "Opportunity",
+            opp.CompanyId,
+            itemIds: itemIds,
+            customerIds: opp.CustomerId.HasValue ? new[] { opp.CustomerId.Value } : null);
+
+        opp.Title = input.Title;
+        opp.OpportunityType = input.OpportunityType;
+        opp.ContactName = input.ContactName;
+        opp.ContactEmail = input.ContactEmail;
+        opp.ContactPhone = input.ContactPhone;
+        opp.SalesStage = input.SalesStage;
+        opp.Probability = input.Probability;
+        opp.ExpectedClosingDate = input.ExpectedClosingDate;
+        opp.CurrencyCode = input.CurrencyCode;
+        opp.AssignedUserId = input.AssignedUserId;
+        opp.Territory = input.Territory;
+        opp.Notes = input.Notes;
+        opp.CampaignName = input.CampaignName;
+        opp.UtmCampaign = input.UtmCampaign;
+        opp.UtmSource = input.UtmSource;
+        opp.UtmMedium = input.UtmMedium;
+        if (input.ConversionRate > 0)
+        {
+            opp.ConversionRate = input.ConversionRate;
+        }
+
+        // Replace items
+        opp.Items.Clear();
+        foreach (var item in input.Items)
+        {
+            opp.Items.Add(new OpportunityItem(
+                GuidGenerator.Create(),
+                opp.Id,
+                item.Description,
+                item.Quantity,
+                item.UnitPrice)
+            {
+                ItemId = item.ItemId,
+                Uom = item.Uom,
+            });
+        }
+        opp.ValidateItems();
+        opp.RecalculateAmount();
+
+        await _repository.UpdateAsync(opp);
+        return ObjectMapper.Map<Opportunity, OpportunityDto>(opp);
+    }
+
+    [Authorize(MyERPPermissions.Opportunities.Delete)]
+    public async Task DeleteAsync(Guid id)
+    {
+        await _repository.DeleteAsync(id);
+    }
+
+    [Authorize(MyERPPermissions.Opportunities.Edit)]
+    public async Task<OpportunityDto> MarkRepliedAsync(Guid id)
+    {
+        var opp = await _repository.GetAsync(id);
+        opp.MarkReplied();
+        await _repository.UpdateAsync(opp);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "Opportunity", opp.Id,
+            "MarkedReplied", opp.CompanyId,
+            opp.OpportunityNumber, "Open", "Replied", CurrentUser.Id,
+            $"Opportunity {opp.OpportunityNumber} marked as Replied. Response time: {opp.FirstResponseTime:N0}s", CurrentTenant.Id));
+
+        return ObjectMapper.Map<Opportunity, OpportunityDto>(opp);
+    }
+
+    [Authorize(MyERPPermissions.Opportunities.Edit)]
+    public async Task<OpportunityDto> MarkQuotationAsync(Guid id)
+    {
+        var opp = await _repository.GetAsync(id);
+        opp.MarkQuotation();
+        await _repository.UpdateAsync(opp);
+        return ObjectMapper.Map<Opportunity, OpportunityDto>(opp);
+    }
+
+    [Authorize(MyERPPermissions.Opportunities.Convert)]
+    public async Task<OpportunityDto> ConvertAsync(Guid id)
+    {
+        var opp = await _repository.GetAsync(id);
+        opp.Convert();
+        await _repository.UpdateAsync(opp);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "Opportunity", opp.Id,
+            "Converted", opp.CompanyId,
+            opp.OpportunityNumber, "Open", "Converted", CurrentUser.Id,
+            $"Opportunity {opp.OpportunityNumber} ({opp.Title}) marked as Converted", CurrentTenant.Id));
+
+        return ObjectMapper.Map<Opportunity, OpportunityDto>(opp);
+    }
+
+    /// <summary>
+    /// Convert an Opportunity to a Customer (ERPNext make_customer from opportunity).
+    /// Enforces guards from PR #59890 / commit 167380e7f4:
+    /// - Refuse when opportunity is already for a Customer.
+    /// - Refuse when customer already exists for this opportunity or its linked lead.
+    /// </summary>
+    [Authorize(MyERPPermissions.Opportunities.Convert)]
+    public async Task<Guid> ConvertToCustomerAsync(ConvertOpportunityToCustomerDto input)
+    {
+        var opp = await _repository.GetAsync(input.OpportunityId);
+
+        if (opp.CustomerId.HasValue)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.OpportunityAlreadyHasCustomer)
+                .WithData("opportunityId", opp.Id)
+                .WithData("opportunityNumber", opp.OpportunityNumber);
+        }
+
+        var custRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Customer, Guid>>();
+        var custQuery = await custRepo.GetQueryableAsync();
+
+        var existingOppCust = custQuery.FirstOrDefault(c => c.OpportunityId == opp.Id);
+        if (existingOppCust != null)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.OpportunityCustomerAlreadyExists)
+                .WithData("opportunityId", opp.Id)
+                .WithData("customerName", existingOppCust.Name);
+        }
+
+        if (opp.LeadId.HasValue)
+        {
+            var existingLeadCust = custQuery.FirstOrDefault(c => c.LeadId == opp.LeadId.Value);
+            if (existingLeadCust != null)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.OpportunityCustomerAlreadyExists)
+                    .WithData("opportunityId", opp.Id)
+                    .WithData("leadId", opp.LeadId.Value)
+                    .WithData("customerName", existingLeadCust.Name);
+            }
+        }
+
+        if (input.CustomerGroupId.HasValue)
+        {
+            var groupRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<MyERP.Core.Entities.CustomerGroup, Guid>>();
+            var customerGroup = await groupRepo.FindAsync(input.CustomerGroupId.Value);
+            if (customerGroup != null && customerGroup.IsGroup)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", "Cannot select a Group type Customer Group. Please select a non-group Customer Group.");
+            }
+        }
+
+        if (input.TerritoryId.HasValue)
+        {
+            var territoryRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<MyERP.Core.Entities.Territory, Guid>>();
+            var territory = await territoryRepo.FindAsync(input.TerritoryId.Value);
+            if (territory != null && territory.IsGroup)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", "Cannot select a Group type Territory. Please select a non-group Territory.");
+            }
+        }
+
+        var customerName = !string.IsNullOrWhiteSpace(input.CustomerName)
+            ? input.CustomerName
+            : !string.IsNullOrWhiteSpace(opp.ContactName)
+                ? opp.ContactName
+                : opp.Title;
+
+        var customer = new Customer(GuidGenerator.Create(), opp.CompanyId, customerName, CurrentTenant.Id)
+        {
+            ContactPerson = opp.ContactName,
+            Email = opp.ContactEmail,
+            Phone = opp.ContactPhone,
+            Tin = input.Tin,
+            CustomerGroupId = input.CustomerGroupId,
+            TerritoryId = input.TerritoryId,
+            OpportunityId = opp.Id,
+            LeadId = opp.LeadId,
+        };
+
+        await custRepo.InsertAsync(customer);
+
+        opp.CustomerId = customer.Id;
+        await _repository.UpdateAsync(opp);
+
+        if (opp.LeadId.HasValue)
+        {
+            var leadRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Lead, Guid>>();
+            var lead = await leadRepo.FindAsync(opp.LeadId.Value);
+            if (lead != null && !lead.ConvertedCustomerId.HasValue)
+            {
+                lead.ConvertToCustomer(customer.Id);
+                await leadRepo.UpdateAsync(lead);
+            }
+        }
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "Opportunity", opp.Id,
+            "ConvertedToCustomer", opp.CompanyId,
+            opp.OpportunityNumber, opp.Status.ToString(), opp.Status.ToString(), CurrentUser.Id,
+            $"Opportunity {opp.OpportunityNumber} converted to Customer {customerName}", CurrentTenant.Id));
+
+        return customer.Id;
+    }
+
+    /// <summary>
+    /// Per ERPNext PR #57489 (has_active_quotation): block lost declaration when active
+    /// quotations exist. Active = submitted quotations that are NOT Lost/Cancelled/Expired
+    /// (Rejected). Shared by every path that can declare an opportunity Lost — DeclareLostAsync
+    /// and the Kanban stage-drag path both need it, since a guard on only one of them leaves the
+    /// other free to mark an opportunity Lost while a live Quotation could still convert to an SO.
+    /// </summary>
+    private async Task ValidateNoActiveQuotationAsync(Guid opportunityId)
+    {
+        var quotationQuery = await _quotationRepository.GetQueryableAsync();
+        var hasActiveQuotation = quotationQuery.Any(q =>
+            q.OpportunityId == opportunityId &&
+            q.Status != DocumentStatus.Draft &&
+            q.Status != DocumentStatus.Cancelled &&
+            q.Status != DocumentStatus.Rejected); // Rejected = Lost/Expired in our model
+
+        if (hasActiveQuotation)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("reason", "Cannot declare opportunity as Lost while active quotations exist. Cancel or mark quotations as lost first.");
+        }
+    }
+
+    [Authorize(MyERPPermissions.Opportunities.Edit)]
+    public async Task<OpportunityDto> DeclareLostAsync(Guid id, string? reason)
+    {
+        var opp = await _repository.GetAsync(id);
+
+        await ValidateNoActiveQuotationAsync(id);
+
+        opp.DeclareLost(reason);
+        await _repository.UpdateAsync(opp);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "Opportunity", opp.Id,
+            "DeclaredLost", opp.CompanyId,
+            opp.OpportunityNumber, opp.Status.ToString(), "Lost", CurrentUser.Id,
+            $"Opportunity {opp.OpportunityNumber} declared as Lost. Reason: {reason}", CurrentTenant.Id));
+
+        return ObjectMapper.Map<Opportunity, OpportunityDto>(opp);
+    }
+
+    [Authorize(MyERPPermissions.Opportunities.Edit)]
+    public async Task<OpportunityDto> CloseAsync(Guid id)
+    {
+        var opp = await _repository.GetAsync(id);
+        opp.Close();
+        await _repository.UpdateAsync(opp);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "Opportunity", opp.Id,
+            "Closed", opp.CompanyId,
+            opp.OpportunityNumber, "Open", "Closed", CurrentUser.Id,
+            $"Opportunity {opp.OpportunityNumber} ({opp.Title}) closed", CurrentTenant.Id));
+
+        return ObjectMapper.Map<Opportunity, OpportunityDto>(opp);
+    }
+
+    [Authorize(MyERPPermissions.Opportunities.Edit)]
+    public async Task<OpportunityDto> ReopenAsync(Guid id)
+    {
+        var opp = await _repository.GetAsync(id);
+        opp.Reopen();
+        await _repository.UpdateAsync(opp);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "Opportunity", opp.Id,
+            "Reopened", opp.CompanyId,
+            opp.OpportunityNumber, "Closed", "Open", CurrentUser.Id,
+            $"Opportunity {opp.OpportunityNumber} ({opp.Title}) reopened", CurrentTenant.Id));
+
+        return ObjectMapper.Map<Opportunity, OpportunityDto>(opp);
+    }
+
+    private static IQueryable<Opportunity> ApplySorting(IQueryable<Opportunity> query, string sorting)
+    {
+        return sorting.ToLower() switch
+        {
+            "title asc" => query.OrderBy(o => o.Title),
+            "title desc" => query.OrderByDescending(o => o.Title),
+            "creationtime asc" => query.OrderBy(o => o.CreationTime),
+            "creationtime desc" => query.OrderByDescending(o => o.CreationTime),
+            "opportunityamount asc" => query.OrderBy(o => o.OpportunityAmount),
+            "opportunityamount desc" => query.OrderByDescending(o => o.OpportunityAmount),
+            _ => query.OrderByDescending(o => o.CreationTime),
+        };
+    }
+
+    /// <summary>
+    /// Update the sales stage of an opportunity (used by Kanban board drag-and-drop).
+    /// Per ERPNext: Opportunity.sales_stage field drives pipeline position.
+    /// </summary>
+    [Authorize(MyERPPermissions.Opportunities.Edit)]
+    public async Task<OpportunityDto> UpdateStageAsync(Guid id, UpdateOpportunityStageDto input)
+    {
+        var opp = await _repository.GetAsync(id);
+
+        // Validate: cannot move lost/closed opportunities
+        if (opp.Status == OpportunityStatus.Lost || opp.Status == OpportunityStatus.Closed)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("status", opp.Status.ToString());
+        }
+
+        opp.SalesStage = input.SalesStage;
+
+        // Auto-update probability based on stage (per ERPNext convention)
+        opp.Probability = input.SalesStage switch
+        {
+            "Prospecting" => 10,
+            "Qualification" => 25,
+            "Needs Analysis" => 40,
+            "Proposal" => 60,
+            "Negotiation" => 75,
+            "Won" => 100,
+            "Lost" => 0,
+            _ => opp.Probability,
+        };
+
+        // Auto-transition status for terminal stages using domain methods
+        if (input.SalesStage == "Won" && opp.Status != OpportunityStatus.Converted)
+        {
+            opp.Convert();
+        }
+        else if (input.SalesStage == "Lost")
+        {
+            await ValidateNoActiveQuotationAsync(id);
+            opp.DeclareLost("Moved to Lost via Kanban");
+        }
+
+        await _repository.UpdateAsync(opp);
+        return ObjectMapper.Map<Opportunity, OpportunityDto>(opp);
+    }
+
+    public async Task<List<CrmNoteDto>> GetNotesAsync(Guid id)
+    {
+        var query = await _noteRepository.GetQueryableAsync();
+        var notes = query.Where(n => n.ParentType == "Opportunity" && n.ParentId == id)
+            .OrderByDescending(n => n.AddedOn).ToList();
+        return notes.Select(MapNoteToDto).ToList();
+    }
+
+    [Authorize(MyERPPermissions.Opportunities.Edit)]
+    public async Task<CrmNoteDto> AddNoteAsync(Guid id, AddCrmNoteDto input)
+    {
+        var opp = await _repository.GetAsync(id);
+        var note = opp.AddNote(GuidGenerator.Create(), input.NoteText, CurrentUser.Id ?? Guid.Empty);
+        await _noteRepository.InsertAsync(note);
+        return MapNoteToDto(note);
+    }
+
+    [Authorize(MyERPPermissions.Opportunities.Edit)]
+    public async Task<CrmNoteDto> EditNoteAsync(Guid id, Guid noteId, UpdateCrmNoteDto input)
+    {
+        await _repository.GetAsync(id);
+        var note = await _noteRepository.GetAsync(noteId);
+        if (note.ParentType != "Opportunity" || note.ParentId != id)
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Note does not belong to the specified Opportunity.");
+        }
+
+        note.UpdateNoteText(input.NoteText);
+        await _noteRepository.UpdateAsync(note);
+        return MapNoteToDto(note);
+    }
+
+    [Authorize(MyERPPermissions.Opportunities.Delete)]
+    public async Task DeleteNoteAsync(Guid id, Guid noteId)
+    {
+        await _repository.GetAsync(id);
+        var note = await _noteRepository.GetAsync(noteId);
+        if (note.ParentType != "Opportunity" || note.ParentId != id)
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Note does not belong to the specified Opportunity.");
+        }
+
+        await _noteRepository.DeleteAsync(note);
+    }
+
+    private static CrmNoteDto MapNoteToDto(CrmNote note) => new()
+    {
+        Id = note.Id,
+        ParentType = note.ParentType,
+        ParentId = note.ParentId,
+        NoteText = note.NoteText,
+        AddedByUserId = note.AddedByUserId,
+        AddedOn = note.AddedOn,
+    };
+}
+

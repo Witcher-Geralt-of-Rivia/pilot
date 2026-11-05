@@ -1,0 +1,546 @@
+<abp-page [title]="order?.orderNumber ?? 'Purchase Order'">
+  @if (!order) {
+    <app-loading-overlay />
+  } @else {
+    <app-breadcrumb />
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <div>
+        <button class="btn btn-outline-secondary btn-sm" (click)="printOrder()">
+          <i class="fa fa-print me-1"></i>{{ 'Print' | abpLocalization }}
+        </button>
+        <button class="btn btn-outline-success btn-sm" (click)="downloadPdf()">
+          <i class="fa fa-file-pdf me-1"></i>{{ 'Download' | abpLocalization }}
+        </button>
+      </div>
+      @if (order.status === 'Draft') {
+        <div class="btn-group btn-group-sm">
+          <a class="btn btn-outline-primary" [routerLink]="['/purchasing/orders', order.id, 'edit']">
+            <i class="fa fa-edit me-1"></i>{{ 'Edit' | abpLocalization }}
+          </a>
+          <button class="btn btn-outline-danger" (click)="deleteOrder()">
+            <i class="fa fa-trash me-1"></i>{{ 'Delete' | abpLocalization }}
+          </button>
+        </div>
+      }
+    </div>
+    <app-document-workflow
+      [currentStatus]="order.status!"
+      [availableActions]="workflowActions"
+      (actionTriggered)="onWorkflowAction($event)" />
+
+    <!-- Draft Link Guard (shown when creating follow-up document) -->
+    @if (showDraftGuard() && draftGuardTarget()) {
+      <app-draft-link-guard
+        [sourceDocType]="'PurchaseOrder'"
+        [sourceId]="order.id!"
+        [targetDocType]="draftGuardTarget()!"
+        (proceed)="onDraftGuardProceed()"
+        (cancelled)="onDraftGuardCancelled()" />
+    }
+
+    <!-- Header info -->
+    <div class="card mt-4">
+      <div class="card-body">
+        <div class="row">
+          <div class="col-12 col-md-3 mb-3">
+            <small class="text-muted d-block">{{ '::OrderNumber' | abpLocalization }}</small>
+            <span class="fw-semibold">{{ order.orderNumber }}</span>
+          </div>
+          <div class="col-12 col-md-3 mb-3">
+            <small class="text-muted d-block">{{ '::Supplier' | abpLocalization }}</small>
+            <span class="fw-semibold">{{ order.supplierName || '—' }}</span>
+          </div>
+          <div class="col-12 col-md-3 mb-3">
+            <small class="text-muted d-block">{{ '::OrderDate' | abpLocalization }}</small>
+            <span class="fw-semibold">{{ order.orderDate | date:'dd/MM/yyyy' }}</span>
+          </div>
+          <div class="col-12 col-md-3 mb-3">
+            <small class="text-muted d-block">{{ '::ExpectedDelivery' | abpLocalization }}</small>
+            <span class="fw-semibold">{{ order.expectedDeliveryDate | date:'dd/MM/yyyy' }}</span>
+          </div>
+          @if (order.remarks) {
+            <div class="col-12 col-md-3 mb-3">
+              <small class="text-muted d-block">{{ '::Remarks' | abpLocalization }}</small>
+              <span>{{ order.remarks }}</span>
+            </div>
+          }
+        </div>
+        @if (supplierContact(); as contact) {
+          @if (contact.phone || contact.email || contact.contactPerson) {
+            <hr class="my-2" />
+            <div class="d-flex flex-wrap gap-3 text-muted small">
+              @if (contact.contactPerson) {
+                <span><i class="fa fa-user me-1"></i>{{ contact.contactPerson }}</span>
+              }
+              @if (contact.phone) {
+                <a [href]="'tel:' + contact.phone" class="text-decoration-none"><i class="fa fa-phone me-1"></i>{{ contact.phone }}</a>
+              }
+              @if (contact.email) {
+                <a [href]="'mailto:' + contact.email" class="text-decoration-none"><i class="fa fa-envelope me-1"></i>{{ contact.email }}</a>
+              }
+            </div>
+          }
+        }
+      </div>
+    </div>
+
+    <!-- Fulfillment Progress -->
+    @if (order.status !== 'Draft') {
+      <div class="row mt-4">
+        <div class="col-md-6">
+          <div class="card">
+            <div class="card-body">
+              <div class="d-flex justify-content-between mb-1">
+                <small class="fw-bold">{{ 'ReceivedQty' | abpLocalization }}</small>
+                <small>{{ order.perReceived ?? 0 | number:'1.0-0' }}%</small>
+              </div>
+              <div class="progress" style="height: 8px;">
+                <div class="progress-bar bg-info" [style.width.%]="order.perReceived ?? 0"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-6">
+          <div class="card">
+            <div class="card-body">
+              <div class="d-flex justify-content-between mb-1">
+                <small class="fw-bold">{{ 'BilledQty' | abpLocalization }}</small>
+                <small>{{ order.perBilled ?? 0 | number:'1.0-0' }}%</small>
+              </div>
+              <div class="progress" style="height: 8px;">
+                <div class="progress-bar bg-success" [style.width.%]="order.perBilled ?? 0"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    }
+
+    <!-- Advance Payment Progress -->
+    @if (order.advancePaid && order.advancePaid > 0) {
+      <div class="card mt-4 border-start border-4 border-success">
+        <div class="card-body py-3">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <h6 class="mb-0"><i class="fa fa-money-bill-wave me-2 text-success"></i>{{ '::AdvancePayment' | abpLocalization }}</h6>
+            <span class="badge" [class]="(order.perAdvancePaid ?? 0) >= 100 ? 'bg-success' : 'bg-warning text-dark'">
+              {{ order.perAdvancePaid | number:'1.0-0' }}%
+            </span>
+          </div>
+          <div class="progress mb-1" style="height: 8px;">
+            <div class="progress-bar bg-success" [style.width.%]="(order.perAdvancePaid ?? 0) > 100 ? 100 : (order.perAdvancePaid ?? 0)"></div>
+          </div>
+          <small class="text-muted">{{ order.advancePaid | number:'1.2-2' }} / {{ order.grandTotal | number:'1.2-2' }}</small>
+        </div>
+      </div>
+    }
+
+    <!-- Overdue Delivery Alert -->
+    @if (isOverdue()) {
+      <div class="alert alert-danger d-flex align-items-center mt-4" role="alert">
+        <i class="fa fa-triangle-exclamation me-2 fs-5"></i>
+        <div>
+          <strong>{{ '::DeliveryOverdue' | abpLocalization }}</strong> —
+          {{ '::ExpectedBy' | abpLocalization }} {{ order.expectedDeliveryDate | date:'dd/MM/yyyy' }}
+          ({{ overdueDays() }} {{ '::DaysOverdue' | abpLocalization }})
+        </div>
+      </div>
+    }
+
+    <!-- Supplier Performance Card -->
+    @if (supplierPerformance(); as perf) {
+      <div class="card mt-4 border-start border-4"
+           [class.border-success]="(perf.onTimeDeliveryRate ?? 0) >= 80"
+           [class.border-warning]="(perf.onTimeDeliveryRate ?? 0) >= 50 && (perf.onTimeDeliveryRate ?? 0) < 80"
+           [class.border-danger]="(perf.onTimeDeliveryRate ?? 0) < 50">
+        <div class="card-header py-2 d-flex justify-content-between align-items-center">
+          <h6 class="mb-0"><i class="fa fa-gauge-simple me-2"></i>{{ '::SupplierPerformance' | abpLocalization }}</h6>
+        </div>
+        <div class="card-body py-2">
+          <div class="row text-center">
+            <div class="col-3">
+              <small class="text-muted d-block">{{ '::TotalOrders' | abpLocalization }}</small>
+              <span class="fw-bold">{{ perf.totalOrders ?? 0 }}</span>
+            </div>
+            <div class="col-3">
+              <small class="text-muted d-block">{{ '::OnTimeDelivery' | abpLocalization }}</small>
+              <span class="badge"
+                    [class.bg-success]="(perf.onTimeDeliveryRate ?? 0) >= 80"
+                    [class.bg-warning]="(perf.onTimeDeliveryRate ?? 0) >= 50 && (perf.onTimeDeliveryRate ?? 0) < 80"
+                    [class.bg-danger]="(perf.onTimeDeliveryRate ?? 0) < 50">
+                {{ perf.onTimeDeliveryRate ?? 0 | number:'1.0-0' }}%
+              </span>
+            </div>
+            <div class="col-3">
+              <small class="text-muted d-block">{{ '::AvgOrderValue' | abpLocalization }}</small>
+              <span class="fw-bold">{{ perf.averageOrderValue ?? 0 | number:'1.0-0' }}</span>
+            </div>
+            <div class="col-3">
+              <small class="text-muted d-block">{{ '::TotalSpend' | abpLocalization }}</small>
+              <span class="fw-bold">{{ perf.totalSpend ?? 0 | number:'1.0-0' }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    }
+
+    <!-- Line items -->
+    <div class="card mt-4">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="card-title mb-0"><i class="fa fa-list me-2"></i>{{ '::Items' | abpLocalization }}</h5>
+        @if (canUpdateItems() && !isEditingItems()) {
+          <button class="btn btn-sm btn-outline-warning" (click)="startEditingItems()">
+            <i class="fa fa-pen me-1"></i>{{ '::UpdateItems' | abpLocalization }}
+          </button>
+        }
+        @if (isEditingItems()) {
+          <div class="btn-group btn-group-sm">
+            <button class="btn btn-success" (click)="saveItemUpdates()" [disabled]="isSavingItems()">
+              @if (isSavingItems()) { <i class="fa fa-spinner fa-spin me-1"></i> }
+              {{ '::Save' | abpLocalization }}
+            </button>
+            <button class="btn btn-outline-secondary" (click)="cancelEditingItems()" [disabled]="isSavingItems()">
+              {{ '::Cancel' | abpLocalization }}
+            </button>
+          </div>
+        }
+      </div>
+      <div class="card-body">
+        @if (isEditingItems()) {
+          <div class="alert alert-info py-2 mb-3">
+            <i class="fa fa-info-circle me-1"></i>{{ '::UpdateItemsHelp' | abpLocalization }}
+          </div>
+          <div class="table-responsive">
+            <table class="table table-sm w-100">
+              <thead>
+                <tr>
+                  <th>{{ '::Description' | abpLocalization }}</th>
+                  <th class="text-end" style="width: 120px;">{{ '::Quantity' | abpLocalization }}</th>
+                  <th class="text-end" style="width: 130px;">{{ '::UnitPrice' | abpLocalization }}</th>
+                  <th class="text-end">{{ '::LineTotal' | abpLocalization }}</th>
+                  <th class="text-muted" style="width: 100px;">{{ '::Received' | abpLocalization }}</th>
+                  <th style="width: 50px;"></th>
+                </tr>
+              </thead>
+              <tbody>
+                @for (item of editableItems(); track item.itemId; let i = $index) {
+                  <tr>
+                    <td class="text-muted">{{ item.description }}</td>
+                    <td>
+                      <input type="number" class="form-control form-control-sm text-end" [min]="item.receivedQty"
+                        step="1" [(ngModel)]="editableItems()[i].quantity">
+                    </td>
+                    <td>
+                      <input type="number" class="form-control form-control-sm text-end"
+                        min="0" step="0.01" [(ngModel)]="editableItems()[i].unitPrice">
+                    </td>
+                    <td class="text-end font-monospace">{{ (item.quantity * item.unitPrice) | number:'1.2-2' }}</td>
+                    <td class="text-muted small">{{ item.receivedQty | number:'1.0-1' }}</td>
+                    <td>
+                      <button type="button" class="btn btn-sm btn-outline-danger" [disabled]="item.receivedQty > 0"
+                        [title]="item.receivedQty > 0 ? ('::CannotRemoveReceivedItem' | abpLocalization) : ('::Remove' | abpLocalization)"
+                        (click)="removeEditableItem(item.itemId)">
+                        <i class="fa fa-trash"></i>
+                      </button>
+                    </td>
+                  </tr>
+                }
+              </tbody>
+            </table>
+          </div>
+        } @else {
+          <table class="table table-sm w-100">
+            <thead>
+              <tr>
+                <th>{{ '::Description' | abpLocalization }}</th>
+                <th class="text-end">{{ '::Quantity' | abpLocalization }}</th>
+                <th class="text-end">{{ '::UnitPrice' | abpLocalization }}</th>
+                <th class="text-end">{{ '::Tax' | abpLocalization }}</th>
+                <th class="text-end">{{ '::LineTotal' | abpLocalization }}</th>
+                @if (order.status !== 'Draft') {
+                  <th>{{ '::ExpectedDate' | abpLocalization }}</th>
+                  <th style="min-width: 140px;">{{ '::ReceiptProgress' | abpLocalization }}</th>
+                  <th style="min-width: 140px;">{{ '::BillingProgress' | abpLocalization }}</th>
+                  <th>{{ '::Status' | abpLocalization }}</th>
+                }
+              </tr>
+            </thead>
+            <tbody>
+              @for (row of order.items!; track $index) {
+                <tr>
+                  <td>{{ row.description }}</td>
+                  <td class="text-end">{{ row.quantity }}</td>
+                  <td class="text-end font-monospace">{{ row.unitPrice | number:'1.2-2' }}</td>
+                  <td class="text-end font-monospace">{{ row.taxAmount | number:'1.2-2' }}</td>
+                  <td class="text-end font-monospace">{{ row.lineTotal | number:'1.2-2' }}</td>
+                  @if (order.status !== 'Draft') {
+                    <td>
+                      @if (getEffectiveExpectedDate(row); as dateStr) {
+                        <small [class.text-danger]="isItemOverdue(row)" [class.fw-bold]="isItemOverdue(row)">
+                          {{ dateStr }}
+                        </small>
+                        @if (isItemOverdue(row)) {
+                          <span class="badge bg-danger ms-1">{{ '::Overdue' | abpLocalization }}</span>
+                        }
+                      } @else {
+                        <small class="text-muted">—</small>
+                      }
+                    </td>
+                    <td>
+                      @if (row.deliveredBySupplier) {
+                        <!-- Drop-ship items never get a real Purchase Receipt (goods go straight
+                             to the customer) — delivered qty has to be recorded manually. -->
+                        <div class="d-flex align-items-center gap-1">
+                          <span class="badge bg-info-subtle text-info-emphasis">{{ '::DropShip' | abpLocalization }}</span>
+                          <small class="text-nowrap">{{ row.receivedQty | number:'1.0-1' }}/{{ row.quantity }}</small>
+                          @if (order.status !== 'Cancelled' && order.status !== 'Closed' && order.status !== 'Completed') {
+                            <input type="number" class="form-control form-control-sm py-0" style="width: 70px"
+                              [(ngModel)]="dropShipQtyInputs[row.id]" [placeholder]="'::Qty' | abpLocalization">
+                            <button type="button" class="btn btn-outline-info btn-sm py-0 px-1"
+                              [disabled]="!dropShipQtyInputs[row.id]" (click)="recordDropShipDelivery(row.id)" [title]="'::RecordDelivery' | abpLocalization">
+                              <i class="fa fa-truck"></i>
+                            </button>
+                          }
+                        </div>
+                      } @else {
+                        <div class="d-flex align-items-center gap-1">
+                          <div class="progress flex-grow-1" style="height: 6px;">
+                            <div class="progress-bar bg-info" [style.width.%]="getItemReceiptPct(row)"></div>
+                          </div>
+                          <small class="text-nowrap" [class.text-success]="getItemReceiptPct(row) >= 100" [class.fw-bold]="getItemReceiptPct(row) >= 100">
+                            {{ row.receivedQty | number:'1.0-1' }}/{{ row.quantity }}
+                          </small>
+                        </div>
+                      }
+                    </td>
+                    <td>
+                      <div class="d-flex align-items-center gap-1">
+                        <div class="progress flex-grow-1" style="height: 6px;">
+                          <div class="progress-bar bg-success" [style.width.%]="getItemBilledPct(row)"></div>
+                        </div>
+                        <small class="text-nowrap" [class.text-success]="getItemBilledPct(row) >= 100" [class.fw-bold]="getItemBilledPct(row) >= 100">
+                          {{ row.billedQty | number:'1.0-1' }}/{{ row.quantity }}
+                        </small>
+                      </div>
+                    </td>
+                    <td>
+                      @if (row.isClosed) {
+                        <span class="badge bg-secondary me-1">{{ '::Closed' | abpLocalization }}</span>
+                        @if (order.status !== 'Cancelled' && order.status !== 'Closed') {
+                          <button type="button" class="btn btn-outline-primary btn-sm py-0 px-1" (click)="reopenItem(row.id)" [title]="'::Reopen' | abpLocalization">
+                            <i class="fa fa-lock-open"></i>
+                          </button>
+                        }
+                      } @else if (order.status !== 'Cancelled' && order.status !== 'Closed' && order.status !== 'Completed') {
+                        <button type="button" class="btn btn-outline-warning btn-sm py-0 px-1" (click)="closeItem(row.id)" [title]="'::Close' | abpLocalization">
+                          <i class="fa fa-lock"></i>
+                        </button>
+                      }
+                    </td>
+                  }
+                </tr>
+              }
+            </tbody>
+          </table>
+        }
+      </div>
+    </div>
+
+    <!-- Totals -->
+    <div class="card mt-4" style="max-width: 380px; margin-left: auto">
+      <div class="card-body text-end">
+        <p>{{ '::NetTotal' | abpLocalization }}: <strong class="font-monospace">{{ order.netTotal | number:'1.2-2' }}</strong></p>
+        <p>{{ '::Tax' | abpLocalization }}: <strong class="font-monospace">{{ order.taxAmount | number:'1.2-2' }}</strong></p>
+        <hr />
+        <p class="fs-5">{{ '::GrandTotal' | abpLocalization }}: <strong class="font-monospace">{{ order.grandTotal | number:'1.2-2' }}</strong></p>
+      </div>
+    </div>
+
+    <!-- Supplier Confirmation Tracking -->
+    @if (order.status !== 'Draft' && order.status !== 'Cancelled') {
+      <div class="card mt-4" [class.border-success]="order.isSupplierConfirmed">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <h6 class="mb-0"><i class="fa fa-handshake me-2"></i>{{ '::SupplierConfirmation' | abpLocalization }}</h6>
+          @if (order.isSupplierConfirmed) {
+            <span class="badge bg-success"><i class="fa fa-check me-1"></i>{{ '::SupplierConfirmed' | abpLocalization }}</span>
+          } @else {
+            <span class="badge bg-secondary">{{ '::NotConfirmed' | abpLocalization }}</span>
+          }
+        </div>
+        <div class="card-body">
+          @if (order.isSupplierConfirmed) {
+            <div class="row">
+              <div class="col-md-4">
+                <small class="text-muted d-block">{{ '::ConfirmationNumber' | abpLocalization }}</small>
+                <strong>{{ order.supplierConfirmationNumber || '—' }}</strong>
+              </div>
+              <div class="col-md-4">
+                <small class="text-muted d-block">{{ '::ConfirmationDate' | abpLocalization }}</small>
+                <strong>{{ order.supplierConfirmationDate | date:'dd/MM/yyyy' }}</strong>
+              </div>
+              <div class="col-md-4">
+                <small class="text-muted d-block">{{ '::PromisedDeliveryDate' | abpLocalization }}</small>
+                <strong [class.text-danger]="order.supplierPromisedDate && order.expectedDeliveryDate && order.supplierPromisedDate < order.expectedDeliveryDate">
+                  {{ order.supplierPromisedDate ? (order.supplierPromisedDate | date:'dd/MM/yyyy') : '—' }}
+                </strong>
+              </div>
+            </div>
+          } @else {
+            @if (!showConfirmationForm()) {
+              <button type="button" class="btn btn-outline-success btn-sm" (click)="showConfirmationForm.set(true)">
+                <i class="fa fa-plus me-1"></i>{{ '::RecordConfirmation' | abpLocalization }}
+              </button>
+            } @else {
+              <div class="row g-3">
+                <div class="col-md-4">
+                  <label class="form-label">{{ '::ConfirmationNumber' | abpLocalization }}</label>
+                  <input type="text" class="form-control form-control-sm" [(ngModel)]="confirmationNumber"
+                         [placeholder]="'::Placeholder:SupplierReference' | abpLocalization">
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label">{{ '::PromisedDeliveryDate' | abpLocalization }}</label>
+                  <input type="date" class="form-control form-control-sm" [(ngModel)]="promisedDate">
+                </div>
+                <div class="col-md-4 d-flex align-items-end gap-2">
+                  <button type="button" class="btn btn-success btn-sm" (click)="recordSupplierConfirmation()" [disabled]="isRecordingConfirmation()">
+                    @if (isRecordingConfirmation()) { <i class="fa fa-spinner fa-spin me-1"></i> }
+                    {{ '::Save' | abpLocalization }}
+                  </button>
+                  <button type="button" class="btn btn-outline-secondary btn-sm" (click)="showConfirmationForm.set(false)">
+                    {{ '::Cancel' | abpLocalization }}
+                  </button>
+                </div>
+              </div>
+            }
+          }
+        </div>
+      </div>
+    }
+
+    <!-- Goods Received History -->
+    @if (orderReceipts().length > 0) {
+      <div class="card mt-4">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <h6 class="mb-0"><i class="fa fa-truck-ramp-box me-2"></i>{{ '::GoodsReceived' | abpLocalization }}</h6>
+          <span class="badge bg-info">{{ orderReceipts().length }}</span>
+        </div>
+        <div class="card-body p-0">
+          <div class="table-responsive">
+            <table class="table table-sm table-hover mb-0">
+              <thead>
+                <tr>
+                  <th>{{ '::ReceiptNumber' | abpLocalization }}</th>
+                  <th>{{ '::Date' | abpLocalization }}</th>
+                  <th class="text-end">{{ '::Items' | abpLocalization }}</th>
+                  <th>{{ '::Status' | abpLocalization }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                @for (r of orderReceipts(); track r.purchaseReceiptId) {
+                  <tr>
+                    <td>
+                      <a [routerLink]="['/purchasing/receipts', r.purchaseReceiptId]" class="text-decoration-none">
+                        {{ r.receiptNumber || '—' }}
+                      </a>
+                    </td>
+                    <td>{{ r.postingDate | date:'dd/MM/yyyy' }}</td>
+                    <td class="text-end">{{ r.itemCount }}</td>
+                    <td><app-status-badge [status]="r.status" /></td>
+                  </tr>
+                }
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    }
+
+    <!-- Payments Made -->
+    @if (orderPayments().length > 0) {
+      <div class="card mt-4">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <h6 class="mb-0"><i class="fa fa-money-bill me-2"></i>{{ '::PaymentsMade' | abpLocalization }}</h6>
+          <span class="badge bg-success">{{ orderPayments().length }}</span>
+        </div>
+        <div class="card-body p-0">
+          <div class="table-responsive">
+            <table class="table table-sm table-hover mb-0">
+              <thead>
+                <tr>
+                  <th>{{ '::PaymentNumber' | abpLocalization }}</th>
+                  <th>{{ '::Date' | abpLocalization }}</th>
+                  <th class="text-end">{{ '::Amount' | abpLocalization }}</th>
+                  <th>{{ '::Reference' | abpLocalization }}</th>
+                  <th>{{ '::Status' | abpLocalization }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                @for (pe of orderPayments(); track pe.paymentEntryId) {
+                  <tr>
+                    <td>
+                      <a [routerLink]="['/accounting/payments', pe.paymentEntryId]" class="text-decoration-none">
+                        {{ pe.paymentNumber || '—' }}
+                      </a>
+                    </td>
+                    <td>{{ pe.postingDate | date:'dd/MM/yyyy' }}</td>
+                    <td class="text-end font-monospace text-success">{{ pe.paidAmount | number:'1.2-2' }}</td>
+                    <td>{{ pe.referenceNumber || '—' }}</td>
+                    <td><app-status-badge [status]="pe.status" /></td>
+                  </tr>
+                }
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    }
+
+    @if (order.status !== 'Draft') {
+      <app-document-connections [documentType]="'PurchaseOrder'" [documentId]="order.id!" />
+    }
+
+    <app-activity-log [documentType]="'PurchaseOrder'" [documentId]="order.id!"></app-activity-log>
+
+    <!-- Send Email Dialog -->
+    @if (showEmailDialog) {
+      <div class="modal d-block" style="background: rgba(0,0,0,0.5)">
+        <div class="modal-dialog">
+          <div class="modal-content">
+            <div class="modal-header">
+              <h5 class="modal-title"><i class="fa fa-envelope me-2"></i>{{ '::SendPurchaseOrder' | abpLocalization }}</h5>
+              <button type="button" class="btn-close" (click)="cancelEmailDialog()"></button>
+            </div>
+            <div class="modal-body">
+              <div class="mb-3">
+                <label class="form-label">{{ '::RecipientEmail' | abpLocalization }}</label>
+                <input type="email" class="form-control" [(ngModel)]="emailRecipient" [placeholder]="'Placeholder:Email' | abpLocalization">
+              </div>
+              <div class="mb-3">
+                <label class="form-label">{{ '::CcEmails' | abpLocalization }}</label>
+                <input type="text" class="form-control" [(ngModel)]="emailCc" [placeholder]="'Placeholder:CommaSeparatedEmails' | abpLocalization">
+              </div>
+              <div class="form-check mb-3">
+                <input type="checkbox" class="form-check-input" id="attachPdf" [(ngModel)]="emailAttachPdf">
+                <label class="form-check-label" for="attachPdf">{{ '::AttachPdf' | abpLocalization }}</label>
+              </div>
+            </div>
+            <div class="modal-footer">
+              <button class="btn btn-secondary" (click)="cancelEmailDialog()">{{ '::Cancel' | abpLocalization }}</button>
+              <button class="btn btn-primary" [disabled]="emailSending" (click)="sendEmail()">
+                @if (emailSending) { <span class="spinner-border spinner-border-sm me-1"></span> }
+                <i class="fa fa-paper-plane me-1"></i>{{ '::Send' | abpLocalization }}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    }
+
+    <!-- Print Layout (hidden on screen, shown only in print) -->
+    <app-po-print-layout
+      [order]="order"
+      [companyName]="companyName"
+      [companyTin]="companyTin"
+      [companySst]="companySst"
+    ></app-po-print-layout>
+  }
+</abp-page>

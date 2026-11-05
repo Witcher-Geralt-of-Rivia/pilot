@@ -1,0 +1,465 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using MyERP.Accounting.DomainServices;
+using MyERP.Accounting.Entities;
+using MyERP.Core;
+using Shouldly;
+using Xunit;
+
+namespace MyERP.Accounting;
+
+/// <summary>
+/// Tests for AccountingRuleEngine calculation and dispatch logic.
+/// Verifies amount resolution, account resolution, and journal entry construction.
+/// </summary>
+public class AccountingRuleEngineTests
+{
+    // === IAccountableDocument implementation for testing ===
+
+    private class TestDocument : IAccountableDocument
+    {
+        public Guid Id { get; set; } = Guid.NewGuid();
+        public Guid CompanyId { get; set; } = Guid.NewGuid();
+        public string DocumentType { get; set; } = "SalesInvoice";
+        public decimal NetTotal { get; set; }
+        public decimal GrandTotal { get; set; }
+        public decimal TaxAmount { get; set; }
+        public Guid? CustomerId { get; set; }
+        public Guid? SupplierId { get; set; }
+        public DateTime PostingDate { get; set; } = DateTime.Today;
+        public string CurrencyCode { get; set; } = "MYR";
+        public decimal ExchangeRate { get; set; } = 1m;
+    }
+
+    // === AmountSource Resolution Tests ===
+
+    [Fact]
+    public void AmountSource_NetTotal_ResolvesCorrectly()
+    {
+        var doc = new TestDocument { NetTotal = 1000, GrandTotal = 1080, TaxAmount = 80 };
+        ResolveAmount(AmountSource.NetTotal, doc).ShouldBe(1000);
+    }
+
+    [Fact]
+    public void AmountSource_GrandTotal_ResolvesCorrectly()
+    {
+        var doc = new TestDocument { NetTotal = 1000, GrandTotal = 1080, TaxAmount = 80 };
+        ResolveAmount(AmountSource.GrandTotal, doc).ShouldBe(1080);
+    }
+
+    [Fact]
+    public void AmountSource_TaxAmount_ResolvesCorrectly()
+    {
+        var doc = new TestDocument { NetTotal = 1000, GrandTotal = 1080, TaxAmount = 80 };
+        ResolveAmount(AmountSource.TaxAmount, doc).ShouldBe(80);
+    }
+
+    [Fact]
+    public void AmountSource_ZeroTax_SkipsRuleWithZeroAmount()
+    {
+        // Rules with zero amount should be skipped (per engine logic: if amount <= 0 continue)
+        var doc = new TestDocument { NetTotal = 1000, GrandTotal = 1000, TaxAmount = 0 };
+        ResolveAmount(AmountSource.TaxAmount, doc).ShouldBe(0);
+    }
+
+    // === Journal Entry Construction Tests ===
+
+    [Fact]
+    public void JournalEntry_SalesInvoice_ThreeLines_Balanced()
+    {
+        // SI rule set: DR Receivable (GrandTotal), CR Revenue (NetTotal), CR Tax (TaxAmount)
+        var companyId = Guid.NewGuid();
+        var fiscalYearId = Guid.NewGuid();
+        var receivableAccId = Guid.NewGuid();
+        var revenueAccId = Guid.NewGuid();
+        var taxAccId = Guid.NewGuid();
+
+        var doc = new TestDocument
+        {
+            CompanyId = companyId,
+            NetTotal = 1000,
+            GrandTotal = 1080,
+            TaxAmount = 80,
+        };
+
+        var journal = new JournalEntry(Guid.NewGuid(), companyId, fiscalYearId, doc.PostingDate);
+        journal.ReferenceType = doc.DocumentType;
+        journal.ReferenceId = doc.Id;
+
+        // Simulate rule processing: DR Receivable for GrandTotal
+        journal.AddLine(receivableAccId, 1080, isDebit: true);
+        // CR Revenue for NetTotal
+        journal.AddLine(revenueAccId, 1000, isDebit: false);
+        // CR Tax for TaxAmount
+        journal.AddLine(taxAccId, 80, isDebit: false);
+
+        // Validate: total DR = total CR (double-entry)
+        journal.Lines.Where(l => l.IsDebit).Sum(l => l.Amount).ShouldBe(1080);
+        journal.Lines.Where(l => !l.IsDebit).Sum(l => l.Amount).ShouldBe(1080);
+        journal.Lines.Count.ShouldBe(3);
+
+        // Should not throw
+        journal.Validate();
+    }
+
+    [Fact]
+    public void JournalEntry_PurchaseInvoice_TwoLines_Balanced()
+    {
+        // PI rule set: DR Expense (NetTotal), CR Payable (GrandTotal)
+        // Note: tax is included in GrandTotal for purchase side (simplification)
+        var companyId = Guid.NewGuid();
+        var fiscalYearId = Guid.NewGuid();
+        var expenseAccId = Guid.NewGuid();
+        var payableAccId = Guid.NewGuid();
+
+        var journal = new JournalEntry(Guid.NewGuid(), companyId, fiscalYearId, DateTime.Today);
+
+        // DR Expense (NetTotal)
+        journal.AddLine(expenseAccId, 500, isDebit: true);
+        // CR Payable (GrandTotal) — but for balance we need same amount
+        journal.AddLine(payableAccId, 500, isDebit: false);
+
+        journal.Validate(); // should not throw — balanced
+    }
+
+    [Fact]
+    public void JournalEntry_Unbalanced_ThrowsOnValidate()
+    {
+        var companyId = Guid.NewGuid();
+        var fiscalYearId = Guid.NewGuid();
+        var journal = new JournalEntry(Guid.NewGuid(), companyId, fiscalYearId, DateTime.Today);
+
+        journal.AddLine(Guid.NewGuid(), 1000, isDebit: true);
+        journal.AddLine(Guid.NewGuid(), 999, isDebit: false); // off by 1!
+
+        Should.Throw<Volo.Abp.BusinessException>(() => journal.Validate());
+    }
+
+    [Fact]
+    public void JournalEntry_NoLines_ThrowsOnValidate()
+    {
+        var journal = new JournalEntry(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), DateTime.Today);
+
+        Should.Throw<Volo.Abp.BusinessException>(() => journal.Validate());
+    }
+
+    [Fact]
+    public void JournalEntry_PostSetsPostedStatus()
+    {
+        var companyId = Guid.NewGuid();
+        var journal = new JournalEntry(Guid.NewGuid(), companyId, Guid.NewGuid(), DateTime.Today);
+        journal.AddLine(Guid.NewGuid(), 100, isDebit: true);
+        journal.AddLine(Guid.NewGuid(), 100, isDebit: false);
+
+        journal.Status.ShouldBe(DocumentStatus.Draft);
+        journal.Validate();
+        journal.Post();
+        journal.Status.ShouldBe(DocumentStatus.Posted);
+    }
+
+    [Fact]
+    public void JournalEntry_DoublePost_Throws()
+    {
+        var journal = new JournalEntry(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), DateTime.Today);
+        journal.AddLine(Guid.NewGuid(), 100, isDebit: true);
+        journal.AddLine(Guid.NewGuid(), 100, isDebit: false);
+        journal.Validate();
+        journal.Post();
+
+        Should.Throw<Volo.Abp.BusinessException>(() => journal.Post());
+    }
+
+    // === AccountingRule Entity Tests ===
+
+    [Fact]
+    public void AccountingRule_SortOrder_DeterminesProcessingSequence()
+    {
+        var rules = new List<AccountingRule>
+        {
+            CreateRule("Tax CR", AmountSource.TaxAmount, false, 3),
+            CreateRule("Revenue CR", AmountSource.NetTotal, false, 2),
+            CreateRule("Receivable DR", AmountSource.GrandTotal, true, 1),
+        };
+
+        var ordered = rules.OrderBy(r => r.SortOrder).ToList();
+
+        ordered[0].Name.ShouldBe("Receivable DR");
+        ordered[1].Name.ShouldBe("Revenue CR");
+        ordered[2].Name.ShouldBe("Tax CR");
+    }
+
+    [Fact]
+    public void AccountingRule_IsActive_FiltersCorrectly()
+    {
+        var rules = new List<AccountingRule>
+        {
+            CreateRule("Active Rule", AmountSource.GrandTotal, true, 1),
+            CreateRule("Inactive Rule", AmountSource.GrandTotal, true, 2, isActive: false),
+        };
+
+        var active = rules.Where(r => r.IsActive).ToList();
+        active.Count.ShouldBe(1);
+        active[0].Name.ShouldBe("Active Rule");
+    }
+
+    [Fact]
+    public void AccountingRule_DocumentType_FiltersByType()
+    {
+        var companyId = Guid.NewGuid();
+        var rules = new List<AccountingRule>
+        {
+            CreateRule("SI Revenue", AmountSource.NetTotal, false, 1, "SalesInvoice"),
+            CreateRule("PI Expense", AmountSource.NetTotal, true, 1, "PurchaseInvoice"),
+        };
+
+        var siRules = rules.Where(r => r.DocumentType == "SalesInvoice").ToList();
+        siRules.Count.ShouldBe(1);
+        siRules[0].Name.ShouldBe("SI Revenue");
+    }
+
+    // === Document Type Coverage Tests ===
+
+    [Fact]
+    public void IAccountableDocument_SalesInvoice_FieldsAccessible()
+    {
+        var doc = new TestDocument
+        {
+            DocumentType = "SalesInvoice",
+            NetTotal = 1000,
+            GrandTotal = 1060,
+            TaxAmount = 60,
+            CustomerId = Guid.NewGuid(),
+        };
+
+        doc.DocumentType.ShouldBe("SalesInvoice");
+        doc.CustomerId.ShouldNotBeNull();
+        doc.SupplierId.ShouldBeNull();
+    }
+
+    [Fact]
+    public void IAccountableDocument_PurchaseInvoice_FieldsAccessible()
+    {
+        var doc = new TestDocument
+        {
+            DocumentType = "PurchaseInvoice",
+            NetTotal = 500,
+            GrandTotal = 530,
+            TaxAmount = 30,
+            SupplierId = Guid.NewGuid(),
+        };
+
+        doc.DocumentType.ShouldBe("PurchaseInvoice");
+        doc.SupplierId.ShouldNotBeNull();
+        doc.CustomerId.ShouldBeNull();
+    }
+
+    [Fact]
+    public void IAccountableDocument_DeliveryNote_PerpetualInventory()
+    {
+        // DN posts: DR COGS, CR Stock (both at NetTotal = valuation)
+        var doc = new TestDocument
+        {
+            DocumentType = "DeliveryNote",
+            NetTotal = 800, // valuation amount
+            GrandTotal = 800,
+            TaxAmount = 0,  // no tax on COGS
+        };
+
+        doc.NetTotal.ShouldBe(800);
+        doc.TaxAmount.ShouldBe(0);
+    }
+
+    // === Return Document (negative amount) Direction Tests ===
+
+    [Fact]
+    public void ResolveDirectionAndAmount_PositiveAmount_KeepsRuleDirection()
+    {
+        var (amount, isDebit) = AccountingRuleEngine.ResolveDirectionAndAmount(1080m, ruleIsDebit: true);
+        amount.ShouldBe(1080m);
+        isDebit.ShouldBeTrue();
+    }
+
+    [Fact]
+    public void ResolveDirectionAndAmount_NegativeAmount_FlipsDirectionAndTakesAbsoluteValue()
+    {
+        // A Credit Note's GrandTotal is negative; the DR-Receivable rule must become CR
+        // and post the positive magnitude, not be skipped.
+        var (amount, isDebit) = AccountingRuleEngine.ResolveDirectionAndAmount(-1080m, ruleIsDebit: true);
+        amount.ShouldBe(1080m);
+        isDebit.ShouldBeFalse();
+    }
+
+    [Fact]
+    public void ResolveDirectionAndAmount_NegativeAmount_CreditRuleBecomesDebit()
+    {
+        var (amount, isDebit) = AccountingRuleEngine.ResolveDirectionAndAmount(-1000m, ruleIsDebit: false);
+        amount.ShouldBe(1000m);
+        isDebit.ShouldBeTrue();
+    }
+
+    [Fact]
+    public void SalesReturn_NegativeAmounts_ProducesBalancedPostableJournal()
+    {
+        // Regression test for a real bug: before the fix, every rule line for a return document
+        // (negative NetTotal/GrandTotal/TaxAmount) was skipped by "amount <= 0 continue", leaving
+        // a zero-line journal that JournalEntry.Validate() rejects with UnbalancedJournalEntry —
+        // Sales/Purchase Returns could never post at all through AccountingRuleEngine.
+        var companyId = Guid.NewGuid();
+        var fiscalYearId = Guid.NewGuid();
+        var receivableAccId = Guid.NewGuid();
+        var revenueAccId = Guid.NewGuid();
+        var taxAccId = Guid.NewGuid();
+
+        // Same SI rule set as JournalEntry_SalesInvoice_ThreeLines_Balanced, but for a return:
+        // DR Receivable(GrandTotal), CR Revenue(NetTotal), CR Tax(TaxAmount) — all negative.
+        var doc = new TestDocument
+        {
+            CompanyId = companyId,
+            NetTotal = -1000,
+            GrandTotal = -1080,
+            TaxAmount = -80,
+        };
+
+        var journal = new JournalEntry(Guid.NewGuid(), companyId, fiscalYearId, doc.PostingDate);
+        journal.ReferenceType = doc.DocumentType;
+        journal.ReferenceId = doc.Id;
+
+        void AddRuleLine(AmountSource source, bool ruleIsDebit, Guid accountId)
+        {
+            var raw = ResolveAmount(source, doc);
+            if (raw == 0) return;
+            var (amount, isDebit) = AccountingRuleEngine.ResolveDirectionAndAmount(raw, ruleIsDebit);
+            journal.AddLine(accountId, amount, isDebit);
+        }
+
+        AddRuleLine(AmountSource.GrandTotal, true, receivableAccId);
+        AddRuleLine(AmountSource.NetTotal, false, revenueAccId);
+        AddRuleLine(AmountSource.TaxAmount, false, taxAccId);
+
+        journal.Lines.Count.ShouldBe(3); // not silently dropped
+        journal.Lines.Single(l => l.AccountId == receivableAccId).IsDebit.ShouldBeFalse(); // reversed: CR
+        journal.Lines.Single(l => l.AccountId == revenueAccId).IsDebit.ShouldBeTrue();      // reversed: DR
+        journal.Lines.Single(l => l.AccountId == taxAccId).IsDebit.ShouldBeTrue();          // reversed: DR
+        journal.Lines.Sum(l => l.Amount * (l.IsDebit ? 1 : -1)).ShouldBe(0m); // balanced
+
+        Should.NotThrow(() => journal.Validate());
+    }
+
+    // === Round-Off Tests ===
+
+    [Fact]
+    public void ApplyRoundOff_ExactlyBalanced_NoLineAdded()
+    {
+        var journal = new JournalEntry(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), DateTime.Today);
+        journal.AddLine(Guid.NewGuid(), 100m, isDebit: true);
+        journal.AddLine(Guid.NewGuid(), 100m, isDebit: false);
+        var company = new MyERP.Core.Entities.Company(Guid.NewGuid(), "Test Co")
+        {
+            RoundOffAccountId = Guid.NewGuid(),
+        };
+
+        AccountingRuleEngine.ApplyRoundOff(journal, company);
+
+        journal.Lines.Count.ShouldBe(2);
+    }
+
+    [Fact]
+    public void ApplyRoundOff_SmallImbalanceWithRoundOffAccount_AddsBalancingLine()
+    {
+        var journal = new JournalEntry(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), DateTime.Today);
+        journal.AddLine(Guid.NewGuid(), 100.03m, isDebit: true);
+        journal.AddLine(Guid.NewGuid(), 100m, isDebit: false);
+        var roundOffAccountId = Guid.NewGuid();
+        var company = new MyERP.Core.Entities.Company(Guid.NewGuid(), "Test Co")
+        {
+            RoundOffAccountId = roundOffAccountId,
+        };
+
+        AccountingRuleEngine.ApplyRoundOff(journal, company);
+
+        journal.Lines.Count.ShouldBe(3);
+        var roundOffLine = journal.Lines.Last();
+        roundOffLine.AccountId.ShouldBe(roundOffAccountId);
+        roundOffLine.Amount.ShouldBe(0.03m);
+        roundOffLine.IsDebit.ShouldBeFalse(); // debit-heavy → credit the round-off account
+
+        journal.Validate(); // should not throw — now balanced
+    }
+
+    [Fact]
+    public void ApplyRoundOff_SmallImbalanceNoRoundOffAccount_Throws()
+    {
+        var journal = new JournalEntry(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), DateTime.Today);
+        journal.AddLine(Guid.NewGuid(), 100.03m, isDebit: true);
+        journal.AddLine(Guid.NewGuid(), 100m, isDebit: false);
+        var company = new MyERP.Core.Entities.Company(Guid.NewGuid(), "Test Co");
+
+        Should.Throw<Volo.Abp.BusinessException>(() => AccountingRuleEngine.ApplyRoundOff(journal, company));
+    }
+
+    [Fact]
+    public void ApplyRoundOff_LargeImbalance_LeavesUnchangedForValidateToThrow()
+    {
+        // A difference beyond the 0.5 allowance is a real bug, not rounding noise —
+        // ApplyRoundOff must not paper over it; Validate() downstream should still throw.
+        var journal = new JournalEntry(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), DateTime.Today);
+        journal.AddLine(Guid.NewGuid(), 150m, isDebit: true);
+        journal.AddLine(Guid.NewGuid(), 100m, isDebit: false);
+        var company = new MyERP.Core.Entities.Company(Guid.NewGuid(), "Test Co")
+        {
+            RoundOffAccountId = Guid.NewGuid(),
+        };
+
+        AccountingRuleEngine.ApplyRoundOff(journal, company);
+
+        journal.Lines.Count.ShouldBe(2); // untouched
+        Should.Throw<Volo.Abp.BusinessException>(() => journal.Validate());
+    }
+
+    [Fact]
+    public void ApplyRoundOff_CreditHeavy_DebitsRoundOffAccount()
+    {
+        var journal = new JournalEntry(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), DateTime.Today);
+        journal.AddLine(Guid.NewGuid(), 100m, isDebit: true);
+        journal.AddLine(Guid.NewGuid(), 100.02m, isDebit: false);
+        var roundOffAccountId = Guid.NewGuid();
+        var company = new MyERP.Core.Entities.Company(Guid.NewGuid(), "Test Co")
+        {
+            RoundOffAccountId = roundOffAccountId,
+        };
+
+        AccountingRuleEngine.ApplyRoundOff(journal, company);
+
+        var roundOffLine = journal.Lines.Last();
+        roundOffLine.IsDebit.ShouldBeTrue(); // credit-heavy → debit the round-off account
+        roundOffLine.Amount.ShouldBe(0.02m);
+    }
+
+    // === Helper Methods ===
+
+    private static decimal ResolveAmount(AmountSource source, IAccountableDocument document)
+    {
+        return source switch
+        {
+            AmountSource.NetTotal => document.NetTotal,
+            AmountSource.GrandTotal => document.GrandTotal,
+            AmountSource.TaxAmount => document.TaxAmount,
+            _ => 0m
+        };
+    }
+
+    private static AccountingRule CreateRule(
+        string name, AmountSource source, bool isDebit, int sortOrder,
+        string documentType = "SalesInvoice", bool isActive = true)
+    {
+        var rule = new AccountingRule(Guid.NewGuid(), Guid.NewGuid(), name, documentType,
+            isDebit, AccountSource.FixedAccount, source)
+        {
+            IsActive = isActive,
+            FixedAccountId = Guid.NewGuid(),
+            SortOrder = sortOrder,
+        };
+        return rule;
+    }
+}

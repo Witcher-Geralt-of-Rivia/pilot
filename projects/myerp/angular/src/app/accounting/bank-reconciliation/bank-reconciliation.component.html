@@ -1,0 +1,408 @@
+<abp-page [title]="'::BankReconciliation' | abpLocalization">
+  <!-- Bank Account Selector + Date Range Filter -->
+  <div class="row g-3 mb-4">
+    <div class="col-md-4">
+      <label class="form-label fw-semibold">{{ '::BankAccount' | abpLocalization }}</label>
+      <select class="form-select" [(ngModel)]="bankAccountId" (change)="onBankAccountChanged()">
+        <option value="">{{ '::SelectBankAccount' | abpLocalization }}</option>
+        @for (acct of bankAccounts(); track acct.id) {
+          <option [value]="acct.id">{{ acct.accountCode }} — {{ acct.accountName }}</option>
+        }
+      </select>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label fw-semibold">{{ '::From' | abpLocalization }}</label>
+      <input type="date" class="form-control" [(ngModel)]="fromDate" (change)="onBankAccountChanged()" />
+    </div>
+    <div class="col-md-3">
+      <label class="form-label fw-semibold">{{ '::To' | abpLocalization }}</label>
+      <input type="date" class="form-control" [(ngModel)]="toDate" (change)="onBankAccountChanged()" />
+    </div>
+    <div class="col-md-2 d-flex align-items-end">
+      <button class="btn btn-outline-secondary w-100" (click)="fromDate=''; toDate=''; onBankAccountChanged()">
+        <i class="fa fa-times me-1"></i>{{ '::Clear' | abpLocalization }}
+      </button>
+    </div>
+  </div>
+
+  @if (!bankAccountId) {
+    <div class="text-center text-muted py-5">
+      <i class="fa fa-building-columns fa-3x mb-3 opacity-50"></i>
+      <p>{{ '::SelectBankAccountToViewTransactions' | abpLocalization }}</p>
+    </div>
+  } @else {
+
+  @if (isLoading()) {
+    <div class="d-flex justify-content-center py-3"><div class="spinner-border text-primary" role="status"><span class="visually-hidden">Loading...</span></div></div>
+  }
+
+  <div class="row g-3 mb-4">
+    <div class="col-6 col-md-3">
+      <div class="card">
+        <div class="card-body text-center py-3">
+          <p class="fs-3 fw-bold">{{ summary().totalTransactions ?? 0 }}</p>
+          <small class="text-muted">{{ '::Total' | abpLocalization }}</small>
+        </div>
+      </div>
+    </div>
+    <div class="col-6 col-md-3">
+      <div class="card">
+        <div class="card-body text-center py-3">
+          <p class="fs-3 fw-bold text-success">{{ summary().reconciledCount ?? 0 }}</p>
+          <small class="text-muted">{{ '::Reconciled' | abpLocalization }}</small>
+        </div>
+      </div>
+    </div>
+    <div class="col-6 col-md-3">
+      <div class="card">
+        <div class="card-body text-center py-3">
+          <p class="fs-3 fw-bold text-warning">{{ summary().unreconciledCount ?? 0 }}</p>
+          <small class="text-muted">{{ '::Unreconciled' | abpLocalization }}</small>
+        </div>
+      </div>
+    </div>
+    <div class="col-6 col-md-3">
+      <div class="card">
+        <div class="card-body text-center py-3">
+          <p class="fs-3 fw-bold font-monospace">{{ summary().unreconciledBalance ?? 0 | number:'1.2-2' }}</p>
+                    <small class="text-muted">{{ '::Balance' | abpLocalization }}</small>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+      <h5 class="card-title mb-0">{{ '::BankTransactions' | abpLocalization }}</h5>
+      <div class="d-flex gap-2">
+        <button class="btn btn-sm btn-outline-primary" (click)="openAddTransaction()" [disabled]="!bankAccountId">
+          <i class="fa fa-plus me-1"></i>{{ '::AddTransaction' | abpLocalization }}
+        </button>
+        <button class="btn btn-sm btn-success" (click)="autoMatch()" [disabled]="isMatching()">
+          <i class="fa fa-magic me-1"></i>{{ '::AutoMatch' | abpLocalization }}
+        </button>
+      </div>
+    </div>
+    <div class="card-body pt-3">
+      <div class="table-responsive">
+                <table class="table table-hover w-100">
+          <thead>
+            <tr>
+              <th>{{ '::PostingDate' | abpLocalization }}</th>
+              <th>{{ '::Description' | abpLocalization }}</th>
+              <th>{{ '::Amount' | abpLocalization }}</th>
+              <th>{{ '::Matched' | abpLocalization }}</th>
+              <th>{{ '::Status' | abpLocalization }}</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            @for (t of transactions(); track t.id ?? $index) {
+              <tr>
+                <td>{{ t.transactionDate | date:'dd/MM/yyyy' }}</td>
+                <td>{{ t.description }}</td>
+                <td class="font-monospace"
+                  [class.text-success]="(t.amount ?? 0) > 0"
+                  [class.text-danger]="(t.amount ?? 0) < 0">
+                  {{ "" | companyCurrency }} {{ t.amount | number:'1.2-2' }}
+                </td>
+                <td>{{ t.matchedDocumentRef ?? '—' }}</td>
+                <td>
+                  <span class="badge" [class]="t.isReconciled ? 'bg-success-subtle text-success' : 'bg-warning-subtle text-warning'">
+                    {{ t.isReconciled ? 'Reconciled' : 'Pending' }}
+                  </span>
+                </td>
+                <td>
+                  @if (!t.isReconciled) {
+                    <div class="btn-group btn-group-sm">
+                      <button class="btn btn-outline-primary" (click)="reconcile(t.id!)">
+                        <i class="fa fa-check me-1"></i>{{ '::Reconcile' | abpLocalization }}
+                      </button>                      <button class="btn btn-outline-success" (click)="openCreatePayment(t)" title="Create Payment Entry">
+                        <i class="fa fa-plus"></i>
+                      </button>
+                      <button class="btn btn-outline-warning" (click)="openCreateJournal(t)" title="Create Journal Entry">
+                        <i class="fa fa-book"></i>
+                      </button>
+                      <button class="btn btn-outline-info" (click)="createTransfer(t.id!)" title="Create Internal Transfer">
+                        <i class="fa fa-exchange-alt"></i>
+                      </button>
+                    </div>
+                  } @else {
+                    <button class="btn btn-sm btn-outline-secondary" (click)="unreconcile(t.id!)">
+                      <i class="fa fa-undo me-1"></i>{{ '::Undo' | abpLocalization }}
+                    </button>
+                  }
+                </td>
+              </tr>
+            }
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Add Transaction Panel (manual single-transaction import) -->
+  @if (showAddTransactionPanel()) {
+    <div class="card mt-3">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h6 class="mb-0"><i class="fa fa-plus me-1"></i>{{ '::AddTransaction' | abpLocalization }}</h6>
+        <button class="btn btn-sm btn-outline-secondary" (click)="closeAddTransactionPanel()">
+          <i class="fa fa-times"></i>
+        </button>
+      </div>
+      <div class="card-body">
+        <div class="row g-2">
+          <div class="col-md-3">
+            <label class="form-label small">{{ '::PostingDate' | abpLocalization }}</label>
+            <input type="date" class="form-control form-control-sm" [(ngModel)]="newTransactionDate" />
+          </div>
+          <div class="col-md-4">
+            <label class="form-label small">{{ '::Description' | abpLocalization }}</label>
+            <input type="text" class="form-control form-control-sm" [(ngModel)]="newTransactionDescription" />
+          </div>
+          <div class="col-md-2">
+            <label class="form-label small">{{ '::Amount' | abpLocalization }}</label>
+            <input type="number" class="form-control form-control-sm" [(ngModel)]="newTransactionAmount"
+              [placeholder]="'::AddTransactionAmountHint' | abpLocalization" />
+          </div>
+          <div class="col-md-3">
+            <label class="form-label small">{{ '::ReferenceNumber' | abpLocalization }}</label>
+            <input type="text" class="form-control form-control-sm" [(ngModel)]="newTransactionReference" />
+          </div>
+        </div>
+        <div class="d-flex gap-2 mt-3">
+          <button class="btn btn-sm btn-primary" [disabled]="isAddingTransaction()" (click)="confirmAddTransaction()">
+            {{ '::Confirm' | abpLocalization }}
+          </button>
+          <button class="btn btn-sm btn-secondary" (click)="closeAddTransactionPanel()">
+            {{ '::Cancel' | abpLocalization }}
+          </button>
+        </div>
+      </div>
+    </div>
+  }
+
+  <!-- Match Candidates Panel (manual reconciliation) -->
+  @if (showMatchPanel()) {
+    <div class="card mt-3">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h6 class="mb-0"><i class="fa fa-search me-1"></i>{{ '::MatchCandidates' | abpLocalization }}</h6>
+        <button class="btn btn-sm btn-outline-secondary" (click)="closeMatchPanel()">
+          <i class="fa fa-times"></i>
+        </button>
+      </div>
+      <div class="card-body">
+        @if (matchCandidates().length === 0) {
+          <p class="text-muted mb-0">{{ '::NoMatchCandidatesFound' | abpLocalization }}</p>
+        } @else {
+          <table class="table table-hover table-sm">
+            <thead>
+              <tr>
+                <th>{{ '::VoucherType' | abpLocalization }}</th>
+                <th>{{ '::PaymentNumber' | abpLocalization }}</th>
+                <th>{{ '::Amount' | abpLocalization }}</th>
+                <th>{{ '::PostingDate' | abpLocalization }}</th>
+                <th>{{ '::ReferenceNumber' | abpLocalization }}</th>
+                <th>{{ '::Rank' | abpLocalization }}</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (c of matchCandidates(); track (c.paymentEntryId ?? c.journalEntryId)) {
+                <tr>
+                  <td>
+                    <span class="badge bg-info-subtle text-info">{{ c.voucherType === 'JournalEntry' ? ('::JournalEntry' | abpLocalization) : ('::PaymentEntry' | abpLocalization) }}</span>
+                  </td>
+                  <td>{{ c.paymentNumber }}</td>
+                  <td class="font-monospace">{{ c.amount | number:'1.2-2' }}</td>
+                  <td>{{ c.postingDate | date:'dd/MM/yyyy' }}</td>
+                  <td>{{ c.referenceNumber ?? '—' }}</td>
+                  <td>
+                    <span class="badge" [class]="(c.rank ?? 0) >= 3 ? 'bg-success' : (c.rank ?? 0) >= 2 ? 'bg-warning' : 'bg-secondary'">
+                      {{ c.rank }}
+                    </span>
+                  </td>
+                  <td>
+                    <button class="btn btn-sm btn-primary" (click)="selectCandidate(c)">
+                      <i class="fa fa-check me-1"></i>{{ '::Select' | abpLocalization }}
+                    </button>
+                  </td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        }
+      </div>
+    </div>
+  }
+
+  <!-- Internal Transfer Panel -->
+  @if (showTransferPanel()) {
+    <div class="card mt-3">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h6 class="mb-0"><i class="fa fa-exchange-alt me-1"></i>{{ '::CreateInternalTransfer' | abpLocalization }}</h6>
+        <button class="btn btn-sm btn-outline-secondary" (click)="closeTransferPanel()">
+          <i class="fa fa-times"></i>
+        </button>
+      </div>
+      <div class="card-body">
+        @if (mirrorTransaction()) {
+          <div class="alert alert-info">
+            <i class="fa fa-info-circle me-1"></i>
+            {{ '::MirrorTransactionFound' | abpLocalization }}:
+            <strong>{{ mirrorTransaction()!.referenceNumber ?? 'N/A' }}</strong>
+            ({{ mirrorTransaction()!.deposit! > 0 ? '+' : '-' }}{{ (mirrorTransaction()!.deposit! || mirrorTransaction()!.withdrawal!) | number:'1.2-2' }}
+            {{ mirrorTransaction()!.currencyCode }},
+            {{ mirrorTransaction()!.transactionDate | date:'dd/MM/yyyy' }})
+          </div>
+        } @else {
+          <p class="text-muted">{{ '::NoMirrorTransactionFound' | abpLocalization }}</p>
+        }
+        <button class="btn btn-primary" (click)="confirmTransfer(bankAccountId)">
+          <i class="fa fa-paper-plane me-1"></i>{{ '::CreateTransfer' | abpLocalization }}
+        </button>
+      </div>
+    </div>
+  }
+
+  <!-- Create Payment Entry Panel -->
+  @if (showCreatePePanel()) {
+    <div class="card mt-3 border-success">
+      <div class="card-header bg-success-subtle d-flex justify-content-between align-items-center">
+        <h6 class="mb-0"><i class="fa fa-plus-circle me-1"></i>{{ '::CreatePaymentEntry' | abpLocalization }}</h6>
+        <button class="btn btn-sm btn-outline-secondary" (click)="closeCreatePePanel()">
+          <i class="fa fa-times"></i>
+        </button>
+      </div>
+      <div class="card-body">
+        @if (createPeTransaction(); as tx) {
+          <div class="alert alert-light border">
+            <strong>{{ tx.description }}</strong>
+            <span class="ms-2 badge" [class]="(tx.amount ?? 0) > 0 ? 'bg-success' : 'bg-danger'">
+              {{ "" | companyCurrency }} {{ tx.amount | number:'1.2-2' }}
+            </span>
+            <span class="ms-2 text-muted">{{ tx.transactionDate | date:'dd/MM/yyyy' }}</span>
+          </div>
+
+          <div class="row g-3">
+            <div class="col-md-4">
+              <label class="form-label">{{ '::PartyType' | abpLocalization }}</label>
+              <select class="form-select" [ngModel]="pePartyType()" (ngModelChange)="pePartyType.set($event)">
+                <option value="Customer">{{ '::Customer' | abpLocalization }}</option>
+                <option value="Supplier">{{ '::Supplier' | abpLocalization }}</option>
+              </select>
+            </div>
+            <div class="col-md-8">
+              <label class="form-label">{{ '::Party' | abpLocalization }}</label>
+              @if (pePartyType() === 'Customer') {
+                <select class="form-select" [ngModel]="pePartyId()" (ngModelChange)="pePartyId.set($event)">
+                  <option value="">-- Select Customer --</option>
+                  @for (c of customers(); track c.id) {
+                    <option [value]="c.id">{{ c.name }}</option>
+                  }
+                </select>
+              } @else {
+                <select class="form-select" [ngModel]="pePartyId()" (ngModelChange)="pePartyId.set($event)">
+                  <option value="">-- Select Supplier --</option>
+                  @for (s of suppliers(); track s.id) {
+                    <option [value]="s.id">{{ s.name }}</option>
+                  }
+                </select>
+              }
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">{{ '::BankAccount' | abpLocalization }}</label>
+              <select class="form-select" [ngModel]="peBankAccountId()" (ngModelChange)="peBankAccountId.set($event)">
+                <option value="">{{ '::SelectBankAccount' | abpLocalization }}</option>
+                @for (a of bankAccounts(); track a.id) {
+                  <option [value]="a.id">{{ a.accountCode }} — {{ a.accountName }}</option>
+                }
+              </select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">{{ '::PartyAccount' | abpLocalization }}</label>
+              <select class="form-select" [ngModel]="pePartyAccountId()" (ngModelChange)="pePartyAccountId.set($event)">
+                <option value="">{{ '::SelectAccount' | abpLocalization }}</option>
+                @for (a of partyAccounts(); track a.id) {
+                  <option [value]="a.id">{{ a.accountCode }} — {{ a.accountName }}</option>
+                }
+              </select>
+            </div>
+          </div>
+
+          <div class="mt-3 d-flex justify-content-end gap-2">
+            <button class="btn btn-outline-secondary" (click)="closeCreatePePanel()">
+              {{ '::Cancel' | abpLocalization }}
+            </button>
+            <button class="btn btn-success" (click)="confirmCreatePayment()" [disabled]="isCreatingPe()">
+              @if (isCreatingPe()) {
+                <span class="spinner-border spinner-border-sm me-1"></span>
+              }
+              <i class="fa fa-check me-1"></i>{{ '::CreateAndReconcile' | abpLocalization }}
+            </button>
+          </div>
+        }
+      </div>
+    </div>
+  }
+
+  <!-- Create Journal Entry Panel -->
+  @if (showCreateJePanel()) {
+    <div class="card mt-3 border-warning">
+      <div class="card-header bg-warning-subtle d-flex justify-content-between align-items-center">
+        <h6 class="mb-0"><i class="fa fa-book me-1"></i>{{ '::CreateJournalEntry' | abpLocalization }}</h6>
+        <button class="btn btn-sm btn-outline-secondary" (click)="closeCreateJePanel()">
+          <i class="fa fa-times"></i>
+        </button>
+      </div>
+      <div class="card-body">
+        @if (createJeTransaction(); as tx) {
+          <div class="alert alert-light border">
+            <strong>{{ tx.description }}</strong>
+            <span class="ms-2 badge" [class]="(tx.amount ?? 0) > 0 ? 'bg-success' : 'bg-danger'">
+              {{ "" | companyCurrency }} {{ tx.amount | number:'1.2-2' }}
+            </span>
+            <span class="ms-2 text-muted">{{ tx.transactionDate | date:'dd/MM/yyyy' }}</span>
+          </div>
+
+          <div class="row g-3">
+            <div class="col-md-6">
+              <label class="form-label">{{ '::SecondAccount' | abpLocalization }} <span class="text-danger">*</span></label>
+              <select class="form-select" [ngModel]="jeSecondAccountId()" (ngModelChange)="jeSecondAccountId.set($event)">
+                <option value="">-- {{ '::SelectAccount' | abpLocalization }} --</option>
+                @for (a of allPostingAccounts(); track a.id) {
+                  <option [value]="a.id">{{ a.accountCode }} — {{ a.accountName }}</option>
+                }
+              </select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">{{ '::VoucherType' | abpLocalization }}</label>
+              <select class="form-select" [ngModel]="jeVoucherType()" (ngModelChange)="jeVoucherType.set(+$event)">
+                <option [value]="2">{{ '::BankEntry' | abpLocalization }}</option>
+                <option [value]="7">{{ '::ContraEntry' | abpLocalization }}</option>
+                <option [value]="0">{{ '::JournalEntry' | abpLocalization }}</option>
+              </select>
+            </div>
+            <div class="col-md-12">
+              <label class="form-label">{{ '::Narration' | abpLocalization }}</label>
+              <input type="text" class="form-control" [ngModel]="jeNarration()" (ngModelChange)="jeNarration.set($event)" />
+            </div>
+          </div>
+
+          <div class="mt-3 d-flex justify-content-end gap-2">
+            <button class="btn btn-outline-secondary" (click)="closeCreateJePanel()">
+              {{ '::Cancel' | abpLocalization }}
+            </button>
+            <button class="btn btn-warning" (click)="confirmCreateJournal()" [disabled]="isCreatingJe()">
+              @if (isCreatingJe()) {
+                <span class="spinner-border spinner-border-sm me-1"></span>
+              }
+              <i class="fa fa-check me-1"></i>{{ '::CreateAndReconcile' | abpLocalization }}
+            </button>
+          </div>
+        }
+      </div>
+    </div>
+  }
+  } <!-- end bankAccountId else -->
+</abp-page>

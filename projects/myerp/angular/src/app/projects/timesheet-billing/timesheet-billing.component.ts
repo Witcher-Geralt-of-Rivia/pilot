@@ -1,0 +1,98 @@
+import { CompanyCurrencyPipe } from '../../shared/pipes/company-currency.pipe';
+import { Component, inject, OnInit, signal } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { FormsModule } from '@angular/forms';
+import { Router } from '@angular/router';
+import { PageModule } from '@abp/ng.components/page';
+import { LocalizationPipe } from '@abp/ng.core';
+import { ToasterService } from '@abp/ng.theme.shared';
+import { CompanyContextService } from '../../shared/services/company-context.service';
+import { CustomerService } from '../../proxy/sales/customer.service';
+import { TimesheetService } from '../../proxy/projects/timesheet.service';
+import type { UnbilledTimesheetSummaryDto } from '../../proxy/projects/models';
+
+interface CustomerOption {
+  id: string;
+  customerName: string;
+}
+
+@Component({
+  selector: 'app-timesheet-billing',
+  standalone: true,
+  imports: [CompanyCurrencyPipe, CommonModule, FormsModule, PageModule, LocalizationPipe],
+  templateUrl: './timesheet-billing.component.html',
+  styleUrls: ['./timesheet-billing.component.scss'],
+})
+export class TimesheetBillingComponent implements OnInit {
+  private timesheetService = inject(TimesheetService);
+  private toaster = inject(ToasterService);
+  private router = inject(Router);
+  private companyContext = inject(CompanyContextService);
+  private customerService = inject(CustomerService);
+
+  unbilledItems = signal<UnbilledTimesheetSummaryDto[]>([]);
+  customers = signal<CustomerOption[]>([]);
+  isLoading = signal(false);
+  isBilling = signal(false);
+  customerId = '';
+  projectId = '';
+  totalHours = signal(0);
+  totalAmount = signal(0);
+
+  ngOnInit(): void {
+    this.loadCustomers();
+    this.loadUnbilled();
+  }
+
+  loadCustomers(): void {
+    this.customerService.getList({ skipCount: 0, maxResultCount: 200, sorting: '' }).subscribe({
+      next: (result: any) => {
+        this.customers.set((result.items ?? []).map((c: any) => ({ id: c.id, customerName: c.name })));
+      },
+    });
+  }
+
+  loadUnbilled(): void {
+    const companyId = this.companyContext.currentCompanyId();
+    if (!companyId) return;
+
+    this.isLoading.set(true);
+    this.timesheetService.getUnbilledSummary(companyId, this.projectId || '').subscribe({
+      next: (items) => {
+        this.unbilledItems.set(items);
+        this.totalHours.set(items.reduce((s, i) => s + (i.totalHours ?? 0), 0));
+        this.totalAmount.set(items.reduce((s, i) => s + (i.totalAmount ?? 0), 0));
+        this.isLoading.set(false);
+      },
+      error: () => {
+        this.isLoading.set(false);
+        this.toaster.error('::FailedToLoad');
+      },
+    });
+  }
+
+  createInvoice(): void {
+    const companyId = this.companyContext.currentCompanyId();
+    if (!companyId || !this.customerId) {
+      this.toaster.warn('::PleaseSelectCompanyAndCustomer');
+      return;
+    }
+
+    this.isBilling.set(true);
+    this.timesheetService.createInvoiceFromTimesheets({
+      companyId,
+      customerId: this.customerId,
+      projectId: this.projectId || undefined,
+    } as any).subscribe({
+      next: (result) => {
+        this.isBilling.set(false);
+        this.toaster.success(`Invoice ${result.invoiceNumber} created (${result.totalHours}h, MYR ${result.totalAmount})`);
+        this.router.navigate(['/sales/invoices', result.invoiceId]);
+      },
+      error: (err) => {
+        this.isBilling.set(false);
+        this.toaster.error(err?.error?.error?.message ?? '::FailedToCreate');
+      },
+    });
+  }
+}

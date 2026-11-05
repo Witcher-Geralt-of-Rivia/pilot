@@ -1,0 +1,59 @@
+using System;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.HumanResources.Entities;
+using MyERP.Permissions;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+
+namespace MyERP.HumanResources;
+
+[Authorize(MyERPPermissions.Employees.Default)]
+public class HolidayListAppService : ApplicationService, IHolidayListAppService
+{
+    private readonly IRepository<HolidayList, Guid> _repository;
+
+    public HolidayListAppService(IRepository<HolidayList, Guid> repository) => _repository = repository;
+
+    public async Task<PagedResultDto<HolidayListDto>> GetListAsync(PagedAndSortedResultRequestDto input)
+    {
+        var query = (await _repository.WithDetailsAsync()).AsQueryable();
+        var totalCount = query.Count();
+        var items = query.OrderByDescending(h => h.Year).ThenBy(h => h.Name)
+            .Skip(input.SkipCount).Take(input.MaxResultCount).ToList();
+        return new PagedResultDto<HolidayListDto>(totalCount, items.Select(x => ObjectMapper.Map<HolidayList, HolidayListDto>(x)).ToList());
+    }
+
+    public async Task<HolidayListDto> GetAsync(Guid id)
+    {
+        var hl = (await _repository.WithDetailsAsync()).First(h => h.Id == id);
+        return ObjectMapper.Map<HolidayList, HolidayListDto>(hl);
+    }
+
+    [Authorize(MyERPPermissions.Employees.Create)]
+    public async Task<HolidayListDto> CreateAsync(CreateHolidayListDto input)
+    {
+        var hl = new HolidayList(GuidGenerator.Create(), input.CompanyId, input.Name, input.Year, CurrentTenant.Id)
+        {
+            WeeklyOff = input.WeeklyOff,
+            IsDefault = input.IsDefault,
+        };
+        foreach (var h in input.Holidays)
+            hl.AddHoliday(new Holiday(Guid.NewGuid(), hl.Id, h.HolidayDate, h.Description, h.IsWeeklyOff, h.IsHalfDay));
+        await _repository.InsertAsync(hl);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "HolidayList", hl.Id,
+            "Created", hl.CompanyId,
+            hl.Name, "Draft", "Active", CurrentUser.Id,
+            $"Holiday list '{hl.Name}' ({hl.Year}) created with {hl.Holidays.Count} holidays", CurrentTenant.Id));
+
+        return ObjectMapper.Map<HolidayList, HolidayListDto>(hl);
+    }
+
+    [Authorize(MyERPPermissions.Employees.Delete)]
+    public async Task DeleteAsync(Guid id) => await _repository.DeleteAsync(id);
+}

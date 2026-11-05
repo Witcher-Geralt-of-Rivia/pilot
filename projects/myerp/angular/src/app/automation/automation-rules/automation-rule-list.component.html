@@ -1,0 +1,80 @@
+<abp-page [title]="'::AutomationRules' | abpLocalization">
+  @if (store.isLoading()) {
+    <div class="d-flex justify-content-center py-3"><div class="spinner-border text-primary" role="status"><span class="visually-hidden">Loading...</span></div></div>
+  }
+
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h5 class="fs-5 fw-medium">{{ store.totalCount() }} {{ '::Rules' | abpLocalization }}</h5>
+    <button class="btn btn-primary" routerLink="new">
+      <i class="fa fa-plus"></i> {{ '::NewRule' | abpLocalization }}
+    </button>
+  </div>
+
+  <div class="card">
+    <div class="card-body">
+      <div class="table-responsive">
+                <table class="table table-hover w-100">
+          <thead>
+            <tr>
+              <th>{{ '::Name' | abpLocalization }}</th>
+              <th>{{ '::Trigger' | abpLocalization }}</th>
+              <th>{{ '::DocumentType' | abpLocalization }}</th>
+              <th>{{ '::Action' | abpLocalization }}</th>
+              <th>{{ '::Priority' | abpLocalization }}</th>
+              <th>{{ '::Active' | abpLocalization }}</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            @for (row of store.entities(); track row.id ?? $index) {
+              <tr>
+                <td>
+                  <span class="fw-medium">{{ row.name }}</span>
+                  @if (row.description) {
+                  <br><small class="text-muted">{{ row.description }}</small>
+                  }
+                </td>
+                <td><span class="badge bg-light text-dark">{{ triggerLabels[row.trigger!] || 'Unknown' }}</span></td>
+                <td>{{ row.documentType || 'All' }}</td>
+                <td><span class="badge bg-primary-subtle text-primary">{{ actionLabels[row.action!] || 'Unknown' }}</span></td>
+                <td>{{ row.priority }}</td>
+                <td>
+                  <div class="form-check form-switch">
+                    <input class="form-check-input" type="checkbox"
+                      [checked]="row.isActive"
+                      (change)="toggleActive(row.id)"
+                      [title]="row.isActive ? 'Deactivate' : 'Activate'" />
+                  </div>
+                </td>
+                <td>
+                  <div class="btn-group btn-group-sm">
+                    <button class="btn btn-outline-primary" [routerLink]="[row.id, 'edit']"
+                      title="Edit" aria-label="Edit">
+                      <i class="fa fa-pencil"></i>
+                    </button>
+                    <button class="btn btn-outline-danger" (click)="delete(row.id)"
+                      title="Delete" aria-label="Delete">
+                      <i class="fa fa-trash"></i>
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            }
+          </tbody>
+        </table>
+      </div>
+      @if (store.entities().length === 0 && !store.isLoading()) {
+        <div class="text-center py-5">
+          <i class="fa fa-robot fa-3x text-muted mb-3 d-block"></i>
+          <h6 class="text-muted">{{ '::NoRecordsFound' | abpLocalization }}</h6>
+          <p class="text-muted small mb-3">{{ '::NoAutomationRulesYet' | abpLocalization }}</p>
+          <button class="btn btn-primary btn-sm" routerLink="/automation/new">
+            <i class="fa fa-plus me-1"></i>{{ '::NewAutomationRule' | abpLocalization }}
+          </button>
+        </div>
+      }
+    </div>
+  </div>
+
+  <app-pagination [totalCount]="store.totalCount()" [pageSize]="pageSize" [currentPage]="currentPage" (pageChange)="onPageChange($event)" />
+</abp-page>

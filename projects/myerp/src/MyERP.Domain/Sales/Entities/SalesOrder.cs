@@ -1,0 +1,558 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using MyERP.Core;
+using Volo.Abp;
+using Volo.Abp.Domain.Entities.Auditing;
+using Volo.Abp.MultiTenancy;
+
+namespace MyERP.Sales.Entities;
+
+/// <summary>
+/// Sales Order — confirmed order from customer.
+/// Maps to ERPNext selling/doctype/sales_order.
+/// Flow: Quotation → SalesOrder → SalesInvoice
+/// </summary>
+public class SalesOrder : FullAuditedAggregateRoot<Guid>, IMultiTenant, IAmendable
+{
+    public Guid? TenantId { get; set; }
+    public Guid CompanyId { get; set; }
+
+    /// <summary>Shipping term (e.g. FOB, CIF, EXW) — who bears cost/risk at each stage.</summary>
+    public Guid? IncotermId { get; set; }
+
+    public string OrderNumber { get; set; } = null!;
+    public DateTime OrderDate { get; set; }
+    public DateTime? DeliveryDate { get; set; }
+
+    public Guid CustomerId { get; set; }
+
+    /// <summary>Customer's own PO reference number.</summary>
+    public string? CustomerPoNumber { get; set; }
+
+    public string CurrencyCode { get; set; } = "MYR";
+    /// <summary>Exchange rate for multi-currency sales orders (order currency → company currency).</summary>
+    public decimal ExchangeRate { get; set; } = 1m;
+    public decimal NetTotal { get; set; }
+    public decimal TaxAmount { get; set; }
+    public decimal GrandTotal { get; set; }
+
+    /// <summary>Selling Price List — defaults from Customer.DefaultPriceListId, overridable per order.</summary>
+    public Guid? PriceListId { get; set; }
+
+    /// <summary>Primary billing address (auto-resolved from Customer on create).</summary>
+    public Guid? BillingAddressId { get; set; }
+
+    /// <summary>Shipping/delivery address (auto-resolved from Customer on create).</summary>
+    public Guid? ShippingAddressId { get; set; }
+
+    /// <summary>Billing contact person (Contact ID).</summary>
+    public Guid? ContactPersonId { get; set; }
+
+    /// <summary>Shipping contact person (Contact ID) per ERPNext PR #58159.</summary>
+    public Guid? ShippingContactPersonId { get; set; }
+
+    /// <summary>Shipping charge calculated from ShippingRule.</summary>
+    public decimal ShippingCharge { get; set; }
+
+    /// <summary>Cost center for departmental tracking.</summary>
+    public Guid? CostCenterId { get; set; }
+
+    /// <summary>Project for project-wise tracking.</summary>
+    public Guid? ProjectId { get; set; }
+
+    /// <summary>Total advance payment received against this order.</summary>
+    /// <summary>Sales partner linked to this order for commission tracking.</summary>
+    public Guid? SalesPartnerId { get; set; }
+
+    /// <summary>Commission rate percentage for the sales partner.</summary>
+    public decimal CommissionRate { get; set; }
+
+    /// <summary>Total commission amount for the sales partner.</summary>
+    public decimal TotalCommission { get; set; }
+
+    public decimal AdvancePaid { get; set; }
+
+    /// <summary>Percentage of advance paid: (AdvancePaid / GrandTotal) × 100.</summary>
+    public decimal PerAdvancePaid => GrandTotal > 0 ? Math.Round(AdvancePaid / GrandTotal * 100m, 2) : 0;
+
+    public Guid? TermsAndConditionsId { get; set; }
+    public string? Terms { get; set; }
+    public string? Notes { get; set; }
+    /// <summary>Coupon code applied at creation — persisted so cancellation can reverse the usage count.</summary>
+    public string? CouponCode { get; set; }
+
+    public DocumentStatus Status { get; private set; } = DocumentStatus.Draft;
+
+    // Amendment (cancel-and-amend workflow)
+    public Guid? AmendedFromId { get; set; }
+    public int AmendmentIndex { get; set; }
+
+    /// <summary>Source quotation (if converted from quotation).</summary>
+    public Guid? QuotationId { get; set; }
+
+    /// <summary>Order type: Sales, Maintenance, or Shopping Cart (per ERPNext PR #52475 / commit 1a22e3cb61).</summary>
+    public SalesOrderType OrderType { get; set; } = SalesOrderType.Sales;
+
+    /// <summary>When true, order does not require Delivery Notes (e.g. maintenance or service orders).</summary>
+    public bool SkipDeliveryNote { get; set; }
+
+    /// <summary>
+    /// Percentage of total qty delivered (0-100). Excludes closed rows and service items.
+    /// If all items skip delivery, order skips delivery, or all are closed, returns 100%.
+    /// Gotcha #370 / part52 line 155: SUM(MIN(delivered_qty, qty)) / SUM(qty) * 100.
+    /// </summary>
+    public decimal PerDelivered
+    {
+        get
+        {
+            if (SkipDeliveryNote || OrderType == SalesOrderType.Maintenance) return 100m;
+            var openItems = _items.Where(i => !i.SkipDelivery && !i.IsClosed).ToList();
+            var basis = openItems.Count > 0 ? openItems : _items.Where(i => !i.SkipDelivery).ToList();
+            if (basis.Count == 0) return _items.Count > 0 ? 100m : 0m;
+            var totalQty = basis.Sum(i => i.Quantity);
+            if (totalQty <= 0) return 100m;
+            var percentage = Math.Round(basis.Sum(i => Math.Min(i.DeliveredQty, i.Quantity)) / totalQty * 100, 2);
+            // Per ERPNext PR #61983 (commit 13c337cd69): snap rounding-short >= 99.99% to 100% when no pending delivery remains
+            if (percentage >= 99.99m && !basis.Any(i => i.PendingDeliveryQty > 0))
+                return 100m;
+            return percentage;
+        }
+    }
+
+    /// <summary>Percentage of total amount billed (0-100). Excludes closed rows. Falls back to quantity for zero-amount orders (ERPNext PR #58816).</summary>
+    public decimal PerBilled
+    {
+        get
+        {
+            var openItems = _items.Where(i => !i.IsClosed).ToList();
+            var basis = openItems.Count > 0 ? openItems : _items;
+            if (basis.Count == 0) return 0m;
+
+            var basisTotal = basis.Sum(i => i.LineTotal);
+            if (basisTotal > 0)
+            {
+                var percentage = Math.Round(basis.Sum(i => i.BilledQty * i.UnitPrice) / basisTotal * 100, 2);
+                // Per ERPNext PR #58816: if any row (e.g. zero-amount free item) still has pending billing qty, cap at 99.99
+                if (percentage >= 100m && basis.Any(i => i.PendingBillingQty > 0))
+                    return 99.99m;
+                // Per ERPNext PR #61983 (commit 13c337cd69): snap rounding-short >= 99.99% to 100% when all rows are billed
+                if (percentage >= 99.99m && !basis.Any(i => i.PendingBillingQty > 0))
+                    return 100m;
+                return percentage;
+            }
+
+            var totalQty = basis.Sum(i => i.Quantity);
+            if (totalQty > 0)
+            {
+                var percentage = Math.Round(basis.Sum(i => Math.Min(i.Quantity, i.BilledQty)) / totalQty * 100, 2);
+                if (percentage >= 99.99m && !basis.Any(i => i.PendingBillingQty > 0))
+                    return 100m;
+                return percentage;
+            }
+            return 100m;
+        }
+    }
+
+    private readonly List<SalesOrderItem> _items = new();
+    /// <summary>Rows in document order (Idx), since the database gives no ordering guarantee.</summary>
+    public IReadOnlyList<SalesOrderItem> Items => _items.OrderBy(i => i.Idx).ThenBy(i => i.CreationTime).ToList();
+
+    protected SalesOrder() { }
+
+    public SalesOrder(Guid id, Guid companyId, Guid customerId, string orderNumber, DateTime orderDate, Guid? tenantId = null)
+        : base(id)
+    {
+        CompanyId = Check.NotDefaultOrNull<Guid>(companyId, nameof(companyId));
+        CustomerId = Check.NotDefaultOrNull<Guid>(customerId, nameof(customerId));
+        OrderNumber = Check.NotNullOrWhiteSpace(orderNumber, nameof(orderNumber), SalesOrderConsts.MaxOrderNumberLength);
+        OrderDate = orderDate;
+        TenantId = tenantId;
+    }
+
+    public void AddItem(Guid itemId, string description, decimal quantity, decimal unitPrice, decimal taxAmount, string uom = "Unit", DateTime? deliveryDate = null, Guid? quotationItemId = null, Guid? productBundleId = null)
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Check.NotDefaultOrNull<Guid>(itemId, nameof(itemId));
+        if (quantity <= 0)
+            throw new ArgumentException("Quantity must be greater than zero.", nameof(quantity));
+        var item = new SalesOrderItem(Guid.NewGuid(), Id, itemId, description, quantity, unitPrice, taxAmount, uom);
+        item.DeliveryDate = deliveryDate;
+        item.QuotationItemId = quotationItemId;
+        item.ProductBundleId = productBundleId;
+        item.Idx = _items.Count;
+        _items.Add(item);
+        RecalculateTotals();
+    }
+
+    /// <summary>Clear all items (Draft only). Used during edit to replace items.</summary>
+    public void ClearItems()
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        _items.Clear();
+        RecalculateTotals();
+    }
+
+    /// <summary>
+    /// Removes a single item row from a submitted order (post-submit editing).
+    /// Caller must validate the row is safe to delete (ChildItemUpdateService) before calling this.
+    /// </summary>
+    public void RemoveItem(Guid itemRowId)
+    {
+        if (Status == DocumentStatus.Cancelled)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        var item = _items.FirstOrDefault(i => i.Id == itemRowId);
+        if (item == null)
+            return;
+        _items.Remove(item);
+        RecalculateTotals();
+    }
+
+    public void Submit()
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        if (_items.Count == 0)
+            throw new BusinessException(MyERPDomainErrorCodes.DocumentMustHaveItems);
+
+        // Per ERPNext validate(): SO delivery date must be >= order date
+        ValidateDeliveryDates();
+
+        // Auto-correct conversion factor when UOM equals StockUOM (gotcha #6171)
+        foreach (var item in _items)
+        {
+            if (!string.IsNullOrEmpty(item.Uom) && !string.IsNullOrEmpty(item.StockUom)
+                && string.Equals(item.Uom, item.StockUom, StringComparison.OrdinalIgnoreCase)
+                && item.ConversionFactor != 1.0m)
+            {
+                item.ConversionFactor = 1.0m;
+            }
+        }
+
+        if (PerDelivered >= 100m)
+            Status = DocumentStatus.ToBill;
+        else
+            Status = DocumentStatus.ToDeliverAndBill;
+    }
+
+    /// <summary>
+    /// Validates delivery dates and syncs header delivery date to max of item delivery dates (gotcha #462, PR #48690 / commit cf6913891a).
+    /// Gated to order_type == "Sales" and skip_delivery_note == false.
+    /// </summary>
+    public void ValidateDeliveryDates()
+    {
+        if (SkipDeliveryNote || OrderType != SalesOrderType.Sales) return;
+
+        foreach (var item in _items)
+        {
+            if (!item.DeliveryDate.HasValue && DeliveryDate.HasValue)
+            {
+                item.DeliveryDate = DeliveryDate;
+            }
+
+            if (item.DeliveryDate.HasValue && item.DeliveryDate.Value.Date < OrderDate.Date)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Item '{item.Description}' delivery date ({item.DeliveryDate.Value:yyyy-MM-dd}) cannot be earlier than order date ({OrderDate:yyyy-MM-dd}).");
+            }
+        }
+
+        var allItemDates = _items.Where(i => i.DeliveryDate.HasValue).Select(i => i.DeliveryDate!.Value).ToList();
+        if (allItemDates.Count > 0)
+        {
+            DeliveryDate = allItemDates.Max();
+        }
+        else if (DeliveryDate.HasValue && DeliveryDate.Value.Date < OrderDate.Date)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"Delivery date ({DeliveryDate.Value:yyyy-MM-dd}) cannot be earlier than order date ({OrderDate:yyyy-MM-dd}).");
+        }
+    }
+
+    /// <summary>
+    /// Per ERPNext on_cancel(): a Closed SO cannot be cancelled directly — it must be
+    /// reopened first. Without this guard, cancelling a Closed order would bypass whatever
+    /// the close/reopen cycle is meant to gate (e.g. re-checking credit limit on reopen).
+    /// </summary>
+    public void Cancel()
+    {
+        if (Status == DocumentStatus.Cancelled || Status == DocumentStatus.Closed)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = DocumentStatus.Cancelled;
+
+        // Per ERPNext PR #59120 (commit ded6df3614): reset ordered_qty when a Sales Order is cancelled
+        foreach (var item in _items)
+        {
+            item.OrderedQty = 0;
+        }
+    }
+
+    /// <summary>
+    /// Manually close the SO (stops further fulfillment without cancelling).
+    /// Used when remaining items won't be delivered/billed (short-close).
+    /// </summary>
+    public void Close()
+    {
+        if (Status == DocumentStatus.Draft || Status == DocumentStatus.Cancelled || Status == DocumentStatus.Closed)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = DocumentStatus.Closed;
+    }
+
+    /// <summary>
+    /// Reopen a closed SO for further fulfillment.
+    /// </summary>
+    public void Reopen()
+    {
+        if (Status != DocumentStatus.Closed)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        if (_items.Count > 0 && _items.All(i => i.IsClosed))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Every row of Sales Order is closed. Reopen the rows you need instead.");
+        }
+        UpdateFulfillmentStatus(); // recalculate correct status from qty fields
+    }
+
+    /// <summary>
+    /// Recalculates fulfillment status based on delivered/billed quantities.
+    /// Called after Delivery Note or Sales Invoice submission.
+    /// </summary>
+    public void UpdateFulfillmentStatus()
+    {
+        if (Status == DocumentStatus.Cancelled || Status == DocumentStatus.Draft)
+            return;
+
+        var fullyDelivered = PerDelivered >= 100m;
+        var fullyBilled = PerBilled >= 100m;
+
+        if (fullyDelivered && fullyBilled)
+            Status = DocumentStatus.Completed;
+        else if (fullyDelivered)
+            Status = DocumentStatus.ToBill;
+        else if (fullyBilled)
+            Status = DocumentStatus.ToDeliver;
+        else
+            Status = DocumentStatus.ToDeliverAndBill;
+    }
+
+    public void RecalculateTotals()
+    {
+        NetTotal = _items.Sum(i => i.LineTotal);
+        TaxAmount = _items.Sum(i => i.TaxAmount);
+        GrandTotal = NetTotal + TaxAmount;
+    }
+
+    /// <summary>Closes an individual item row (per ERPNext PR #57596).</summary>
+    public void CloseItem(Guid itemRowId)
+    {
+        var item = _items.FirstOrDefault(i => i.Id == itemRowId);
+        if (item == null || item.IsClosed) return;
+        if (item.DeliveredQty >= item.Quantity && item.BilledQty >= item.BillableQty)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"Item {item.Description} is already completed in full, so there is nothing to close.");
+        }
+        item.IsClosed = true;
+        if (_items.All(i => i.IsClosed))
+        {
+            Status = DocumentStatus.Closed;
+        }
+        else
+        {
+            UpdateFulfillmentStatus();
+        }
+    }
+
+    /// <summary>Reopens an individual item row.</summary>
+    public void ReopenItem(Guid itemRowId)
+    {
+        var item = _items.FirstOrDefault(i => i.Id == itemRowId);
+        if (item == null || !item.IsClosed) return;
+        item.IsClosed = false;
+        UpdateFulfillmentStatus();
+    }
+
+    /// <summary>
+    /// Checks whether any fully delivered row can take more quantity within its over-delivery allowance (PR #60140).
+    /// </summary>
+    public bool HasOverDeliverableRows(decimal allowancePct, IReadOnlyDictionary<string, bool>? uomWholeNumberMap = null)
+    {
+        if (allowancePct <= 0) return false;
+
+        return _items.Any(item =>
+        {
+            if (item.DeliveredBySupplier || item.SkipDelivery || item.IsClosed)
+                return false;
+
+            var isWhole = uomWholeNumberMap != null
+                && uomWholeNumberMap.TryGetValue(item.Uom, out var whole)
+                && whole;
+
+            var maxAllowed = item.GetMaxDeliverableQty(allowancePct, isWhole);
+            return item.DeliveredQty >= item.Quantity && item.DeliveredQty < maxAllowed;
+        });
+    }
+}
+
+public class SalesOrderItem : CreationAuditedEntity<Guid>, IMultiTenant
+{
+    public Guid? TenantId { get; set; }
+    public Guid SalesOrderId { get; set; }
+    /// <summary>Zero-based row position within the document (ERPNext idx); the database gives no ordering guarantee.</summary>
+    public int Idx { get; set; }
+    public Guid ItemId { get; set; }
+    public string Description { get; set; } = null!;
+    public string Uom { get; set; } = "Unit";
+    public decimal Quantity { get; set; }
+    public decimal UnitPrice { get; set; }
+    public decimal TaxAmount { get; set; }
+    public decimal LineTotal => Quantity * UnitPrice;
+
+    /// <summary>Whether this individual row is closed (per ERPNext PR #57596).</summary>
+    public bool IsClosed { get; set; }
+
+    /// <summary>Item's stock UOM (e.g., "Unit"). From Item master.</summary>
+    public string StockUom { get; set; } = "Unit";
+
+    /// <summary>Conversion factor: transaction UOM → stock UOM. e.g., 1 Dozen = 12 Units → factor = 12.</summary>
+    public decimal ConversionFactor { get; set; } = 1m;
+
+    /// <summary>Quantity in stock UOM = Quantity × ConversionFactor.</summary>
+    public decimal StockQty => Quantity * ConversionFactor;
+
+    /// <summary>Rate per stock UOM = UnitPrice / ConversionFactor (gotcha #198).</summary>
+    public decimal StockUomRate => ConversionFactor > 0 ? Math.Round(UnitPrice / ConversionFactor, 4) : UnitPrice;
+
+    /// <summary>Quantity already delivered via Delivery Notes.</summary>
+    public decimal DeliveredQty { get; set; }
+
+    /// <summary>Quantity already invoiced via Sales Invoices.</summary>
+    public decimal BilledQty { get; set; }
+
+    /// <summary>Quantity returned via sales returns (Delivery Note return).</summary>
+    public decimal ReturnedQty { get; set; }
+
+    /// <summary>Quantity requested via Material Requests created from this Sales Order line.</summary>
+    public decimal RequestedQty { get; set; }
+
+    /// <summary>Quantity ordered via Purchase Orders created from this Sales Order line (e.g. drop-ship).</summary>
+    public decimal OrderedQty { get; set; }
+
+    /// <summary>Quantity already included in submitted Work Orders (ERPNext selling/doctype/sales_order_item: work_order_qty).</summary>
+    public decimal WorkOrderQty { get; set; }
+
+    /// <summary>Quantity produced via submitted Work Orders (ERPNext selling/doctype/sales_order_item: produced_qty).</summary>
+    public decimal ProducedQty { get; set; }
+
+    /// <summary>
+    /// Billable quantity accounting for deliveries, returns, and re-deliveries.
+    /// Per ERPNext PR #114ba42850:
+    /// min(ordered_qty, max(ordered_qty - returned_qty, delivered_qty))
+    /// </summary>
+    public decimal BillableQty => Math.Min(Quantity, Math.Max(Quantity - ReturnedQty, DeliveredQty));
+
+    /// <summary>For service/non-stock items when SkipDeliveryNoteForServiceItems is active or Maintenance order.</summary>
+    public bool SkipDelivery { get; set; }
+
+    /// <summary>Remaining qty to deliver.</summary>
+    public decimal PendingDeliveryQty => (SkipDelivery || IsClosed) ? 0 : Math.Max(0, Math.Round(Quantity - DeliveredQty, 4));
+
+    /// <summary>
+    /// Ordered qty plus the over delivery allowance, floored to whole units when the UOM requires it (PR #60140).
+    /// </summary>
+    public decimal GetMaxDeliverableQty(decimal allowancePct, bool mustBeWholeNumber = false)
+    {
+        var maxAllowed = Quantity * (1m + allowancePct / 100m);
+        return mustBeWholeNumber ? Math.Floor(maxAllowed) : Math.Round(maxAllowed, 4);
+    }
+
+    /// <summary>Remaining qty to bill accounting for returns and re-deliveries.</summary>
+    public decimal PendingBillingQty => IsClosed ? 0 : Math.Max(0, Math.Round(BillableQty - BilledQty, 4));
+
+    /// <summary>Target warehouse for this item (for stock reservation).</summary>
+    public Guid? WarehouseId { get; set; }
+
+    /// <summary>Whether this item is fulfilled directly by supplier to customer (no warehouse involvement).</summary>
+    public bool DeliveredBySupplier { get; set; }
+
+    /// <summary>Drop-ship supplier for this item (required when DeliveredBySupplier=true).</summary>
+    public Guid? SupplierId { get; set; }
+
+    /// <summary>Per-item delivery date (overrides parent SO DeliveryDate). Per ERPNext: each SO item can have its own delivery_date.</summary>
+    public DateTime? DeliveryDate { get; set; }
+
+    /// <summary>Blanket Order this line draws from (deducts qty from the blanket allocation on submit).</summary>
+    public Guid? BlanketOrderId { get; set; }
+
+    /// <summary>Link to Quotation item (for Quotation fulfillment tracking and handling duplicate items per ERPNext PR #47775 / commit 39f6d8ffb6).</summary>
+    public Guid? QuotationItemId { get; set; }
+
+    /// <summary>Product bundle version associated with this order line (PR #62149).</summary>
+    public Guid? ProductBundleId { get; set; }
+
+    /// <summary>Quantity picked via Pick Lists (ERPNext Sales Order Item picked_qty).</summary>
+    public decimal PickedQty { get; set; }
+
+    public void UpdatePickedQty(decimal delta)
+    {
+        PickedQty = Math.Max(0m, Math.Round(PickedQty + delta, 4));
+    }
+
+    protected SalesOrderItem() { }
+    public SalesOrderItem(Guid id, Guid salesOrderId, Guid itemId, string description, decimal quantity, decimal unitPrice, decimal taxAmount, string uom)
+        : base(id)
+    {
+        SalesOrderId = salesOrderId; ItemId = itemId; Description = description;
+        Quantity = quantity; UnitPrice = unitPrice; TaxAmount = taxAmount; Uom = uom;
+    }
+}
+
+/// <summary>
+/// Sales Order Delivery Schedule — planned delivery windows for partial fulfillment.
+/// Per ERPNext: SO delivery_schedule child table enables splitting large orders into
+/// multiple delivery dates. Each row tracks planned vs actual delivered qty.
+/// Frequency-based auto-generation (Weekly/Monthly/Quarterly/Yearly) supported.
+/// Per gotcha #108: SO has a dialog to create frequency-based split deliveries.
+/// </summary>
+public class DeliveryScheduleEntry : CreationAuditedEntity<Guid>, IMultiTenant
+{
+    public Guid? TenantId { get; set; }
+    public Guid SalesOrderId { get; set; }
+    public Guid SalesOrderItemId { get; set; }
+
+    /// <summary>Planned delivery date for this schedule row.</summary>
+    public DateTime ScheduledDate { get; set; }
+
+    /// <summary>Planned quantity to deliver on this date.</summary>
+    public decimal ScheduledQty { get; set; }
+
+    /// <summary>Quantity actually delivered against this schedule row.</summary>
+    public decimal DeliveredQty { get; set; }
+
+    /// <summary>Pending delivery qty = Scheduled - Delivered.</summary>
+    public decimal PendingQty => Math.Max(0, ScheduledQty - DeliveredQty);
+
+    /// <summary>True when all scheduled qty has been delivered.</summary>
+    public bool IsFullyDelivered => DeliveredQty >= ScheduledQty;
+
+    protected DeliveryScheduleEntry() { }
+
+    public DeliveryScheduleEntry(Guid id, Guid salesOrderId, Guid salesOrderItemId,
+        DateTime scheduledDate, decimal scheduledQty, Guid? tenantId = null) : base(id)
+    {
+        SalesOrderId = salesOrderId;
+        SalesOrderItemId = salesOrderItemId;
+        ScheduledDate = scheduledDate;
+        ScheduledQty = scheduledQty;
+        TenantId = tenantId;
+    }
+
+    /// <summary>Record delivery against this schedule row.</summary>
+    public void RecordDelivery(decimal qty)
+    {
+        DeliveredQty += qty;
+    }
+}
+

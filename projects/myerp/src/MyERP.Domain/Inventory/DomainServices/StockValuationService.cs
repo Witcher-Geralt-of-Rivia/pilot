@@ -1,0 +1,970 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Core;
+using MyERP.Inventory.Entities;
+using MyERP.Settings;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Domain.Services;
+using Volo.Abp.Settings;
+
+namespace MyERP.Inventory.DomainServices;
+
+/// <summary>
+/// Calculates stock valuation rates using the item's configured method (FIFO, LIFO, Moving Average).
+/// Dispatches to the appropriate algorithm based on Item.ValuationMethod.
+///
+/// ERPNext equivalent: stock/valuation.py + stock_ledger.py
+/// </summary>
+public class StockValuationService : DomainService
+{
+    private readonly IRepository<StockLedgerEntry, Guid> _ledgerRepository;
+    private readonly IRepository<Item, Guid> _itemRepository;
+    private readonly ISettingProvider _settingProvider;
+    private readonly IRepository<Batch, Guid>? _batchRepository;
+    private readonly IRepository<SerialAndBatchBundle, Guid>? _bundleRepository;
+    private readonly IRepository<SerialNo, Guid>? _serialNoRepository;
+
+    public StockValuationService(
+        IRepository<StockLedgerEntry, Guid> ledgerRepository,
+        IRepository<Item, Guid> itemRepository,
+        ISettingProvider settingProvider)
+        : this(ledgerRepository, itemRepository, settingProvider, null, null, null)
+    {
+    }
+
+    public StockValuationService(
+        IRepository<StockLedgerEntry, Guid> ledgerRepository,
+        IRepository<Item, Guid> itemRepository,
+        ISettingProvider settingProvider,
+        IRepository<Batch, Guid>? batchRepository = null,
+        IRepository<SerialAndBatchBundle, Guid>? bundleRepository = null,
+        IRepository<SerialNo, Guid>? serialNoRepository = null)
+    {
+        _ledgerRepository = ledgerRepository;
+        _itemRepository = itemRepository;
+        _settingProvider = settingProvider;
+        _batchRepository = batchRepository;
+        _bundleRepository = bundleRepository;
+        _serialNoRepository = serialNoRepository;
+    }
+
+    /// <summary>
+    /// Creates a stock ledger entry with proper valuation rate calculated based on item's valuation method.
+    /// Validates negative stock constraint before allowing stock-out.
+    /// </summary>
+    public async Task<StockLedgerEntry> CreateLedgerEntryAsync(
+        Guid companyId,
+        Guid itemId,
+        Guid warehouseId,
+        DateTime postingDate,
+        decimal quantityChange,
+        decimal incomingRate,
+        string? voucherType = null,
+        Guid? voucherId = null,
+        Guid? tenantId = null,
+        Guid? batchId = null,
+        bool? isAdjustmentEntry = null,
+        Guid? serialAndBatchBundleId = null)
+    {
+        var item = await _itemRepository.GetAsync(itemId);
+        var previousSle = await GetPreviousSleAsync(itemId, warehouseId, postingDate);
+
+        var isAdjustment = isAdjustmentEntry ?? (voucherType == "StockReconciliation" && quantityChange == 0);
+
+        decimal valuationRate;
+        decimal newBalanceQty;
+        decimal newBalanceValue;
+        string? stockQueue = null;
+
+        if (voucherType == "StockReconciliation")
+        {
+            if (isAdjustment)
+            {
+                // Per ERPNext PR #59269: adjustment entries (rate revaluation / write-off)
+                // must preserve existing stock queue / balance qty rather than resetting to 0.
+                var prevQty = previousSle?.BalanceQuantity ?? 0;
+                if (prevQty > 0)
+                {
+                    valuationRate = incomingRate > 0 ? incomingRate : (previousSle?.ValuationRate ?? 0);
+                    newBalanceQty = prevQty;
+                    newBalanceValue = Math.Max(0, newBalanceQty * valuationRate);
+                    if (item.ValuationMethod == ValuationMethod.FIFO || item.ValuationMethod == ValuationMethod.LIFO)
+                    {
+                        var queue = FifoValuation.Deserialize(previousSle?.StockQueue, item.ValuationMethod == ValuationMethod.LIFO);
+                        if (incomingRate > 0)
+                        {
+                            queue.RestateRate(incomingRate);
+                        }
+                        stockQueue = queue.Serialize();
+                        newBalanceValue = queue.TotalValue;
+                        valuationRate = queue.ValuationRate;
+                    }
+                }
+                else
+                {
+                    // Stranded value write-off at zero balance qty
+                    valuationRate = previousSle?.ValuationRate ?? 0;
+                    newBalanceQty = 0;
+                    newBalanceValue = 0;
+                    if (item.ValuationMethod == ValuationMethod.FIFO || item.ValuationMethod == ValuationMethod.LIFO)
+                    {
+                        stockQueue = new FifoValuation(isLifo: item.ValuationMethod == ValuationMethod.LIFO).Serialize();
+                    }
+                }
+            }
+            else
+            {
+                // Per ERPNext stock_ledger.py lines 1016-1024 / PR #58800:
+                // Stock Reconciliation directly sets valuation rate and resets balance / queue.
+                // An explicit zero rate is a valid revaluation (not fallback to existing rate).
+                valuationRate = incomingRate;
+                newBalanceQty = (previousSle?.BalanceQuantity ?? 0) + quantityChange;
+                newBalanceValue = Math.Max(0, newBalanceQty * valuationRate);
+                if (item.ValuationMethod == ValuationMethod.FIFO || item.ValuationMethod == ValuationMethod.LIFO)
+                {
+                    var queue = new FifoValuation(isLifo: item.ValuationMethod == ValuationMethod.LIFO);
+                    if (newBalanceQty > 0)
+                    {
+                        queue.AddStock(newBalanceQty, valuationRate);
+                    }
+                    stockQueue = queue.Serialize();
+                }
+            }
+        }
+        else
+        {
+            switch (item.ValuationMethod)
+            {
+                case ValuationMethod.FIFO:
+                case ValuationMethod.LIFO:
+                    (valuationRate, newBalanceQty, newBalanceValue, stockQueue) =
+                        CalculateFifoLifo(previousSle, quantityChange, incomingRate, item.ValuationMethod == ValuationMethod.LIFO);
+                    break;
+
+                case ValuationMethod.StandardCost:
+                    (valuationRate, newBalanceQty, newBalanceValue) =
+                        CalculateStandardCost(previousSle, quantityChange, item.StandardBuyingPrice ?? 0);
+                    break;
+
+                case ValuationMethod.WeightedAverage:
+                default:
+                    (valuationRate, newBalanceQty, newBalanceValue) =
+                        CalculateMovingAverage(previousSle, quantityChange, incomingRate);
+                    break;
+            }
+        }
+
+        // Per ERPNext stock_ledger.py get_valuation_rate:
+        // When stock-out is against a bundle or batch with batchwise valuation, use the specific valuation rate
+        if (quantityChange < 0 && incomingRate <= 0)
+        {
+            if (serialAndBatchBundleId.HasValue)
+            {
+                var bundleRate = await GetValuationRateAsync(
+                    itemId, warehouseId,
+                    serialAndBatchBundleId: serialAndBatchBundleId.Value,
+                    asOfDate: postingDate,
+                    excludeVoucherId: voucherId);
+                if (bundleRate > 0)
+                {
+                    valuationRate = bundleRate;
+                    if (item.ValuationMethod == ValuationMethod.WeightedAverage)
+                    {
+                        newBalanceQty = (previousSle?.BalanceQuantity ?? 0) + quantityChange;
+                        newBalanceValue = Math.Max(0, newBalanceQty * valuationRate);
+                    }
+                }
+            }
+            else if (batchId.HasValue)
+            {
+                var batchRate = await GetValuationRateAsync(itemId, warehouseId, batchId, asOfDate: postingDate, excludeVoucherId: voucherId);
+                if (batchRate > 0)
+                {
+                    valuationRate = batchRate;
+                    if (item.ValuationMethod == ValuationMethod.WeightedAverage)
+                    {
+                        newBalanceQty = (previousSle?.BalanceQuantity ?? 0) + quantityChange;
+                        newBalanceValue = Math.Max(0, newBalanceQty * valuationRate);
+                    }
+                }
+            }
+        }
+
+        // Negative stock validation: block stock-out that would go negative
+        // unless the item explicitly allows it, or the global Stock Settings toggle does
+        if (quantityChange < 0 && newBalanceQty < -0.0001m
+            && !item.AllowNegativeStock
+            && !await _settingProvider.IsTrueAsync(MyERPSettings.Stock.AllowNegativeStock))
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.InsufficientStock)
+                .WithData("itemId", itemId)
+                .WithData("warehouseId", warehouseId)
+                .WithData("requested", Math.Abs(quantityChange))
+                .WithData("available", previousSle?.BalanceQuantity ?? 0);
+        }
+
+        // ERPNext PR #58899: clear stock value for zero-quantity balances
+        if (Math.Round(newBalanceQty, 4) == 0m)
+        {
+            newBalanceQty = 0m;
+            newBalanceValue = 0m;
+        }
+
+        var entry = new StockLedgerEntry(
+            GuidGenerator.Create(),
+            companyId,
+            itemId,
+            warehouseId,
+            postingDate,
+            quantityChange,
+            Math.Round(valuationRate, 4),
+            Math.Round(newBalanceQty, 4),
+            Math.Round(newBalanceValue, 2),
+            tenantId)
+        {
+            VoucherType = voucherType,
+            VoucherId = voucherId,
+            StockQueue = stockQueue,
+            BatchId = batchId,
+            SerialAndBatchBundleId = serialAndBatchBundleId,
+            IsAdjustmentEntry = isAdjustment,
+            StockValueDifference = Math.Round(newBalanceValue - (previousSle?.BalanceValue ?? 0), 2),
+            IncomingRate = quantityChange > 0 ? incomingRate : 0m,
+            OutgoingRate = quantityChange < 0 ? valuationRate : 0m,
+        };
+
+        await _ledgerRepository.InsertAsync(entry);
+
+        // Backdated entry detection: if there are future entries, revalue them
+        // This ensures all downstream valuations are recalculated (mandatory per ERPNext rules)
+        var query = await _ledgerRepository.GetQueryableAsync();
+        var hasFutureEntries = query.Any(e =>
+            e.ItemId == itemId && e.WarehouseId == warehouseId
+            && e.PostingDate > postingDate && e.Id != entry.Id);
+
+        if (hasFutureEntries)
+        {
+            await RevaluateFromDateAsync(itemId, warehouseId, postingDate);
+        }
+
+        return entry;
+    }
+
+    /// <summary>
+    /// Gets the current stock balance for an item in a specific warehouse.
+    /// </summary>
+    public async Task<StockBalance> GetCurrentBalanceAsync(Guid itemId, Guid warehouseId)
+    {
+        var query = await _ledgerRepository.GetQueryableAsync();
+        var lastEntry = query
+            .Where(e => e.ItemId == itemId && e.WarehouseId == warehouseId && !e.IsCancelled)
+            .OrderByDescending(e => e.PostingDate)
+            .ThenByDescending(e => e.CreationTime)
+            .FirstOrDefault();
+
+        if (lastEntry == null)
+            return new StockBalance(0, 0);
+
+        return new StockBalance(lastEntry.BalanceQuantity, lastEntry.BalanceValue);
+    }
+
+    /// <summary>
+    /// Gets the valuation rate for an item in a warehouse, optionally for a specific batch or serial/batch bundle.
+    /// Per ERPNext stock_ledger.py get_valuation_rate:
+    /// 1. If batch specified and uses batchwise valuation: computes batch moving average rate = sum(StockValueDifference) / sum(QuantityChange).
+    /// 2. If serial_and_batch_bundle specified: computes incoming rate per unit using bundle.TotalQty (PR #58994 / commit 825d24f406).
+    ///    Calculates weighted rate across bundle entries divided by total qty (not hardcoded to 1 unit).
+    /// 3. Fallback: last non-cancelled SLE valuation rate for (item, warehouse).
+    /// </summary>
+    public async Task<decimal> GetValuationRateAsync(
+        Guid itemId,
+        Guid warehouseId,
+        Guid? batchId = null,
+        Guid? serialAndBatchBundleId = null,
+        DateTime? asOfDate = null,
+        Guid? excludeVoucherId = null,
+        DateTime? postingDateTime = null,
+        DateTime? creationTime = null)
+    {
+        // 1. Batch-wise valuation
+        if (batchId.HasValue)
+        {
+            var batchRepo = _batchRepository ?? LazyServiceProvider.LazyGetService<IRepository<Batch, Guid>>();
+            if (batchRepo != null)
+            {
+                var batch = await batchRepo.FindAsync(batchId.Value);
+                if (batch != null && batch.UseBatchwiseValuation)
+                {
+                    var queryable = await _ledgerRepository.GetQueryableAsync();
+                    var batchEntries = queryable
+                        .Where(s => s.ItemId == itemId
+                            && s.WarehouseId == warehouseId
+                            && s.BatchId == batchId.Value
+                            && !s.IsCancelled);
+
+                    if (postingDateTime.HasValue)
+                    {
+                        if (creationTime.HasValue)
+                            batchEntries = batchEntries.Where(s => s.PostingDateTime < postingDateTime.Value || (s.PostingDateTime == postingDateTime.Value && s.CreationTime < creationTime.Value));
+                        else
+                            batchEntries = batchEntries.Where(s => s.PostingDateTime <= postingDateTime.Value);
+                    }
+                    else if (asOfDate.HasValue)
+                    {
+                        batchEntries = batchEntries.Where(s => s.PostingDate <= asOfDate.Value);
+                    }
+
+                    if (excludeVoucherId.HasValue)
+                        batchEntries = batchEntries.Where(s => s.VoucherId != excludeVoucherId.Value);
+
+                    var list = batchEntries.ToList();
+                    var totalQty = list.Sum(s => s.QuantityChange);
+                    if (totalQty > 0)
+                    {
+                        var totalVal = list.Sum(s => s.StockValueDifference != 0 ? s.StockValueDifference : s.StockValue);
+                        // Per ERPNext PR #59291: only return batch average rate if both balance qty and value > 0;
+                        // otherwise drained/negative batch pools fall back to warehouse pooled rate.
+                        if (totalVal > 0)
+                        {
+                            return Math.Round(totalVal / totalQty, 4);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Serial and Batch Bundle (PR #58994: rate per unit with actual_qty = -abs(bundle.total_qty))
+        if (serialAndBatchBundleId.HasValue)
+        {
+            var bundleRepo = _bundleRepository ?? LazyServiceProvider.LazyGetService<IRepository<SerialAndBatchBundle, Guid>>();
+            if (bundleRepo != null)
+            {
+                var bundle = await bundleRepo.FindAsync(serialAndBatchBundleId.Value);
+                if (bundle != null && bundle.Entries.Any())
+                {
+                    var totalQty = Math.Abs(bundle.TotalQty);
+                    if (totalQty > 0)
+                    {
+                        var serialNosNeedingRate = bundle.Entries
+                            .Where(e => e.IncomingRate == 0 && !string.IsNullOrWhiteSpace(e.SerialNo))
+                            .Select(e => e.SerialNo!)
+                            .Distinct()
+                            .ToList();
+
+                        Dictionary<string, decimal> serialRates = new(StringComparer.OrdinalIgnoreCase);
+                        if (serialNosNeedingRate.Count > 0)
+                        {
+                            serialRates = await GetSerialNoWiseIncomingRateAsync(
+                                itemId, warehouseId, serialNosNeedingRate,
+                                asOfDate: asOfDate ?? bundle.PostingDate,
+                                excludeVoucherId: excludeVoucherId ?? (bundle.VoucherId != Guid.Empty ? bundle.VoucherId : null),
+                                postingDateTime: postingDateTime,
+                                creationTime: creationTime);
+                        }
+
+                        decimal totalAmount = 0m;
+                        foreach (var entry in bundle.Entries)
+                        {
+                            decimal entryRate = entry.IncomingRate;
+                            if (entryRate == 0 && entry.BatchId.HasValue)
+                            {
+                                entryRate = await GetValuationRateAsync(
+                                    itemId, warehouseId, entry.BatchId.Value,
+                                    asOfDate: asOfDate ?? bundle.PostingDate,
+                                    excludeVoucherId: excludeVoucherId);
+                            }
+                            else if (entryRate == 0 && !string.IsNullOrWhiteSpace(entry.SerialNo))
+                            {
+                                if (serialRates.TryGetValue(entry.SerialNo, out var sRate) && sRate > 0)
+                                {
+                                    entryRate = sRate;
+                                }
+                            }
+                            totalAmount += entry.Qty * entryRate;
+                        }
+                        return Math.Round(Math.Abs(totalAmount / totalQty), 4);
+                    }
+                }
+            }
+        }
+
+        // 3. Fallback: last non-cancelled SLE for (item, warehouse)
+        var sleQ = await _ledgerRepository.GetQueryableAsync();
+        var fallbackQuery = sleQ
+            .Where(s => s.ItemId == itemId && s.WarehouseId == warehouseId && !s.IsCancelled);
+
+        if (postingDateTime.HasValue)
+        {
+            if (creationTime.HasValue)
+                fallbackQuery = fallbackQuery.Where(s => s.PostingDateTime < postingDateTime.Value || (s.PostingDateTime == postingDateTime.Value && s.CreationTime < creationTime.Value));
+            else
+                fallbackQuery = fallbackQuery.Where(s => s.PostingDateTime <= postingDateTime.Value);
+        }
+        else if (asOfDate.HasValue)
+        {
+            fallbackQuery = fallbackQuery.Where(s => s.PostingDate <= asOfDate.Value);
+        }
+
+        if (excludeVoucherId.HasValue)
+            fallbackQuery = fallbackQuery.Where(s => s.VoucherId != excludeVoucherId.Value);
+
+        var lastSle = fallbackQuery
+            .OrderByDescending(s => s.PostingDateTime)
+            .ThenByDescending(s => s.CreationTime)
+            .FirstOrDefault();
+
+        if (lastSle != null && lastSle.ValuationRate >= 0)
+            return lastSle.ValuationRate;
+
+        var item = await _itemRepository.FindAsync(itemId);
+        return item?.StandardBuyingPrice ?? 0m;
+    }
+
+    public const int SerialNoQueryBatchSize = 500;
+
+    /// <summary>
+    /// Gets the incoming valuation rate for a specific serial number in a warehouse.
+    /// Per ERPNext PR #60771 (commit 8233482921):
+    /// Returns the latest inward incoming rate for the serial number in this warehouse.
+    /// </summary>
+    public async Task<decimal> GetSerialNoIncomingRateAsync(
+        Guid itemId,
+        Guid warehouseId,
+        string serialNo,
+        DateTime? asOfDate = null,
+        Guid? excludeVoucherId = null,
+        DateTime? postingDateTime = null,
+        DateTime? creationTime = null)
+    {
+        if (string.IsNullOrWhiteSpace(serialNo)) return 0m;
+        var rates = await GetSerialNoWiseIncomingRateAsync(
+            itemId, warehouseId, new[] { serialNo },
+            asOfDate, excludeVoucherId, postingDateTime, creationTime);
+
+        return rates.TryGetValue(serialNo, out var rate) ? rate : 0m;
+    }
+
+    /// <summary>
+    /// Fetches serial number incoming rates with a single indexed query in batches of 500.
+    /// Per ERPNext PR #60771 (commit 8233482921):
+    /// Queries inward Serial and Batch Bundles for the given item and warehouse,
+    /// ordered by posting date descending, creation time descending.
+    /// Returns the latest inward incoming rate for each serial number.
+    /// </summary>
+    public async Task<Dictionary<string, decimal>> GetSerialNoWiseIncomingRateAsync(
+        Guid itemId,
+        Guid warehouseId,
+        IEnumerable<string> serialNos,
+        DateTime? asOfDate = null,
+        Guid? excludeVoucherId = null,
+        DateTime? postingDateTime = null,
+        DateTime? creationTime = null)
+    {
+        var incomingRates = new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
+        var serialList = serialNos.Where(s => !string.IsNullOrWhiteSpace(s)).Distinct().ToList();
+        if (serialList.Count == 0) return incomingRates;
+
+        var bundleRepo = _bundleRepository ?? LazyServiceProvider.LazyGetService<IRepository<SerialAndBatchBundle, Guid>>();
+        if (bundleRepo != null)
+        {
+            var bundleQuery = await bundleRepo.GetQueryableAsync();
+            if (bundleQuery != null)
+            {
+                var inwardBundles = bundleQuery.Where(b =>
+                    b.ItemId == itemId
+                    && b.WarehouseId == warehouseId
+                    && b.TypeOfTransaction == BundleTransactionType.Inward
+                    && !b.IsCancelled
+                    && b.Status == DocumentStatus.Submitted);
+
+                if (excludeVoucherId.HasValue)
+                {
+                    inwardBundles = inwardBundles.Where(b => b.VoucherId != excludeVoucherId.Value);
+                }
+
+                if (postingDateTime.HasValue)
+                {
+                    if (creationTime.HasValue)
+                    {
+                        inwardBundles = inwardBundles.Where(b =>
+                            b.PostingDate < postingDateTime.Value
+                            || (b.PostingDate == postingDateTime.Value && b.CreationTime < creationTime.Value));
+                    }
+                    else
+                    {
+                        inwardBundles = inwardBundles.Where(b => b.PostingDate <= postingDateTime.Value);
+                    }
+                }
+                else if (asOfDate.HasValue)
+                {
+                    inwardBundles = inwardBundles.Where(b => b.PostingDate <= asOfDate.Value);
+                }
+
+                inwardBundles = inwardBundles
+                    .OrderByDescending(b => b.PostingDate)
+                    .ThenByDescending(b => b.CreationTime);
+
+                // Batch processing matching ERPNext PR #60771
+                for (int i = 0; i < serialList.Count; i += SerialNoQueryBatchSize)
+                {
+                    var batch = serialList.Skip(i).Take(SerialNoQueryBatchSize).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                    var matchedBundles = inwardBundles
+                        .Where(b => b.Entries.Any(e => e.SerialNo != null && batch.Contains(e.SerialNo) && e.Qty > 0))
+                        .ToList();
+
+                    foreach (var bundle in matchedBundles)
+                    {
+                        foreach (var entry in bundle.Entries)
+                        {
+                            if (!string.IsNullOrWhiteSpace(entry.SerialNo) && entry.Qty > 0 && batch.Contains(entry.SerialNo))
+                            {
+                                if (!incomingRates.ContainsKey(entry.SerialNo))
+                                {
+                                    incomingRates[entry.SerialNo] = entry.IncomingRate;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback to SerialNo.PurchaseRate for any serial numbers not found in inward bundles
+        var missingSerials = serialList.Where(s => !incomingRates.ContainsKey(s)).ToList();
+        if (missingSerials.Count > 0)
+        {
+            var serialRepo = _serialNoRepository ?? LazyServiceProvider.LazyGetService<IRepository<SerialNo, Guid>>();
+            if (serialRepo != null)
+            {
+                var serialQuery = await serialRepo.GetQueryableAsync();
+                if (serialQuery != null)
+                {
+                    var foundSerials = serialQuery
+                        .Where(s => s.ItemId == itemId && missingSerials.Contains(s.SerialNumber))
+                        .Select(s => new { s.SerialNumber, s.PurchaseRate })
+                        .ToList();
+
+                    foreach (var s in foundSerials)
+                    {
+                        if (s.PurchaseRate > 0 && !incomingRates.ContainsKey(s.SerialNumber))
+                        {
+                            incomingRates[s.SerialNumber] = s.PurchaseRate;
+                        }
+                    }
+                }
+            }
+        }
+
+        return incomingRates;
+    }
+
+    /// <summary>
+    /// Recalculates valuation for all entries of an item in a warehouse from a given date.
+    /// Used when backdated entries are inserted or rates need correction.
+    /// </summary>
+    public async Task RevaluateFromDateAsync(Guid itemId, Guid warehouseId, DateTime fromDate)
+    {
+        var item = await _itemRepository.GetAsync(itemId);
+        var query = await _ledgerRepository.GetQueryableAsync();
+
+        // Per ERPNext PR #58998 / commit 6cee9c330c: use stored PostingDateTime boundary so entries whose
+        // stored timestamp diverges from posting_date are accurately included in the replay window.
+        var entries = query
+            .Where(e => e.ItemId == itemId && e.WarehouseId == warehouseId && (e.PostingDateTime >= fromDate || e.PostingDate >= fromDate) && !e.IsCancelled)
+            .OrderBy(e => e.PostingDateTime)
+            .ThenBy(e => e.CreationTime)
+            .ToList();
+
+        if (entries.Count == 0) return;
+
+        // Get the SLE just before the revaluation start
+        var priorEntry = query
+            .Where(e => e.ItemId == itemId && e.WarehouseId == warehouseId && (e.PostingDateTime < fromDate && e.PostingDate < fromDate) && !e.IsCancelled)
+            .OrderByDescending(e => e.PostingDateTime)
+            .ThenByDescending(e => e.CreationTime)
+            .FirstOrDefault();
+
+        // Per ERPNext PR #62314 / commit 27303023b9:
+        // Value a transfer's inward leg at what left the source warehouse on repost.
+        // Update incoming_rate from the outward leg's stock_value_difference so target warehouse
+        // maintains valuation equality with the source warehouse.
+        var inwardTransferEntries = entries
+            .Where(e => e.QuantityChange > 0 && (e.RecalculateRate || e.VoucherType == "StockEntry") && e.VoucherDetailNo.HasValue && e.VoucherId.HasValue)
+            .ToList();
+
+        if (inwardTransferEntries.Count > 0)
+        {
+            var voucherDetailIds = inwardTransferEntries.Select(e => e.VoucherDetailNo!.Value).Distinct().ToList();
+            var voucherIds = inwardTransferEntries.Select(e => e.VoucherId!.Value).Distinct().ToList();
+
+            var outwardSles = query
+                .Where(e => e.ItemId == itemId
+                         && e.QuantityChange < 0
+                         && !e.IsCancelled
+                         && e.VoucherDetailNo.HasValue
+                         && voucherDetailIds.Contains(e.VoucherDetailNo.Value)
+                         && e.VoucherId.HasValue
+                         && voucherIds.Contains(e.VoucherId.Value))
+                .ToList();
+
+            var outwardValueByDetail = outwardSles
+                .GroupBy(o => (o.VoucherId, o.VoucherDetailNo))
+                .ToDictionary(
+                    g => g.Key,
+                    g => g.Sum(o => Math.Abs(o.StockValueDifference != 0 ? o.StockValueDifference : o.StockValue)));
+
+            foreach (var inward in inwardTransferEntries)
+            {
+                if (outwardValueByDetail.TryGetValue((inward.VoucherId, inward.VoucherDetailNo), out var outwardVal) && outwardVal > 0)
+                {
+                    var updatedRate = inward.QuantityChange > 0 ? (outwardVal / inward.QuantityChange) : inward.ValuationRate;
+                    inward.IncomingRate = updatedRate;
+                    inward.ValuationRate = updatedRate;
+                }
+            }
+        }
+
+        switch (item.ValuationMethod)
+        {
+            case ValuationMethod.FIFO:
+            case ValuationMethod.LIFO:
+                RevaluateFifoLifo(entries, priorEntry, item.ValuationMethod == ValuationMethod.LIFO);
+                break;
+            case ValuationMethod.WeightedAverage:
+            default:
+                RevaluateMovingAverage(entries, priorEntry);
+                break;
+        }
+
+        // Per ERPNext PR #59768 (commit 3c866acc40): do not revive cancelled stock ledger entry during reposting.
+        // Check database to ensure no entry was cancelled while revaluation was computing.
+        var entryIds = entries.Select(e => e.Id).ToList();
+        var cancelledIds = (await _ledgerRepository.GetQueryableAsync())
+            .Where(e => entryIds.Contains(e.Id) && e.IsCancelled)
+            .Select(e => e.Id)
+            .ToHashSet();
+
+        var activeEntries = entries.Where(e => !cancelledIds.Contains(e.Id) && !e.IsCancelled).ToList();
+        if (activeEntries.Count > 0)
+        {
+            await _ledgerRepository.UpdateManyAsync(activeEntries);
+        }
+    }
+
+    /// <summary>
+    /// Gets the latest preceding Stock Ledger Entry for an item and warehouse.
+    /// Per ERPNext PR #59370 / commit b76f793ec8: creation time only breaks ties when posting_datetime is equal.
+    /// </summary>
+    public async Task<StockLedgerEntry?> GetPreviousSleAsync(
+        Guid itemId,
+        Guid warehouseId,
+        DateTime postingDate,
+        DateTime? creationTime = null,
+        Guid? excludeSleId = null,
+        Guid? excludeVoucherId = null)
+    {
+        var query = await _ledgerRepository.GetQueryableAsync();
+        query = query.Where(e => e.ItemId == itemId && e.WarehouseId == warehouseId && !e.IsCancelled);
+
+        if (excludeSleId.HasValue)
+        {
+            query = query.Where(e => e.Id != excludeSleId.Value);
+        }
+
+        if (excludeVoucherId.HasValue)
+        {
+            query = query.Where(e => e.VoucherId != excludeVoucherId.Value);
+        }
+
+        if (creationTime.HasValue)
+        {
+            query = query.Where(e =>
+                (e.PostingDateTime < postingDate || (e.PostingDateTime == postingDate && e.CreationTime < creationTime.Value))
+                || (e.PostingDate < postingDate || (e.PostingDate == postingDate && e.CreationTime < creationTime.Value)));
+        }
+        else
+        {
+            query = query.Where(e => e.PostingDateTime <= postingDate || e.PostingDate <= postingDate);
+        }
+
+        return query
+            .OrderByDescending(e => e.PostingDateTime)
+            .ThenByDescending(e => e.CreationTime)
+            .FirstOrDefault();
+    }
+
+    private static (decimal valuationRate, decimal balanceQty, decimal balanceValue, string stockQueue)
+        CalculateFifoLifo(StockLedgerEntry? previousSle, decimal quantityChange, decimal incomingRate, bool isLifo)
+    {
+        var queue = FifoValuation.Deserialize(previousSle?.StockQueue, isLifo);
+
+        decimal valuationRate;
+        if (quantityChange > 0)
+        {
+            // Stock IN: add to queue
+            queue.AddStock(quantityChange, incomingRate);
+            valuationRate = incomingRate;
+        }
+        else
+        {
+            // Stock OUT: consume from queue (FIFO or LIFO)
+            var consumed = queue.RemoveStock(Math.Abs(quantityChange), incomingRate);
+            valuationRate = FifoValuation.GetOutgoingRate(consumed);
+        }
+
+        var balanceQty = queue.TotalQty;
+        var balanceValue = queue.TotalValue;
+        var stockQueueJson = queue.Serialize();
+
+        return (valuationRate, balanceQty, balanceValue, stockQueueJson);
+    }
+
+    public static (decimal valuationRate, decimal balanceQty, decimal balanceValue)
+        CalculateMovingAverage(StockLedgerEntry? previousSle, decimal quantityChange, decimal incomingRate)
+    {
+        var existingQty = previousSle?.BalanceQuantity ?? 0;
+        var existingValue = previousSle?.BalanceValue ?? 0;
+        var existingRate = existingQty > 0 ? existingValue / existingQty : 0;
+
+        decimal valuationRate;
+        decimal newBalanceQty;
+        decimal newBalanceValue;
+
+        if (quantityChange > 0)
+        {
+            // Stock IN: weighted average
+            if (existingQty <= 0)
+            {
+                // Reset behavior: when stock crosses from negative to positive
+                valuationRate = incomingRate;
+            }
+            else
+            {
+                newBalanceValue = (existingQty * existingRate) + (quantityChange * incomingRate);
+                newBalanceQty = existingQty + quantityChange;
+                valuationRate = newBalanceQty > 0 ? newBalanceValue / newBalanceQty : incomingRate;
+                if (Math.Round(newBalanceQty, 4) == 0m)
+                {
+                    newBalanceQty = 0m;
+                    newBalanceValue = 0m;
+                }
+                valuationRate = Math.Max(0m, valuationRate);
+                newBalanceValue = Math.Max(0m, newBalanceValue);
+                return (valuationRate, newBalanceQty, newBalanceValue);
+            }
+
+            newBalanceQty = existingQty + quantityChange;
+            newBalanceValue = newBalanceQty * valuationRate;
+        }
+        else
+        {
+            // Stock OUT: use existing average rate
+            valuationRate = existingRate > 0 ? existingRate : incomingRate;
+            newBalanceQty = existingQty + quantityChange; // quantityChange is negative
+            newBalanceValue = newBalanceQty > 0 ? newBalanceQty * valuationRate : 0;
+
+            // ERPNext PR #47700 / commit 1e8ed22421: recompute valuation_rate using rounded stock_value
+            // to avoid discrepancy in valuation rate on outgoing transactions
+            if (newBalanceQty != 0)
+            {
+                valuationRate = Math.Round(newBalanceValue, 2) / newBalanceQty;
+            }
+
+            // Going negative: if was positive and outgoing rate specified, use outgoing rate
+            if (existingQty >= 0 && newBalanceQty < 0 && incomingRate > 0)
+            {
+                valuationRate = incomingRate;
+            }
+        }
+
+        // ERPNext PR #58899: clear stock value for zero-quantity balances
+        if (Math.Round(newBalanceQty, 4) == 0m)
+        {
+            newBalanceQty = 0m;
+            newBalanceValue = 0m;
+        }
+
+        // ERPNext PR #59291 / commit 8793ad8264: moving average valuation rate and balance value
+        // must never be negative, preventing stock value corruption from drained or overdrawn batch pools.
+        valuationRate = Math.Max(0m, valuationRate);
+        newBalanceValue = Math.Max(0m, newBalanceValue);
+
+        return (valuationRate, newBalanceQty, newBalanceValue);
+    }
+
+    private static void RevaluateFifoLifo(List<StockLedgerEntry> entries, StockLedgerEntry? priorEntry, bool isLifo)
+    {
+        var queue = FifoValuation.Deserialize(priorEntry?.StockQueue, isLifo);
+        var runningValue = priorEntry?.BalanceValue ?? 0;
+
+        foreach (var entry in entries)
+        {
+            var valueBefore = runningValue;
+            if (entry.VoucherType == "StockReconciliation" && !entry.IsAdjustmentEntry)
+            {
+                var newQty = queue.TotalQty + entry.QuantityChange;
+                queue = new FifoValuation(isLifo: isLifo);
+                if (newQty > 0)
+                {
+                    queue.AddStock(newQty, entry.ValuationRate);
+                }
+                entry.StockValue = entry.QuantityChange * entry.ValuationRate;
+                entry.BalanceQuantity = Math.Round(queue.TotalQty, 4);
+                entry.BalanceValue = Math.Round(queue.TotalValue, 2);
+                entry.StockValueDifference = Math.Round(entry.BalanceValue - valueBefore, 2);
+                runningValue = entry.BalanceValue;
+                entry.StockQueue = queue.Serialize();
+                continue;
+            }
+
+            if (entry.IsAdjustmentEntry)
+            {
+                // Per ERPNext PR #59269: do not zero out backdated stock at a stock reco adjustment entry
+                if (queue.TotalQty > 0)
+                {
+                    entry.ValuationRate = queue.ValuationRate;
+                    entry.BalanceQuantity = Math.Round(queue.TotalQty, 4);
+                    entry.BalanceValue = Math.Round(queue.TotalValue, 2);
+                    entry.StockValue = entry.BalanceValue;
+                    entry.StockValueDifference = Math.Round(entry.BalanceValue - valueBefore, 2);
+                    runningValue = entry.BalanceValue;
+                    entry.StockQueue = queue.Serialize();
+                }
+                else
+                {
+                    entry.BalanceQuantity = 0m;
+                    entry.BalanceValue = 0m;
+                    entry.StockValue = 0m;
+                    entry.StockValueDifference = Math.Round(-valueBefore, 2);
+                    runningValue = 0m;
+                    entry.StockQueue = queue.Serialize();
+                }
+                continue;
+            }
+
+            if (entry.QuantityChange > 0)
+            {
+                queue.AddStock(entry.QuantityChange, entry.ValuationRate);
+            }
+            else
+            {
+                var consumed = queue.RemoveStock(Math.Abs(entry.QuantityChange), entry.ValuationRate);
+                entry.ValuationRate = FifoValuation.GetOutgoingRate(consumed);
+                entry.StockValue = entry.QuantityChange * entry.ValuationRate;
+            }
+
+            entry.BalanceQuantity = Math.Round(queue.TotalQty, 4);
+            entry.BalanceValue = entry.BalanceQuantity == 0m ? 0m : Math.Round(queue.TotalValue, 2);
+            entry.StockValueDifference = Math.Round(entry.BalanceValue - valueBefore, 2);
+            runningValue = entry.BalanceValue;
+            entry.StockQueue = queue.Serialize();
+        }
+    }
+
+    private static void RevaluateMovingAverage(List<StockLedgerEntry> entries, StockLedgerEntry? priorEntry)
+    {
+        var runningQty = priorEntry?.BalanceQuantity ?? 0;
+        var runningValue = priorEntry?.BalanceValue ?? 0;
+
+        foreach (var entry in entries)
+        {
+            var valueBefore = runningValue;
+            if (entry.VoucherType == "StockReconciliation" && !entry.IsAdjustmentEntry)
+            {
+                runningQty += entry.QuantityChange;
+                runningValue = Math.Max(0, runningQty * entry.ValuationRate);
+                entry.StockValue = entry.QuantityChange * entry.ValuationRate;
+                entry.BalanceQuantity = Math.Round(runningQty, 4);
+                entry.BalanceValue = Math.Round(runningValue, 2);
+                entry.StockValueDifference = Math.Round(runningValue - valueBefore, 2);
+                continue;
+            }
+
+            if (entry.IsAdjustmentEntry)
+            {
+                // Per ERPNext PR #59269: do not zero out backdated stock at a stock reco adjustment entry
+                if (runningQty > 0)
+                {
+                    var avgRate = runningValue / runningQty;
+                    entry.ValuationRate = Math.Round(avgRate, 4);
+                    entry.BalanceQuantity = Math.Round(runningQty, 4);
+                    entry.BalanceValue = Math.Round(runningValue, 2);
+                    entry.StockValue = entry.BalanceValue;
+                    entry.StockValueDifference = Math.Round(runningValue - valueBefore, 2);
+                }
+                else
+                {
+                    entry.BalanceQuantity = 0m;
+                    entry.BalanceValue = 0m;
+                    entry.StockValue = 0m;
+                    entry.StockValueDifference = Math.Round(-valueBefore, 2);
+                    runningValue = 0m;
+                }
+                continue;
+            }
+
+            if (entry.QuantityChange > 0)
+            {
+                entry.StockValue = entry.QuantityChange * entry.ValuationRate;
+                if (runningQty <= 0)
+                {
+                    // Reset behavior
+                    runningQty = entry.QuantityChange;
+                    runningValue = entry.QuantityChange * entry.ValuationRate;
+                }
+                else
+                {
+                    runningQty += entry.QuantityChange;
+                    runningValue += entry.QuantityChange * entry.ValuationRate;
+                }
+            }
+            else
+            {
+                var avgRate = runningQty > 0 ? runningValue / runningQty : entry.ValuationRate;
+                entry.StockValue = entry.QuantityChange * avgRate;
+                runningQty += entry.QuantityChange;
+                runningValue = runningQty > 0 ? runningQty * avgRate : 0;
+                // ERPNext PR #47700 / commit 1e8ed22421: recompute valuation_rate using rounded stock_value
+                if (runningQty != 0)
+                {
+                    avgRate = Math.Round(runningValue, 2) / runningQty;
+                }
+                entry.ValuationRate = Math.Round(avgRate, 4);
+            }
+
+            // ERPNext PR #58899: clear stock value for zero-quantity balances
+            if (Math.Round(runningQty, 4) == 0m)
+            {
+                runningQty = 0m;
+                runningValue = 0m;
+            }
+
+            entry.BalanceQuantity = Math.Round(runningQty, 4);
+            entry.BalanceValue = Math.Max(0, Math.Round(runningValue, 2));
+            entry.StockValueDifference = Math.Round(entry.BalanceValue - valueBefore, 2);
+        }
+    }
+
+    /// <summary>
+    /// Standard Cost valuation: uses fixed standard rate regardless of actual purchase price.
+    /// Per ERPNext: standard rate is set on the item and all movements use that rate.
+    /// Purchase Price Variance (PPV) = (actual_rate - standard_rate) × qty, posted to PPV account.
+    /// </summary>
+    private static (decimal valuationRate, decimal balanceQty, decimal balanceValue)
+        CalculateStandardCost(StockLedgerEntry? previousSle, decimal quantityChange, decimal standardRate)
+    {
+        var existingQty = previousSle?.BalanceQuantity ?? 0;
+        var newBalanceQty = existingQty + quantityChange;
+        // Standard Cost: balance value always = qty × standard_rate
+        var newBalanceValue = newBalanceQty * standardRate;
+        return (standardRate, newBalanceQty, Math.Max(0, newBalanceValue));
+    }
+}
+
+public record StockBalance(decimal Quantity, decimal Value)
+{
+    public decimal ValuationRate => Quantity > 0 ? Value / Quantity : 0;
+}

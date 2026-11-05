@@ -1,0 +1,96 @@
+using System;
+using Volo.Abp.Domain.Entities.Auditing;
+
+namespace MyERP.Manufacturing.Entities;
+
+public class BomItem : FullAuditedEntity<Guid>
+{
+    public Guid BomId { get; set; }
+    public Guid ItemId { get; set; }
+    public string ItemName { get; set; } = null!;
+    public decimal Quantity { get; set; }
+    public string? Uom { get; set; }
+    public decimal Rate { get; set; }
+    public decimal Amount { get; set; }
+    public Guid? SourceWarehouseId { get; set; }
+
+    /// <summary>Stock UOM from Item master (denormalized for SLE creation).</summary>
+    public string StockUom { get; set; } = "Unit";
+
+    /// <summary>Conversion factor: transaction UOM → stock UOM.</summary>
+    public decimal ConversionFactor { get; set; } = 1m;
+
+    /// <summary>Quantity in stock UOM = Quantity × ConversionFactor.</summary>
+    public decimal StockQty => Quantity * ConversionFactor;
+
+    /// <summary>
+    /// Gets quantity consumed per unit of finished good based on the parent BOM quantity.
+    /// Per ERPNext PR #59397 (commit 66ca3af4c8): uses per-unit BOM qty (stock_qty / bom.quantity) rather than raw stock_qty.
+    /// </summary>
+    public decimal GetQtyConsumedPerUnit(decimal bomQuantity) =>
+        bomQuantity > 0 ? StockQty / bomQuantity : StockQty;
+
+    /// <summary>
+    /// If this item is a sub-assembly, references its BOM for recursive explosion.
+    /// </summary>
+    public Guid? SubBomId { get; set; }
+
+    /// <summary>
+    /// Phantom items are not produced independently — their components bubble up to the parent BOM.
+    /// </summary>
+    public bool IsPhantom { get; set; }
+
+    /// <summary>
+    /// If true, prevents recursive explosion of this item's sub-BOM.
+    /// Per ERPNext PR #47543 / commit 4241bfd4bc: Set to true when Finished Good is used as Raw Material.
+    /// </summary>
+    public bool DoNotExplode { get; set; }
+
+    /// <summary>Percentage formulation when BOM.SetQtyBasedOnPercentage is active (ERPNext commit d07f4bb857).</summary>
+    public decimal Percentage { get; set; }
+
+    /// <summary>Absorbs the remaining percentage to make components sum to 100%.</summary>
+    public bool IsBalanceItem { get; set; }
+
+    /// <summary>
+    /// Cost this sub-assembly by rolling up its BOM cost instead of the item's own valuation or price-list rate.
+    /// Per ERPNext PR #59178 / commit ec88db0253: moved setting from BOM header to BOM item level.
+    /// Defaults to true.
+    /// </summary>
+    public bool SetRateOfSubAssemblyItemBasedOnBom { get; set; } = true;
+
+    protected BomItem() { }
+
+    public BomItem(Guid id, Guid bomId, Guid itemId, string itemName, decimal quantity, decimal rate,
+        string? uom = null, decimal conversionFactor = 1m, string stockUom = "Unit")
+        : base(id)
+    {
+        // Raw material quantity and rate cannot be negative (ERPNext commit 3a80e116e8)
+        if (quantity < 0)
+            throw new Volo.Abp.BusinessException(MyERP.MyERPDomainErrorCodes.AmountMustBePositive)
+                .WithData("field", nameof(quantity));
+
+        if (rate < 0)
+            throw new Volo.Abp.BusinessException(MyERP.MyERPDomainErrorCodes.AmountMustBePositive)
+                .WithData("field", nameof(rate));
+
+        BomId = bomId;
+        ItemId = itemId;
+        ItemName = itemName;
+        Quantity = quantity;
+        Rate = rate;
+        Uom = uom;
+        ConversionFactor = conversionFactor;
+        StockUom = stockUom;
+        Amount = quantity * rate;
+    }
+
+    /// <summary>
+    /// Per PR #57708: amount is per-row (qty × rate), not aggregated across duplicate items.
+    /// Rate is in transaction UOM; for stock-UOM-based amount, use StockQty × (Rate / ConversionFactor).
+    /// </summary>
+    public void Recalculate()
+    {
+        Amount = Quantity * Rate;
+    }
+}

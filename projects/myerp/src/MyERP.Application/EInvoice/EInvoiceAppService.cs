@@ -1,0 +1,1451 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Core.Entities;
+using MyERP.EInvoice.Entities;
+using MyERP.EInvoice.Services;
+using MyERP.Permissions;
+using MyERP.Purchasing.Entities;
+using MyERP.Sales.Entities;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Settings;
+
+using MyERP;
+
+namespace MyERP.EInvoice;
+
+[Authorize(MyERPPermissions.EInvoice.Default)]
+public class EInvoiceAppService : ApplicationService, IEInvoiceAppService
+{
+    private readonly EInvoiceService _eInvoiceService;
+    private readonly InvoiceDocumentBuilder _documentBuilder;
+    private readonly InvoiceDocumentSigner _documentSigner;
+    private readonly EInvoiceValidationService _validationService;
+    private readonly EInvoiceConsolidationService _consolidationService;
+    private readonly IRepository<EInvoiceSubmission, Guid> _submissionRepository;
+    private readonly IRepository<EInvoiceConsolidation, Guid> _consolidationRepository;
+    private readonly IRepository<LhdnSuccessLog, Guid> _successLogRepository;
+    private readonly IRepository<SalesInvoice, Guid> _salesInvoiceRepository;
+    private readonly IRepository<PurchaseInvoice, Guid> _purchaseInvoiceRepository;
+    private readonly IRepository<Customer, Guid> _customerRepository;
+    private readonly IRepository<Supplier, Guid> _supplierRepository;
+    private readonly IRepository<Company, Guid> _companyRepository;
+    private readonly TaxpayerValidationService _taxpayerValidationService;
+    private readonly ISettingProvider _settingProvider;
+
+    public EInvoiceAppService(
+        EInvoiceService eInvoiceService,
+        InvoiceDocumentBuilder documentBuilder,
+        InvoiceDocumentSigner documentSigner,
+        EInvoiceValidationService validationService,
+        EInvoiceConsolidationService consolidationService,
+        TaxpayerValidationService taxpayerValidationService,
+        IRepository<EInvoiceSubmission, Guid> submissionRepository,
+        IRepository<EInvoiceConsolidation, Guid> consolidationRepository,
+        IRepository<LhdnSuccessLog, Guid> successLogRepository,
+        IRepository<SalesInvoice, Guid> salesInvoiceRepository,
+        IRepository<PurchaseInvoice, Guid> purchaseInvoiceRepository,
+        IRepository<Customer, Guid> customerRepository,
+        IRepository<Supplier, Guid> supplierRepository,
+        IRepository<Company, Guid> companyRepository,
+        ISettingProvider settingProvider)
+    {
+        _eInvoiceService = eInvoiceService;
+        _documentBuilder = documentBuilder;
+        _documentSigner = documentSigner;
+        _validationService = validationService;
+        _consolidationService = consolidationService;
+        _taxpayerValidationService = taxpayerValidationService;
+        _submissionRepository = submissionRepository;
+        _consolidationRepository = consolidationRepository;
+        _successLogRepository = successLogRepository;
+        _salesInvoiceRepository = salesInvoiceRepository;
+        _purchaseInvoiceRepository = purchaseInvoiceRepository;
+        _customerRepository = customerRepository;
+        _supplierRepository = supplierRepository;
+        _companyRepository = companyRepository;
+        _settingProvider = settingProvider;
+    }
+
+    [Authorize(MyERPPermissions.EInvoice.Submit)]
+    public async Task<EInvoiceSubmissionDto> SubmitAsync(SubmitEInvoiceDto input)
+    {
+        var company = await _companyRepository.GetAsync(input.CompanyId);
+        if (!company.EnableLhdnInvoice)
+        {
+            // Per MyInvois PR d9adf36: Gracefully bypass LHDN submission if disabled.
+            // Return an empty/dummy DTO to prevent blocking ERP transactions.
+            return new EInvoiceSubmissionDto { Status = "NotSubmitted" };
+        }
+
+        // Step 1: Pre-submission validation
+        if (input.SourceDocumentType == "SalesInvoice")
+        {
+            var invoice = await _salesInvoiceRepository.GetAsync(input.SourceDocumentId, includeDetails: true);
+            if (!invoice.IsSubmitToLhdn)
+            {
+                // Per MyInvois commit d9adf36: Skip submission if IsSubmitToLhdn is unchecked.
+                return new EInvoiceSubmissionDto { Status = "NotSubmitted" };
+            }
+            await _validationService.EnsureValidForSubmissionAsync(invoice, input.CompanyId);
+        }
+        else if (input.SourceDocumentType == "PurchaseInvoice")
+        {
+            var invoice = await _purchaseInvoiceRepository.GetAsync(input.SourceDocumentId, includeDetails: true);
+            if (!invoice.IsSubmitToLhdn)
+            {
+                // Per MyInvois commit d9adf36: Skip submission if IsSubmitToLhdn is unchecked.
+                return new EInvoiceSubmissionDto { Status = "NotSubmitted" };
+            }
+            await _validationService.EnsureValidPurchaseInvoiceForSubmissionAsync(invoice, input.CompanyId);
+        }
+
+        // Step 2: Build UBL 2.1 XML from source document
+        var documentData = await BuildDocumentDataAsync(input.CompanyId, input.SourceDocumentType, input.SourceDocumentId);
+        var xmlDocument = _documentBuilder.Build(documentData);
+
+        // Step 3: Digital signature (XAdES) if certificate is configured
+        var pfxBase64 = await _settingProvider.GetOrNullAsync("EInvoice.CertificatePfxBase64");
+        var pfxPassword = await _settingProvider.GetOrNullAsync("EInvoice.CertificatePassword");
+        if (!string.IsNullOrEmpty(pfxBase64) && !string.IsNullOrEmpty(pfxPassword))
+        {
+            var pfxBytes = Convert.FromBase64String(pfxBase64);
+            xmlDocument = _documentSigner.Sign(xmlDocument, pfxBytes, pfxPassword);
+        }
+
+        // Step 4: Get credentials from settings (not hardcoded)
+        var accessToken = await _settingProvider.GetOrNullAsync("EInvoice.AccessToken")
+            ?? throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.EInvoiceValidationFailed)
+                .WithData("reason", "LHDN access token not configured. Please authenticate first.");
+
+        var envString = await _settingProvider.GetOrNullAsync("EInvoice.Environment") ?? "Sandbox";
+        var environment = Enum.Parse<LhdnEnvironment>(envString);
+
+        // Step 5: Submit to LHDN
+        var submission = await _eInvoiceService.SubmitAsync(
+            input.CompanyId,
+            input.SourceDocumentType,
+            input.SourceDocumentId,
+            xmlDocument,
+            accessToken,
+            environment,
+            CurrentTenant.Id);
+
+        // Update source document e-Invoice status
+        await UpdateSourceDocumentStatusAsync(input.SourceDocumentType, input.SourceDocumentId, submission);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "EInvoiceSubmission", submission.Id,
+            "Submitted", submission.CompanyId,
+            submission.DocumentUuid ?? submission.Id.ToString(), "Draft", submission.Status, CurrentUser.Id,
+            $"LHDN e-Invoice submitted. UUID: {submission.DocumentUuid}", CurrentTenant.Id));
+
+        return ObjectMapper.Map<EInvoiceSubmission, EInvoiceSubmissionDto>(submission);
+    }
+
+    private async Task<EInvoiceDocumentData> BuildDocumentDataAsync(Guid companyId, string sourceDocType, Guid sourceDocId)
+    {
+        var company = await _companyRepository.GetAsync(companyId);
+
+        var supplier = new EInvoicePartyData
+        {
+            Name = company.Name,
+            Tin = company.TaxId ?? "",
+            IdType = "BRN",
+            IdValue = company.RegistrationNumber ?? "",
+            SstRegistration = company.SstRegistrationNumber,
+            Address = company.Address,
+            City = company.City,
+            State = company.State,
+            PostalCode = company.PostalCode,
+            CountryCode = company.Country ?? "MYS",
+            Phone = company.Phone,
+            Email = company.Email,
+            MsicCode = company.MsicCode,
+        };
+
+        return sourceDocType switch
+        {
+            "SalesInvoice" => await BuildFromSalesInvoiceAsync(sourceDocId, supplier),
+            "PurchaseInvoice" => await BuildFromPurchaseInvoiceAsync(sourceDocId, supplier, company),
+            _ => throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.UnsupportedEntityType)
+                .WithData("entityType", sourceDocType),
+        };
+    }
+
+    private async Task<EInvoiceDocumentData> BuildFromSalesInvoiceAsync(Guid invoiceId, EInvoicePartyData supplier)
+    {
+        var invoice = await _salesInvoiceRepository.GetAsync(invoiceId, includeDetails: true);
+        var customer = await _customerRepository.GetAsync(invoice.CustomerId);
+
+        var docTypeCode = invoice.EInvoiceDocType.HasValue
+            ? ((int)invoice.EInvoiceDocType.Value).ToString("D2")
+            : (invoice.IsDebitNote ? "03"
+                : (invoice.IsReturn && invoice.IsReturnRefund) ? "04"
+                : invoice.IsReturn ? "02" : "01");
+
+        // Per LHDN schema, a Credit/Debit Note's BillingReference carries the original invoice number (cbc:ID)
+        // and original LHDN-assigned UUID (cbc:UUID).
+        string? billingReferenceNumber = null;
+        string? billingReferenceUuid = null;
+        if (invoice.ReturnAgainstId.HasValue)
+        {
+            var originalInvoice = await _salesInvoiceRepository.FindAsync(invoice.ReturnAgainstId.Value);
+            billingReferenceNumber = originalInvoice?.InvoiceNumber;
+            billingReferenceUuid = originalInvoice?.LhdnUuid;
+        }
+
+        var isForeignCustomer = !string.IsNullOrWhiteSpace(customer.Country) &&
+            !customer.Country.Equals("MYS", StringComparison.OrdinalIgnoreCase) &&
+            !customer.Country.Equals("Malaysia", StringComparison.OrdinalIgnoreCase);
+
+        var defaultBuyerTin = isForeignCustomer ? EInvoiceConsts.ForeignPartyTin : EInvoiceConsts.GenericBuyerTin;
+        var buyerTin = !string.IsNullOrWhiteSpace(invoice.BuyerTin)
+            ? invoice.BuyerTin
+            : (!string.IsNullOrWhiteSpace(customer.Tin) ? customer.Tin : defaultBuyerTin);
+
+        return new EInvoiceDocumentData
+        {
+            InvoiceNumber = invoice.InvoiceNumber,
+            IssueDate = invoice.IssueDate,
+            DocumentTypeCode = docTypeCode,
+            CurrencyCode = invoice.CurrencyCode,
+            BillingReferenceNumber = billingReferenceNumber ?? billingReferenceUuid,
+            BillingReferenceUuid = billingReferenceUuid,
+            Supplier = supplier,
+            Buyer = new EInvoicePartyData
+            {
+                Name = customer.Name,
+                Tin = buyerTin,
+                IdType = customer.IdType ?? (isForeignCustomer ? "PASSPORT" : "BRN"),
+                IdValue = customer.IdValue ?? customer.RegistrationNumber ?? (isForeignCustomer ? "NA" : ""),
+                SstRegistration = customer.SstRegistrationNumber,
+                Address = customer.Address,
+                City = customer.City,
+                State = customer.State,
+                PostalCode = customer.PostalCode,
+                CountryCode = customer.Country ?? "MYS",
+                Phone = customer.Phone,
+                Email = customer.Email,
+            },
+            NetTotal = invoice.NetTotal,
+            TaxAmount = invoice.TaxAmount,
+            GrandTotal = invoice.GrandTotal,
+            DiscountAmount = invoice.DiscountAmount,
+            Lines = invoice.Items.Select(item => new EInvoiceLineData
+            {
+                Description = item.Description,
+                Uom = item.Uom ?? "C62",
+                Quantity = item.Quantity,
+                UnitPrice = item.UnitPrice,
+                TaxAmount = item.TaxAmount,
+            }).ToList(),
+        };
+    }
+
+    private async Task<EInvoiceDocumentData> BuildFromPurchaseInvoiceAsync(
+        Guid invoiceId, EInvoicePartyData buyer, Company company)
+    {
+        var invoice = await _purchaseInvoiceRepository.GetAsync(invoiceId, includeDetails: true);
+        var supplier = await _supplierRepository.GetAsync(invoice.SupplierId);
+
+        var docTypeCode = invoice.EInvoiceDocType.HasValue
+            ? ((int)invoice.EInvoiceDocType.Value).ToString("D2")
+            : (invoice.IsDebitNote ? "13"
+                : (invoice.IsReturn && invoice.IsReturnRefund) ? "14"
+                : invoice.IsReturn ? "12" : "11");
+
+        string? billingReferenceNumber = null;
+        string? billingReferenceUuid = null;
+        if (invoice.ReturnAgainstId.HasValue)
+        {
+            var originalInvoice = await _purchaseInvoiceRepository.FindAsync(invoice.ReturnAgainstId.Value);
+            billingReferenceNumber = originalInvoice?.InvoiceNumber;
+            billingReferenceUuid = originalInvoice?.LhdnUuid;
+        }
+
+        var isForeignSupplier = !string.IsNullOrWhiteSpace(supplier.Country) &&
+            !supplier.Country.Equals("MYS", StringComparison.OrdinalIgnoreCase) &&
+            !supplier.Country.Equals("Malaysia", StringComparison.OrdinalIgnoreCase);
+
+        var defaultSupplierTin = isForeignSupplier ? EInvoiceConsts.ForeignPartyTin : EInvoiceConsts.GenericBuyerTin;
+        var supplierTin = !string.IsNullOrWhiteSpace(invoice.SupplierTin)
+            ? invoice.SupplierTin
+            : (!string.IsNullOrWhiteSpace(supplier.Tin) ? supplier.Tin : defaultSupplierTin);
+
+        // For purchase: supplier is the seller, company is the buyer
+        return new EInvoiceDocumentData
+        {
+            InvoiceNumber = invoice.InvoiceNumber,
+            IssueDate = invoice.IssueDate,
+            DocumentTypeCode = docTypeCode,
+            CurrencyCode = invoice.CurrencyCode,
+            BillingReferenceNumber = billingReferenceNumber ?? billingReferenceUuid,
+            BillingReferenceUuid = billingReferenceUuid,
+            Supplier = new EInvoicePartyData
+            {
+                Name = supplier.Name,
+                Tin = supplierTin,
+                IdType = supplier.IdType ?? (isForeignSupplier ? "PASSPORT" : "BRN"),
+                IdValue = supplier.IdValue ?? supplier.RegistrationNumber ?? (isForeignSupplier ? "NA" : ""),
+                SstRegistration = supplier.SstRegistrationNumber,
+                Address = supplier.Address,
+                City = supplier.City,
+                State = supplier.State,
+                PostalCode = supplier.PostalCode,
+                CountryCode = supplier.Country ?? "MYS",
+                Phone = supplier.Phone,
+                Email = supplier.Email,
+            },
+            Buyer = buyer,
+            NetTotal = invoice.NetTotal,
+            TaxAmount = invoice.TaxAmount,
+            GrandTotal = invoice.GrandTotal,
+            DiscountAmount = invoice.DiscountAmount,
+            Lines = invoice.Items.Select(item => new EInvoiceLineData
+            {
+                Description = item.Description,
+                Uom = item.Uom ?? "C62",
+                Quantity = item.Quantity,
+                UnitPrice = item.UnitPrice,
+                TaxAmount = item.TaxAmount,
+            }).ToList(),
+        };
+    }
+
+    private async Task UpdateSourceDocumentStatusAsync(string docType, Guid docId, EInvoiceSubmission submission)
+    {
+        if (docType == "SalesInvoice")
+        {
+            var invoice = await _salesInvoiceRepository.GetAsync(docId);
+            invoice.EInvoiceStatus = submission.Status == "Accepted"
+                ? Sales.EInvoiceStatus.Pending : Sales.EInvoiceStatus.Invalid;
+            invoice.LhdnUuid = submission.DocumentUuid;
+            invoice.LhdnLongId = submission.LongId;
+            invoice.LhdnSubmissionId = submission.Id;
+            invoice.LhdnSubmittedAt = DateTime.UtcNow;
+            await _salesInvoiceRepository.UpdateAsync(invoice);
+        }
+        else if (docType == "PurchaseInvoice")
+        {
+            var invoice = await _purchaseInvoiceRepository.GetAsync(docId);
+            invoice.EInvoiceStatus = submission.Status == "Accepted"
+                ? Sales.EInvoiceStatus.Pending : Sales.EInvoiceStatus.Invalid;
+            invoice.LhdnUuid = submission.DocumentUuid;
+            invoice.LhdnSubmissionId = submission.Id;
+            await _purchaseInvoiceRepository.UpdateAsync(invoice);
+        }
+    }
+
+    [Authorize(MyERPPermissions.EInvoice.Submit)]
+    public async Task<BatchSubmitResultDto> BatchSubmitAsync(BatchSubmitEInvoiceDto input)
+    {
+        if (input.DocumentIds == null || !input.DocumentIds.Any())
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.DocumentMustHaveItems)
+                .WithData("documentType", "BatchEInvoice");
+
+        var company = await _companyRepository.GetAsync(input.CompanyId);
+        if (!company.EnableLhdnInvoice)
+        {
+            // Per MyInvois PR d9adf36: Gracefully bypass LHDN submission if disabled.
+            return new BatchSubmitResultDto
+            {
+                TotalRequested = input.DocumentIds.Count,
+                SkippedCount = input.DocumentIds.Count,
+                Results = input.DocumentIds.Select(id => new BatchSubmitItemResult
+                {
+                    DocumentId = id,
+                    DocumentNumber = id.ToString()[..8],
+                    Success = false,
+                    ErrorMessage = "LHDN Invoice Submission is not enabled in company settings.",
+                    Status = "NotSubmitted"
+                }).ToList()
+            };
+        }
+
+        var result = new BatchSubmitResultDto { TotalRequested = input.DocumentIds.Count };
+
+        foreach (var docId in input.DocumentIds)
+        {
+            try
+            {
+                // Check if already submitted
+                string? docNumber = null;
+                if (input.SourceDocumentType == "SalesInvoice")
+                {
+                    var si = await _salesInvoiceRepository.FindAsync(docId);
+                    if (si == null) { result.SkippedCount++; continue; }
+                    if (!si.IsSubmitToLhdn)
+                    {
+                        result.Results.Add(new BatchSubmitItemResult
+                        {
+                            DocumentId = docId,
+                            DocumentNumber = si.InvoiceNumber,
+                            Success = false,
+                            ErrorMessage = "Submit to LHDN is not checked for this invoice.",
+                            Status = si.EInvoiceStatus.ToString()
+                        });
+                        result.SkippedCount++;
+                        continue;
+                    }
+                    if (si.EInvoiceStatus != Sales.EInvoiceStatus.NotSubmitted && si.EInvoiceStatus != Sales.EInvoiceStatus.Invalid)
+                    {
+                        result.Results.Add(new BatchSubmitItemResult
+                        {
+                            DocumentId = docId,
+                            DocumentNumber = si.InvoiceNumber,
+                            Success = false,
+                            ErrorMessage = "Already submitted to LHDN",
+                            Status = si.EInvoiceStatus.ToString()
+                        });
+                        result.SkippedCount++;
+                        continue;
+                    }
+                    docNumber = si.InvoiceNumber;
+                }
+                else if (input.SourceDocumentType == "PurchaseInvoice")
+                {
+                    var pi = await _purchaseInvoiceRepository.FindAsync(docId);
+                    if (pi == null) { result.SkippedCount++; continue; }
+                    if (!pi.IsSubmitToLhdn)
+                    {
+                        result.Results.Add(new BatchSubmitItemResult
+                        {
+                            DocumentId = docId,
+                            DocumentNumber = pi.InvoiceNumber,
+                            Success = false,
+                            ErrorMessage = "Submit to LHDN is not checked for this invoice.",
+                            Status = pi.EInvoiceStatus.ToString()
+                        });
+                        result.SkippedCount++;
+                        continue;
+                    }
+                    if (pi.EInvoiceStatus != Sales.EInvoiceStatus.NotSubmitted && pi.EInvoiceStatus != Sales.EInvoiceStatus.Invalid)
+                    {
+                        result.Results.Add(new BatchSubmitItemResult
+                        {
+                            DocumentId = docId,
+                            DocumentNumber = pi.InvoiceNumber,
+                            Success = false,
+                            ErrorMessage = "Already submitted to LHDN",
+                            Status = pi.EInvoiceStatus.ToString()
+                        });
+                        result.SkippedCount++;
+                        continue;
+                    }
+                    docNumber = pi.InvoiceNumber;
+                }
+
+                var submission = await SubmitAsync(new SubmitEInvoiceDto
+                {
+                    CompanyId = input.CompanyId,
+                    SourceDocumentType = input.SourceDocumentType,
+                    SourceDocumentId = docId,
+                });
+
+                result.Results.Add(new BatchSubmitItemResult
+                {
+                    DocumentId = docId,
+                    DocumentNumber = docNumber ?? docId.ToString()[..8],
+                    Success = true,
+                    LhdnUuid = submission.DocumentUuid,
+                    Status = submission.Status
+                });
+                result.SucceededCount++;
+            }
+            catch (Exception ex)
+            {
+                result.Results.Add(new BatchSubmitItemResult
+                {
+                    DocumentId = docId,
+                    DocumentNumber = docId.ToString()[..8],
+                    Success = false,
+                    ErrorMessage = ex.Message
+                });
+                result.FailedCount++;
+            }
+        }
+
+        return result;
+    }
+
+    public async Task<EInvoiceSubmissionDto> GetStatusAsync(Guid submissionId)
+    {
+        var accessToken = await _settingProvider.GetOrNullAsync("EInvoice.AccessToken")
+            ?? throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.EInvoiceValidationFailed);
+
+        var envString = await _settingProvider.GetOrNullAsync("EInvoice.Environment") ?? "Sandbox";
+        var environment = Enum.Parse<LhdnEnvironment>(envString);
+
+        var submission = await _eInvoiceService.RefreshStatusAsync(submissionId, accessToken, environment);
+
+        // Propagate LHDN validation status to source document
+        // Per myinvois get_status.py: updates source invoice EInvoiceStatus field
+        await PropagateStatusToSourceAsync(submission);
+
+        return ObjectMapper.Map<EInvoiceSubmission, EInvoiceSubmissionDto>(submission);
+    }
+
+    /// <summary>
+    /// Propagates LHDN validation status back to the source SI/PI.
+    /// Per myinvois: "Valid" → EInvoiceStatus.Valid, includes QR code URL.
+    /// Per myinvois: "Cancelled" → EInvoiceStatus.Cancelled.
+    /// </summary>
+    private async Task PropagateStatusToSourceAsync(EInvoiceSubmission submission)
+    {
+        if (submission.SourceDocumentType == "SalesInvoice")
+        {
+            var invoice = await _salesInvoiceRepository.FindAsync(submission.SourceDocumentId);
+            if (invoice == null) return;
+
+            invoice.EInvoiceStatus = submission.Status switch
+            {
+                "Valid" => Sales.EInvoiceStatus.Valid,
+                "Cancelled" => Sales.EInvoiceStatus.Cancelled,
+                "Invalid" or "Rejected" => Sales.EInvoiceStatus.Invalid,
+                _ => invoice.EInvoiceStatus // preserve existing
+            };
+            invoice.LhdnUuid = submission.DocumentUuid;
+            invoice.LhdnLongId = submission.LongId;
+            invoice.QrCodeUrl = submission.QrCodeUrl;
+            await _salesInvoiceRepository.UpdateAsync(invoice);
+        }
+        else if (submission.SourceDocumentType == "PurchaseInvoice")
+        {
+            var invoice = await _purchaseInvoiceRepository.FindAsync(submission.SourceDocumentId);
+            if (invoice == null) return;
+
+            invoice.EInvoiceStatus = submission.Status switch
+            {
+                "Valid" => Sales.EInvoiceStatus.Valid,
+                "Cancelled" => Sales.EInvoiceStatus.Cancelled,
+                "Invalid" or "Rejected" => Sales.EInvoiceStatus.Invalid,
+                _ => invoice.EInvoiceStatus
+            };
+            invoice.LhdnUuid = submission.DocumentUuid;
+            await _purchaseInvoiceRepository.UpdateAsync(invoice);
+        }
+    }
+
+    [Authorize(MyERPPermissions.EInvoice.Cancel)]
+    public async Task<EInvoiceSubmissionDto> CancelAsync(CancelEInvoiceDto input)
+    {
+        var accessToken = await _settingProvider.GetOrNullAsync("EInvoice.AccessToken")
+            ?? throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.EInvoiceValidationFailed);
+
+        var envString = await _settingProvider.GetOrNullAsync("EInvoice.Environment") ?? "Sandbox";
+        var environment = Enum.Parse<LhdnEnvironment>(envString);
+
+        var submission = await _eInvoiceService.CancelAsync(
+            input.SubmissionId, input.Reason, accessToken, environment);
+
+        // Propagate cancellation status back to source invoice
+        await PropagateStatusToSourceAsync(submission);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "EInvoiceSubmission", submission.Id,
+            "Cancelled", submission.CompanyId,
+            submission.DocumentUuid ?? submission.Id.ToString(), "Submitted", "Cancelled", CurrentUser.Id,
+            $"LHDN e-Invoice {submission.DocumentUuid} cancelled. Reason: {input.Reason}", CurrentTenant.Id));
+
+        return ObjectMapper.Map<EInvoiceSubmission, EInvoiceSubmissionDto>(submission);
+    }
+
+    public async Task<PagedResultDto<EInvoiceSubmissionDto>> GetListAsync(PagedAndSortedResultRequestDto input)
+    {
+        var totalCount = await _submissionRepository.GetCountAsync();
+        var submissions = await _submissionRepository.GetPagedListAsync(
+            input.SkipCount, input.MaxResultCount, input.Sorting ?? "CreationTime DESC");
+
+        return new PagedResultDto<EInvoiceSubmissionDto>(
+            totalCount,
+            submissions.Select(ObjectMapper.Map<EInvoiceSubmission, EInvoiceSubmissionDto>).ToList());
+    }
+
+    /// <summary>
+    /// Submit a consolidated POS invoice to LHDN.
+    /// Per myinvois consolidate_invoice.py:
+    /// - Uses generic buyer TIN "EI00000000020" for walk-in customers
+    /// - Document type = "01" (standard invoice, not self-billed)
+    /// - Aggregates line items from the consolidated SI
+    /// Per DO-NOT: "Create return for consolidated POS invoices (blocked entirely)"
+    /// </summary>
+    [Authorize(MyERPPermissions.EInvoice.Submit)]
+    public async Task<EInvoiceSubmissionDto> SubmitConsolidatedAsync(SubmitEInvoiceDto input)
+    {
+        var invoice = await _salesInvoiceRepository.GetAsync(input.SourceDocumentId, includeDetails: true);
+
+        // Validate this is actually a consolidated invoice (has ConsolidatedSalesInvoiceId set on children)
+        if (invoice.GrandTotal <= 0)
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.EInvoiceValidationFailed)
+                .WithData("reason", "Consolidated invoice has no value to submit.");
+
+        // Build document with generic buyer for walk-in POS customers
+        var company = await _companyRepository.GetAsync(input.CompanyId);
+        if (!company.EnableLhdnInvoice)
+        {
+            // Per MyInvois PR d9adf36: Gracefully bypass LHDN submission if disabled.
+            return new EInvoiceSubmissionDto { Status = "NotSubmitted" };
+        }
+
+        var supplier = new EInvoicePartyData
+        {
+            Name = company.Name,
+            Tin = company.TaxId ?? "",
+            IdType = "BRN",
+            IdValue = company.RegistrationNumber ?? "",
+            SstRegistration = company.SstRegistrationNumber,
+            Address = company.Address,
+            City = company.City,
+            State = company.State,
+            PostalCode = company.PostalCode,
+            CountryCode = company.Country ?? "MYS",
+            Phone = company.Phone,
+            Email = company.Email,
+            MsicCode = company.MsicCode,
+        };
+
+        // Per myinvois: consolidated invoices use generic buyer "General Public"
+        var buyer = new EInvoicePartyData
+        {
+            Name = "Consolidated - General Public",
+            Tin = EInvoiceConsts.GenericBuyerTin, // LHDN generic TIN for walk-in customers
+            IdType = "BRN",
+            IdValue = EInvoiceConsts.GenericBuyerTin,
+            CountryCode = "MYS",
+        };
+
+        var documentData = new EInvoiceDocumentData
+        {
+            InvoiceNumber = invoice.InvoiceNumber,
+            IssueDate = invoice.IssueDate,
+            DocumentTypeCode = "01", // Standard invoice
+            CurrencyCode = invoice.CurrencyCode,
+            Supplier = supplier,
+            Buyer = buyer,
+            NetTotal = invoice.NetTotal,
+            TaxAmount = invoice.TaxAmount,
+            GrandTotal = invoice.GrandTotal,
+            Lines = invoice.Items.Select(item => new EInvoiceLineData
+            {
+                Description = item.Description,
+                Uom = item.Uom ?? "C62",
+                Quantity = item.Quantity,
+                UnitPrice = item.UnitPrice,
+                TaxAmount = item.TaxAmount,
+            }).ToList(),
+        };
+
+        var xmlDocument = _documentBuilder.Build(documentData);
+
+        // Sign if certificate configured
+        var pfxBase64 = await _settingProvider.GetOrNullAsync("EInvoice.CertificatePfxBase64");
+        var pfxPassword = await _settingProvider.GetOrNullAsync("EInvoice.CertificatePassword");
+        if (!string.IsNullOrEmpty(pfxBase64) && !string.IsNullOrEmpty(pfxPassword))
+        {
+            var pfxBytes = Convert.FromBase64String(pfxBase64);
+            xmlDocument = _documentSigner.Sign(xmlDocument, pfxBytes, pfxPassword);
+        }
+
+        var accessToken = await _settingProvider.GetOrNullAsync("EInvoice.AccessToken")
+            ?? throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.EInvoiceValidationFailed)
+                .WithData("reason", "LHDN access token not configured.");
+
+        var envString = await _settingProvider.GetOrNullAsync("EInvoice.Environment") ?? "Sandbox";
+        var environment = Enum.Parse<LhdnEnvironment>(envString);
+
+        var submission = await _eInvoiceService.SubmitAsync(
+            input.CompanyId, "SalesInvoice", input.SourceDocumentId,
+            xmlDocument, accessToken, environment, CurrentTenant.Id);
+
+        await UpdateSourceDocumentStatusAsync("SalesInvoice", input.SourceDocumentId, submission);
+
+        return ObjectMapper.Map<EInvoiceSubmission, EInvoiceSubmissionDto>(submission);
+    }
+
+    [Authorize(MyERPPermissions.EInvoice.Submit)]
+    public async Task<List<Guid>> ConsolidateInvoicesAsync(ConsolidateInvoicesDto input)
+    {
+        return await _consolidationService.ConsolidateInvoicesAsync(input.InvoiceIds, input.CompanyId, CurrentTenant.Id);
+    }
+
+    [Authorize(MyERPPermissions.EInvoice.Default)]
+    public async Task<TaxpayerSearchResultDto> SearchTaxpayerAsync(SearchTaxpayerDto input)
+    {
+        try
+        {
+            // Auto-resolve missing ID details from target entities (matching myinvois search_taxpayer.py)
+            if (input.CustomerId.HasValue)
+            {
+                var customer = await _customerRepository.FindAsync(input.CustomerId.Value);
+                if (customer != null)
+                {
+                    if (string.IsNullOrWhiteSpace(input.IdType)) input.IdType = customer.IdType ?? "BRN";
+                    if (string.IsNullOrWhiteSpace(input.IdValue)) input.IdValue = customer.IdValue ?? customer.RegistrationNumber;
+                    if (string.IsNullOrWhiteSpace(input.TaxpayerName)) input.TaxpayerName = customer.Name;
+                }
+            }
+            else if (input.SupplierId.HasValue)
+            {
+                var supplier = await _supplierRepository.FindAsync(input.SupplierId.Value);
+                if (supplier != null)
+                {
+                    if (string.IsNullOrWhiteSpace(input.IdType)) input.IdType = supplier.IdType ?? "BRN";
+                    if (string.IsNullOrWhiteSpace(input.IdValue)) input.IdValue = supplier.IdValue ?? supplier.RegistrationNumber;
+                    if (string.IsNullOrWhiteSpace(input.TaxpayerName)) input.TaxpayerName = supplier.Name;
+                }
+            }
+            else if (input.CompanyId.HasValue)
+            {
+                var company = await _companyRepository.FindAsync(input.CompanyId.Value);
+                if (company != null)
+                {
+                    if (string.IsNullOrWhiteSpace(input.IdType)) input.IdType = "BRN";
+                    if (string.IsNullOrWhiteSpace(input.IdValue)) input.IdValue = company.RegistrationNumber;
+                    if (string.IsNullOrWhiteSpace(input.TaxpayerName)) input.TaxpayerName = company.Name;
+                }
+            }
+            else if (input.SalesInvoiceId.HasValue)
+            {
+                var si = await _salesInvoiceRepository.FindAsync(input.SalesInvoiceId.Value);
+                if (si != null)
+                {
+                    var customer = await _customerRepository.FindAsync(si.CustomerId);
+                    if (customer != null)
+                    {
+                        if (string.IsNullOrWhiteSpace(input.IdType)) input.IdType = customer.IdType ?? "BRN";
+                        if (string.IsNullOrWhiteSpace(input.IdValue)) input.IdValue = customer.IdValue ?? customer.RegistrationNumber;
+                        if (string.IsNullOrWhiteSpace(input.TaxpayerName)) input.TaxpayerName = customer.Name;
+                    }
+                }
+            }
+            else if (input.PurchaseInvoiceId.HasValue)
+            {
+                var pi = await _purchaseInvoiceRepository.FindAsync(input.PurchaseInvoiceId.Value);
+                if (pi != null)
+                {
+                    var supplier = await _supplierRepository.FindAsync(pi.SupplierId);
+                    if (supplier != null)
+                    {
+                        if (string.IsNullOrWhiteSpace(input.IdType)) input.IdType = supplier.IdType ?? "BRN";
+                        if (string.IsNullOrWhiteSpace(input.IdValue)) input.IdValue = supplier.IdValue ?? supplier.RegistrationNumber;
+                        if (string.IsNullOrWhiteSpace(input.TaxpayerName)) input.TaxpayerName = supplier.Name;
+                    }
+                }
+            }
+
+            if ((string.IsNullOrWhiteSpace(input.IdType) || string.IsNullOrWhiteSpace(input.IdValue)) && string.IsNullOrWhiteSpace(input.TaxpayerName))
+            {
+                return new TaxpayerSearchResultDto
+                {
+                    IsSuccess = false,
+                    ErrorMessage = "As per LHDN Regulations, either ID Type and Value or Taxpayer Name must be present."
+                };
+            }
+
+            var response = await _taxpayerValidationService.ValidateTaxpayerAsync(input.IdType, input.IdValue, input.TaxpayerName);
+            if (!response.IsFound || string.IsNullOrWhiteSpace(response.Tin))
+            {
+                return new TaxpayerSearchResultDto
+                {
+                    IsSuccess = false,
+                    IdType = input.IdType,
+                    IdValue = input.IdValue,
+                    ErrorMessage = response.ErrorMessage ?? "Taxpayer not found"
+                };
+            }
+
+            bool isPersisted = false;
+            string? persistedTarget = null;
+
+            // Auto-persist TIN to specified target entity
+            if (input.CustomerId.HasValue)
+            {
+                var customer = await _customerRepository.FindAsync(input.CustomerId.Value);
+                if (customer != null)
+                {
+                    customer.Tin = response.Tin;
+                    if (string.IsNullOrWhiteSpace(customer.IdType) && !string.IsNullOrWhiteSpace(input.IdType))
+                        customer.IdType = input.IdType;
+                    if (string.IsNullOrWhiteSpace(customer.IdValue) && !string.IsNullOrWhiteSpace(input.IdValue))
+                        customer.IdValue = input.IdValue;
+                    await _customerRepository.UpdateAsync(customer);
+                    isPersisted = true;
+                    persistedTarget = "Customer";
+                }
+            }
+            else if (input.SupplierId.HasValue)
+            {
+                var supplier = await _supplierRepository.FindAsync(input.SupplierId.Value);
+                if (supplier != null)
+                {
+                    supplier.Tin = response.Tin;
+                    if (string.IsNullOrWhiteSpace(supplier.IdType) && !string.IsNullOrWhiteSpace(input.IdType))
+                        supplier.IdType = input.IdType;
+                    if (string.IsNullOrWhiteSpace(supplier.IdValue) && !string.IsNullOrWhiteSpace(input.IdValue))
+                        supplier.IdValue = input.IdValue;
+                    await _supplierRepository.UpdateAsync(supplier);
+                    isPersisted = true;
+                    persistedTarget = "Supplier";
+                }
+            }
+            else if (input.CompanyId.HasValue)
+            {
+                var company = await _companyRepository.FindAsync(input.CompanyId.Value);
+                if (company != null)
+                {
+                    company.TaxId = response.Tin;
+                    await _companyRepository.UpdateAsync(company);
+                    isPersisted = true;
+                    persistedTarget = "Company";
+                }
+            }
+            else if (input.SalesInvoiceId.HasValue)
+            {
+                var si = await _salesInvoiceRepository.FindAsync(input.SalesInvoiceId.Value);
+                if (si != null)
+                {
+                    si.BuyerTin = response.Tin;
+                    await _salesInvoiceRepository.UpdateAsync(si);
+                    isPersisted = true;
+                    persistedTarget = "SalesInvoice";
+
+                    // Per Gotcha #223 / search_taxpayer.py after_insert: backfill customer TIN if empty
+                    var customer = await _customerRepository.FindAsync(si.CustomerId);
+                    if (customer != null && string.IsNullOrWhiteSpace(customer.Tin))
+                    {
+                        customer.Tin = response.Tin;
+                        await _customerRepository.UpdateAsync(customer);
+                    }
+                }
+            }
+            else if (input.PurchaseInvoiceId.HasValue)
+            {
+                var pi = await _purchaseInvoiceRepository.FindAsync(input.PurchaseInvoiceId.Value);
+                if (pi != null)
+                {
+                    pi.SupplierTin = response.Tin;
+                    await _purchaseInvoiceRepository.UpdateAsync(pi);
+                    isPersisted = true;
+                    persistedTarget = "PurchaseInvoice";
+
+                    // Backfill supplier TIN if empty
+                    var supplier = await _supplierRepository.FindAsync(pi.SupplierId);
+                    if (supplier != null && string.IsNullOrWhiteSpace(supplier.Tin))
+                    {
+                        supplier.Tin = response.Tin;
+                        await _supplierRepository.UpdateAsync(supplier);
+                    }
+                }
+            }
+
+            return new TaxpayerSearchResultDto
+            {
+                IsSuccess = true,
+                Tin = response.Tin,
+                Name = response.TaxpayerName,
+                IdType = input.IdType,
+                IdValue = input.IdValue,
+                IsPersisted = isPersisted,
+                PersistedTarget = persistedTarget
+            };
+        }
+        catch (Exception ex)
+        {
+            return new TaxpayerSearchResultDto
+            {
+                IsSuccess = false,
+                IdType = input.IdType,
+                IdValue = input.IdValue,
+                ErrorMessage = ex.Message
+            };
+        }
+    }
+
+    [Authorize(MyERPPermissions.EInvoice.Default)]
+    public async Task<List<LhdnStatusReportItemDto>> GetSalesStatusReportAsync(LhdnStatusReportRequestDto input)
+    {
+        var salesQuery = await _salesInvoiceRepository.GetQueryableAsync();
+        var customerQuery = await _customerRepository.GetQueryableAsync();
+
+        if (input.CompanyId.HasValue)
+        {
+            salesQuery = salesQuery.Where(x => x.CompanyId == input.CompanyId.Value);
+        }
+        if (input.FromDate.HasValue)
+        {
+            salesQuery = salesQuery.Where(x => x.IssueDate >= input.FromDate.Value);
+        }
+        if (input.ToDate.HasValue)
+        {
+            salesQuery = salesQuery.Where(x => x.IssueDate <= input.ToDate.Value);
+        }
+
+        if (!string.IsNullOrWhiteSpace(input.Status))
+        {
+            if (input.Status.Equals("Not Submitted", StringComparison.OrdinalIgnoreCase) ||
+                input.Status.Equals("NotSubmitted", StringComparison.OrdinalIgnoreCase))
+            {
+                salesQuery = salesQuery.Where(x => x.EInvoiceStatus == Sales.EInvoiceStatus.NotSubmitted);
+            }
+            else if (Enum.TryParse<Sales.EInvoiceStatus>(input.Status, true, out var parsedStatus))
+            {
+                salesQuery = salesQuery.Where(x => x.EInvoiceStatus == parsedStatus);
+            }
+        }
+
+        var query = from si in salesQuery
+                    join c in customerQuery on si.CustomerId equals c.Id into custJoin
+                    from c in custJoin.DefaultIfEmpty()
+                    orderby si.IssueDate descending, si.InvoiceNumber descending
+                    select new LhdnStatusReportItemDto
+                    {
+                        InvoiceId = si.Id,
+                        InvoiceNumber = si.InvoiceNumber,
+                        PostingDate = si.IssueDate,
+                        PartyName = c != null ? c.Name : "—",
+                        GrandTotal = si.GrandTotal,
+                        TaxAmount = si.TaxAmount,
+                        Status = si.EInvoiceStatus.ToString(),
+                        DocumentUuid = si.LhdnUuid,
+                        QrCodeUrl = si.QrCodeUrl,
+                        SubmittedAt = si.LhdnSubmittedAt
+                    };
+
+        return await AsyncExecuter.ToListAsync(query);
+    }
+
+    [Authorize(MyERPPermissions.EInvoice.Default)]
+    public async Task<List<LhdnStatusReportItemDto>> GetPurchaseStatusReportAsync(LhdnStatusReportRequestDto input)
+    {
+        var purchaseQuery = await _purchaseInvoiceRepository.GetQueryableAsync();
+        var supplierQuery = await _supplierRepository.GetQueryableAsync();
+
+        if (input.CompanyId.HasValue)
+        {
+            purchaseQuery = purchaseQuery.Where(x => x.CompanyId == input.CompanyId.Value);
+        }
+        if (input.FromDate.HasValue)
+        {
+            purchaseQuery = purchaseQuery.Where(x => x.IssueDate >= input.FromDate.Value);
+        }
+        if (input.ToDate.HasValue)
+        {
+            purchaseQuery = purchaseQuery.Where(x => x.IssueDate <= input.ToDate.Value);
+        }
+
+        if (!string.IsNullOrWhiteSpace(input.Status))
+        {
+            if (input.Status.Equals("Not Submitted", StringComparison.OrdinalIgnoreCase) ||
+                input.Status.Equals("NotSubmitted", StringComparison.OrdinalIgnoreCase))
+            {
+                purchaseQuery = purchaseQuery.Where(x => x.EInvoiceStatus == Sales.EInvoiceStatus.NotSubmitted);
+            }
+            else if (Enum.TryParse<Sales.EInvoiceStatus>(input.Status, true, out var parsedStatus))
+            {
+                purchaseQuery = purchaseQuery.Where(x => x.EInvoiceStatus == parsedStatus);
+            }
+        }
+
+        var query = from pi in purchaseQuery
+                    join s in supplierQuery on pi.SupplierId equals s.Id into suppJoin
+                    from s in suppJoin.DefaultIfEmpty()
+                    orderby pi.IssueDate descending, pi.InvoiceNumber descending
+                    select new LhdnStatusReportItemDto
+                    {
+                        InvoiceId = pi.Id,
+                        InvoiceNumber = pi.InvoiceNumber,
+                        PostingDate = pi.IssueDate,
+                        PartyName = s != null ? s.Name : "—",
+                        GrandTotal = pi.GrandTotal,
+                        TaxAmount = pi.TaxAmount,
+                        Status = pi.EInvoiceStatus.ToString(),
+                        DocumentUuid = pi.LhdnUuid,
+                        QrCodeUrl = null,
+                        SubmittedAt = pi.LhdnSubmittedAt
+                    };
+
+        return await AsyncExecuter.ToListAsync(query);
+    }
+
+    [Authorize(MyERPPermissions.EInvoice.Default)]
+    public async Task<LhdnVatReportDto> GetVatReportAsync(LhdnVatReportRequestDto input)
+    {
+        var taxCategories = new Dictionary<string, string>
+        {
+            { "01", "Sales Tax" },
+            { "02", "Service Tax" },
+            { "03", "Tourism Tax" },
+            { "04", "High-Value Goods Tax" },
+            { "05", "Sales Tax on Low Value Goods" },
+            { "06", "Not Applicable" },
+            { "E", "Tax Exemption" }
+        };
+
+        var salesQuery = await _salesInvoiceRepository.WithDetailsAsync(si => si.Items);
+        var purchaseQuery = await _purchaseInvoiceRepository.WithDetailsAsync(pi => pi.Items);
+
+        if (input.CompanyId.HasValue)
+        {
+            salesQuery = salesQuery.Where(x => x.CompanyId == input.CompanyId.Value);
+            purchaseQuery = purchaseQuery.Where(x => x.CompanyId == input.CompanyId.Value);
+        }
+        if (input.FromDate.HasValue)
+        {
+            salesQuery = salesQuery.Where(x => x.IssueDate >= input.FromDate.Value);
+            purchaseQuery = purchaseQuery.Where(x => x.IssueDate >= input.FromDate.Value);
+        }
+        if (input.ToDate.HasValue)
+        {
+            salesQuery = salesQuery.Where(x => x.IssueDate <= input.ToDate.Value);
+            purchaseQuery = purchaseQuery.Where(x => x.IssueDate <= input.ToDate.Value);
+        }
+
+        salesQuery = salesQuery.Where(x => x.Status == Core.DocumentStatus.Submitted || x.Status == Core.DocumentStatus.Posted);
+        purchaseQuery = purchaseQuery.Where(x => x.Status == Core.DocumentStatus.Submitted || x.Status == Core.DocumentStatus.Posted);
+
+        var salesInvoices = await AsyncExecuter.ToListAsync(salesQuery);
+        var purchaseInvoices = await AsyncExecuter.ToListAsync(purchaseQuery);
+
+        var taxCategoryRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Tax.Entities.TaxCategory, Guid>>();
+        var allTaxCategories = await taxCategoryRepo.GetListAsync();
+        var taxCatById = allTaxCategories.ToDictionary(tc => tc.Id, tc => tc);
+
+        string ResolveCategoryCode(Guid? taxCategoryId, decimal taxAmount, bool isSales)
+        {
+            if (taxCategoryId.HasValue && taxCatById.TryGetValue(taxCategoryId.Value, out var cat))
+            {
+                var code = cat.Code?.Trim();
+                if (!string.IsNullOrEmpty(code))
+                {
+                    if (code.Contains(':'))
+                        code = code.Split(':')[0].Trim();
+
+                    if (taxCategories.ContainsKey(code))
+                        return code;
+
+                    if (code.StartsWith("SST-S", StringComparison.OrdinalIgnoreCase)) return "01";
+                    if (code.StartsWith("SST-SV", StringComparison.OrdinalIgnoreCase)) return "02";
+                    if (code.StartsWith("SST-E", StringComparison.OrdinalIgnoreCase)) return "E";
+                    if (code.StartsWith("SST-ZR", StringComparison.OrdinalIgnoreCase)) return "06";
+                    if (code.StartsWith("SST-OS", StringComparison.OrdinalIgnoreCase)) return "06";
+                }
+
+                switch (cat.TaxType)
+                {
+                    case Tax.TaxType.Sales: return "01";
+                    case Tax.TaxType.Service: return "02";
+                    case Tax.TaxType.Exempt: return "E";
+                    case Tax.TaxType.ZeroRated: return "06";
+                    case Tax.TaxType.OutOfScope: return "06";
+                }
+            }
+
+            if (taxAmount == 0) return "E";
+            return isSales ? "01" : "02";
+        }
+
+        var salesCatMap = taxCategories.ToDictionary(k => k.Key, v => new LhdnVatCategorySummaryDto
+        {
+            CategoryCode = v.Key,
+            CategoryName = v.Value
+        });
+
+        foreach (var si in salesInvoices)
+        {
+            var itemsWithTaxCat = si.Items.Where(i => i.TaxCategoryId.HasValue).ToList();
+            if (itemsWithTaxCat.Count > 0)
+            {
+                foreach (var item in si.Items)
+                {
+                    var catCode = ResolveCategoryCode(item.TaxCategoryId, item.TaxAmount, isSales: true);
+                    if (!salesCatMap.ContainsKey(catCode)) catCode = "E";
+
+                    var amt = Math.Abs(item.LineTotal);
+                    var vat = Math.Abs(item.TaxAmount);
+
+                    if (si.IsReturn)
+                    {
+                        salesCatMap[catCode].Adjustment += amt;
+                        salesCatMap[catCode].VatAmount -= vat;
+                    }
+                    else
+                    {
+                        salesCatMap[catCode].Amount += amt;
+                        salesCatMap[catCode].VatAmount += vat;
+                    }
+                }
+            }
+            else
+            {
+                var catCode = ResolveCategoryCode(null, si.TaxAmount, isSales: true);
+                if (!salesCatMap.ContainsKey(catCode)) catCode = "E";
+
+                var amt = Math.Abs(si.GrandTotal);
+                var vat = Math.Abs(si.TaxAmount);
+
+                if (si.IsReturn)
+                {
+                    salesCatMap[catCode].Adjustment += amt;
+                    salesCatMap[catCode].VatAmount -= vat;
+                }
+                else
+                {
+                    salesCatMap[catCode].Amount += amt;
+                    salesCatMap[catCode].VatAmount += vat;
+                }
+            }
+        }
+
+        var purchaseCatMap = taxCategories.ToDictionary(k => k.Key, v => new LhdnVatCategorySummaryDto
+        {
+            CategoryCode = v.Key,
+            CategoryName = v.Value
+        });
+
+        foreach (var pi in purchaseInvoices)
+        {
+            var itemsWithTaxCat = pi.Items.Where(i => i.TaxCategoryId.HasValue).ToList();
+            if (itemsWithTaxCat.Count > 0)
+            {
+                foreach (var item in pi.Items)
+                {
+                    var catCode = ResolveCategoryCode(item.TaxCategoryId, item.TaxAmount, isSales: false);
+                    if (!purchaseCatMap.ContainsKey(catCode)) catCode = "E";
+
+                    var amt = Math.Abs(item.LineTotal);
+                    var vat = Math.Abs(item.TaxAmount);
+
+                    if (pi.IsReturn)
+                    {
+                        purchaseCatMap[catCode].Adjustment += amt;
+                        purchaseCatMap[catCode].VatAmount -= vat;
+                    }
+                    else
+                    {
+                        purchaseCatMap[catCode].Amount += amt;
+                        purchaseCatMap[catCode].VatAmount += vat;
+                    }
+                }
+            }
+            else
+            {
+                var catCode = ResolveCategoryCode(null, pi.TaxAmount, isSales: false);
+                if (!purchaseCatMap.ContainsKey(catCode)) catCode = "E";
+
+                var amt = Math.Abs(pi.GrandTotal);
+                var vat = Math.Abs(pi.TaxAmount);
+
+                if (pi.IsReturn)
+                {
+                    purchaseCatMap[catCode].Adjustment += amt;
+                    purchaseCatMap[catCode].VatAmount -= vat;
+                }
+                else
+                {
+                    purchaseCatMap[catCode].Amount += amt;
+                    purchaseCatMap[catCode].VatAmount += vat;
+                }
+            }
+        }
+
+        var report = new LhdnVatReportDto
+        {
+            SalesCategories = salesCatMap.Values.ToList(),
+            PurchaseCategories = purchaseCatMap.Values.ToList(),
+            TotalSalesAmount = salesCatMap.Values.Sum(x => x.Amount),
+            TotalSalesAdjustment = salesCatMap.Values.Sum(x => x.Adjustment),
+            TotalSalesVat = salesCatMap.Values.Sum(x => x.VatAmount),
+            TotalPurchaseAmount = purchaseCatMap.Values.Sum(x => x.Amount),
+            TotalPurchaseAdjustment = purchaseCatMap.Values.Sum(x => x.Adjustment),
+            TotalPurchaseVat = purchaseCatMap.Values.Sum(x => x.VatAmount)
+        };
+        report.NetVatPayable = report.TotalSalesVat - report.TotalPurchaseVat;
+
+        return report;
+    }
+
+    [Authorize(MyERPPermissions.EInvoice.Default)]
+    public async Task<LhdnDashboardStatsDto> GetDashboardStatsAsync(Guid? companyId)
+    {
+        var salesQuery = await _salesInvoiceRepository.WithDetailsAsync(si => si.Items);
+        var purchaseQuery = await _purchaseInvoiceRepository.WithDetailsAsync(pi => pi.Items);
+
+        if (companyId.HasValue)
+        {
+            salesQuery = salesQuery.Where(x => x.CompanyId == companyId.Value);
+            purchaseQuery = purchaseQuery.Where(x => x.CompanyId == companyId.Value);
+        }
+
+        var stats = new LhdnDashboardStatsDto
+        {
+            SalesValid = await AsyncExecuter.CountAsync(salesQuery.Where(x => x.EInvoiceStatus == Sales.EInvoiceStatus.Valid)),
+            SalesInvalid = await AsyncExecuter.CountAsync(salesQuery.Where(x => x.EInvoiceStatus == Sales.EInvoiceStatus.Invalid)),
+            SalesSubmitted = await AsyncExecuter.CountAsync(salesQuery.Where(x => x.EInvoiceStatus == Sales.EInvoiceStatus.Pending)),
+            SalesCancelled = await AsyncExecuter.CountAsync(salesQuery.Where(x => x.EInvoiceStatus == Sales.EInvoiceStatus.Cancelled)),
+            SalesFailed = await AsyncExecuter.CountAsync(salesQuery.Where(x => x.EInvoiceStatus == Sales.EInvoiceStatus.Rejected)),
+            SalesNotSubmitted = await AsyncExecuter.CountAsync(salesQuery.Where(x => x.EInvoiceStatus == Sales.EInvoiceStatus.NotSubmitted)),
+
+            PurchaseValid = await AsyncExecuter.CountAsync(purchaseQuery.Where(x => x.EInvoiceStatus == Sales.EInvoiceStatus.Valid)),
+            PurchaseInvalid = await AsyncExecuter.CountAsync(purchaseQuery.Where(x => x.EInvoiceStatus == Sales.EInvoiceStatus.Invalid)),
+            PurchaseSubmitted = await AsyncExecuter.CountAsync(purchaseQuery.Where(x => x.EInvoiceStatus == Sales.EInvoiceStatus.Pending)),
+            PurchaseCancelled = await AsyncExecuter.CountAsync(purchaseQuery.Where(x => x.EInvoiceStatus == Sales.EInvoiceStatus.Cancelled)),
+            PurchaseFailed = await AsyncExecuter.CountAsync(purchaseQuery.Where(x => x.EInvoiceStatus == Sales.EInvoiceStatus.Rejected)),
+            PurchaseNotSubmitted = await AsyncExecuter.CountAsync(purchaseQuery.Where(x => x.EInvoiceStatus == Sales.EInvoiceStatus.NotSubmitted))
+        };
+
+        return stats;
+    }
+
+    [Authorize(MyERPPermissions.EInvoice.Default)]
+    public async Task<List<LhdnMonthlyTrendDto>> GetMonthlyTrendAsync(Guid? companyId)
+    {
+        var salesQuery = await _salesInvoiceRepository.GetQueryableAsync();
+
+        if (companyId.HasValue)
+        {
+            salesQuery = salesQuery.Where(x => x.CompanyId == companyId.Value);
+        }
+
+        var trend = new List<LhdnMonthlyTrendDto>();
+        var monthStart = new DateTime(Clock.Now.Year, Clock.Now.Month, 1);
+
+        for (var i = 5; i >= 0; i--)
+        {
+            var periodStart = monthStart.AddMonths(-i);
+            var periodEnd = periodStart.AddMonths(1);
+            var periodQuery = salesQuery.Where(x => x.IssueDate >= periodStart && x.IssueDate < periodEnd);
+
+            trend.Add(new LhdnMonthlyTrendDto
+            {
+                Month = periodStart.ToString("MMM yyyy"),
+                Valid = await AsyncExecuter.CountAsync(periodQuery.Where(x => x.EInvoiceStatus == Sales.EInvoiceStatus.Valid)),
+                Invalid = await AsyncExecuter.CountAsync(periodQuery.Where(x => x.EInvoiceStatus == Sales.EInvoiceStatus.Invalid)),
+                Submitted = await AsyncExecuter.CountAsync(periodQuery.Where(x => x.EInvoiceStatus == Sales.EInvoiceStatus.Pending)),
+            });
+        }
+
+        return trend;
+    }
+
+    [Authorize(MyERPPermissions.EInvoice.Default)]
+    public async Task<List<ConsolidationCandidateDto>> GetConsolidationCandidatesAsync(GetConsolidationCandidatesInputDto input)
+    {
+        var salesQuery = await _salesInvoiceRepository.GetQueryableAsync();
+        var custQuery = await _customerRepository.GetQueryableAsync();
+        var consolQuery = await _consolidationRepository.GetQueryableAsync();
+
+        if (input.CompanyId.HasValue)
+        {
+            salesQuery = salesQuery.Where(x => x.CompanyId == input.CompanyId.Value);
+        }
+        if (input.FromDate.HasValue)
+        {
+            salesQuery = salesQuery.Where(x => x.IssueDate >= input.FromDate.Value);
+        }
+        if (input.ToDate.HasValue)
+        {
+            salesQuery = salesQuery.Where(x => x.IssueDate <= input.ToDate.Value);
+        }
+
+        // Only submitted sales invoices not submitted to LHDN directly
+        salesQuery = salesQuery.Where(x => x.Status == Core.DocumentStatus.Submitted &&
+                                           x.EInvoiceStatus == Sales.EInvoiceStatus.NotSubmitted);
+
+        var alreadyConsolidatedIds = consolQuery.Select(c => c.OriginalInvoiceId);
+        salesQuery = salesQuery.Where(x => !alreadyConsolidatedIds.Contains(x.Id));
+
+        var maxAmount = input.MaxAmount ?? 10000m;
+        salesQuery = salesQuery.Where(x => x.GrandTotal <= maxAmount);
+
+        // B2C consolidation only: LHDN requires B2B invoices (real buyer TIN) to be submitted
+        // individually so the buyer's own TIN is on record — never merged into an anonymous
+        // consolidated document. "Has a real TIN" mirrors the same resolution
+        // EInvoiceAppService.BuildFromSalesInvoiceAsync uses: invoice.BuyerTin first, else
+        // customer.Tin; only the generic consumer fallback ("no TIN on either") is eligible.
+        var query = from si in salesQuery
+                    join c in custQuery on si.CustomerId equals c.Id into custJoin
+                    from c in custJoin.DefaultIfEmpty()
+                    where (si.BuyerTin == null || si.BuyerTin == "") && (c == null || c.Tin == null || c.Tin == "")
+                    orderby si.IssueDate descending, si.InvoiceNumber descending
+                    select new ConsolidationCandidateDto
+                    {
+                        InvoiceId = si.Id,
+                        InvoiceNumber = si.InvoiceNumber,
+                        IssueDate = si.IssueDate,
+                        CustomerId = si.CustomerId,
+                        CustomerName = c != null ? c.Name : "General Public",
+                        GrandTotal = si.GrandTotal,
+                        ItemCount = si.Items.Count,
+                        CurrencyCode = si.CurrencyCode ?? "MYR",
+                        IsEligible = true
+                    };
+
+        return await AsyncExecuter.ToListAsync(query);
+    }
+
+    [Authorize(MyERPPermissions.EInvoice.Default)]
+    public async Task<PagedResultDto<EInvoiceConsolidationDto>> GetConsolidationsAsync(GetConsolidationsInputDto input)
+    {
+        var consolQuery = await _consolidationRepository.GetQueryableAsync();
+        var salesQuery = await _salesInvoiceRepository.GetQueryableAsync();
+        var custQuery = await _customerRepository.GetQueryableAsync();
+
+        if (input.CompanyId.HasValue)
+        {
+            consolQuery = consolQuery.Where(x => x.CompanyId == input.CompanyId.Value);
+        }
+
+        var totalCount = await AsyncExecuter.CountAsync(
+            consolQuery.Select(x => x.ConsolidatedInvoiceId).Distinct()
+        );
+
+        var consolidatedInvoiceIds = await AsyncExecuter.ToListAsync(
+            consolQuery
+                .OrderByDescending(x => x.CreationTime)
+                .Select(x => x.ConsolidatedInvoiceId)
+                .Distinct()
+                .Skip(input.SkipCount)
+                .Take(input.MaxResultCount)
+        );
+
+        var consolidatedInvoices = await AsyncExecuter.ToListAsync(
+            salesQuery.Where(x => consolidatedInvoiceIds.Contains(x.Id))
+        );
+
+        var consolRecords = await AsyncExecuter.ToListAsync(
+            consolQuery.Where(x => consolidatedInvoiceIds.Contains(x.ConsolidatedInvoiceId))
+        );
+
+        var originalInvoiceIds = consolRecords.Select(x => x.OriginalInvoiceId).Distinct().ToList();
+        var originalInvoices = await AsyncExecuter.ToListAsync(
+            salesQuery.Where(x => originalInvoiceIds.Contains(x.Id))
+        );
+        var originalCustomerIds = originalInvoices.Select(x => x.CustomerId).Distinct().ToList();
+        var customers = await AsyncExecuter.ToListAsync(
+            custQuery.Where(x => originalCustomerIds.Contains(x.Id))
+        );
+        var custMap = customers.ToDictionary(k => k.Id, v => v.Name);
+
+        var origMap = originalInvoices.ToDictionary(k => k.Id, v => new ConsolidationCandidateDto
+        {
+            InvoiceId = v.Id,
+            InvoiceNumber = v.InvoiceNumber,
+            IssueDate = v.IssueDate,
+            CustomerId = v.CustomerId,
+            CustomerName = custMap.TryGetValue(v.CustomerId, out var cName) ? cName : "General Public",
+            GrandTotal = v.GrandTotal,
+            ItemCount = v.Items.Count,
+            CurrencyCode = v.CurrencyCode ?? "MYR",
+            IsEligible = true
+        });
+
+        var resultList = new List<EInvoiceConsolidationDto>();
+        foreach (var cInv in consolidatedInvoices)
+        {
+            var matchedConsols = consolRecords.Where(x => x.ConsolidatedInvoiceId == cInv.Id).ToList();
+            var origList = matchedConsols
+                .Where(m => origMap.ContainsKey(m.OriginalInvoiceId))
+                .Select(m => origMap[m.OriginalInvoiceId])
+                .ToList();
+
+            resultList.Add(new EInvoiceConsolidationDto
+            {
+                Id = matchedConsols.FirstOrDefault()?.Id ?? cInv.Id,
+                CompanyId = cInv.CompanyId,
+                ConsolidatedInvoiceId = cInv.Id,
+                ConsolidatedInvoiceNumber = cInv.InvoiceNumber,
+                ConsolidatedIssueDate = cInv.IssueDate,
+                ConsolidatedGrandTotal = cInv.GrandTotal,
+                LhdnUuid = cInv.LhdnUuid,
+                EInvoiceStatus = cInv.EInvoiceStatus.ToString(),
+                QrCodeUrl = cInv.QrCodeUrl,
+                OriginalInvoices = origList,
+                CreationTime = matchedConsols.FirstOrDefault()?.CreationTime ?? cInv.CreationTime
+            });
+        }
+
+        return new PagedResultDto<EInvoiceConsolidationDto>(totalCount, resultList);
+    }
+
+    [Authorize(MyERPPermissions.EInvoice.Default)]
+    public async Task<PagedResultDto<LhdnSuccessLogDto>> GetSuccessLogsAsync(GetLhdnSuccessLogsInputDto input)
+    {
+        var logQuery = await _successLogRepository.GetQueryableAsync();
+
+        if (input.CompanyId.HasValue)
+        {
+            logQuery = logQuery.Where(x => x.CompanyId == input.CompanyId.Value);
+        }
+        if (!string.IsNullOrWhiteSpace(input.SourceDocumentType))
+        {
+            logQuery = logQuery.Where(x => x.SourceDocumentType == input.SourceDocumentType);
+        }
+        if (input.FromDate.HasValue)
+        {
+            logQuery = logQuery.Where(x => x.SubmittedAt >= input.FromDate.Value);
+        }
+        if (input.ToDate.HasValue)
+        {
+            logQuery = logQuery.Where(x => x.SubmittedAt <= input.ToDate.Value);
+        }
+        if (!string.IsNullOrWhiteSpace(input.SearchFilter))
+        {
+            var filter = input.SearchFilter.Trim().ToLower();
+            logQuery = logQuery.Where(x => x.DocumentUuid.ToLower().Contains(filter) ||
+                                           (x.SourceDocumentNumber != null && x.SourceDocumentNumber.ToLower().Contains(filter)));
+        }
+
+        var totalCount = await AsyncExecuter.CountAsync(logQuery);
+
+        var logs = await AsyncExecuter.ToListAsync(
+            logQuery.OrderByDescending(x => x.SubmittedAt)
+                    .Skip(input.SkipCount)
+                    .Take(input.MaxResultCount)
+        );
+
+        var dtoList = logs.Select(x => new LhdnSuccessLogDto
+        {
+            Id = x.Id,
+            CompanyId = x.CompanyId,
+            SubmissionId = x.SubmissionId,
+            DocumentUuid = x.DocumentUuid,
+            LongId = x.LongId,
+            SourceDocumentType = x.SourceDocumentType,
+            SourceDocumentId = x.SourceDocumentId,
+            SourceDocumentNumber = x.SourceDocumentNumber,
+            DocumentTypeCode = x.DocumentTypeCode,
+            SubmittedAt = x.SubmittedAt,
+            ValidatedAt = x.ValidatedAt,
+            ResponseJson = x.ResponseJson,
+            QrCodeUrl = x.QrCodeUrl,
+            GrandTotal = x.GrandTotal,
+            CurrencyCode = x.CurrencyCode
+        }).ToList();
+
+        return new PagedResultDto<LhdnSuccessLogDto>(totalCount, dtoList);
+    }
+
+    [Authorize(MyERPPermissions.EInvoice.Default)]
+    public async Task<EInvoiceSubmissionDto> RefreshStatusAsync(Guid submissionId)
+    {
+        var accessToken = await _settingProvider.GetOrNullAsync("EInvoice.AccessToken")
+            ?? throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.EInvoiceValidationFailed)
+                .WithData("reason", "LHDN access token not configured.");
+
+        var envString = await _settingProvider.GetOrNullAsync("EInvoice.Environment") ?? "Sandbox";
+        var environment = Enum.Parse<LhdnEnvironment>(envString);
+
+        var submission = await _eInvoiceService.RefreshStatusAsync(submissionId, accessToken, environment);
+        await PropagateStatusToSourceAsync(submission);
+
+        return ObjectMapper.Map<EInvoiceSubmission, EInvoiceSubmissionDto>(submission);
+    }
+}
+

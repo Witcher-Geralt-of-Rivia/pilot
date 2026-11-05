@@ -1,0 +1,137 @@
+<abp-page [title]="isEditMode ? ('::EditDeliveryNote' | abpLocalization) : ('::NewDeliveryNote' | abpLocalization)" (appSaveShortcut)="save()">
+  <div class="card mb-4">
+    <div class="card-header">
+      <h5 class="card-title mb-0"><i class="fa fa-truck me-2"></i>{{ '::DeliveryNote' | abpLocalization }}</h5>
+    </div>
+    <div class="card-body">
+      <form [formGroup]="form" (ngSubmit)="save()">
+        <div class="row">
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::Company' | abpLocalization }}</label>
+            <select class="form-select" formControlName="companyId" [class.is-invalid]="form.get('companyId')?.invalid && form.get('companyId')?.touched">
+              <option value="">{{ '::SelectCompany' | abpLocalization }}</option>
+              @for (c of companies(); track c.id) {
+                <option [value]="c.id">{{ c.name }}</option>
+              }
+            </select>
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::Customer' | abpLocalization }}</label>
+            <select class="form-select" formControlName="customerId" (change)="onCustomerChanged()" [class.is-invalid]="form.get('customerId')?.invalid && form.get('customerId')?.touched">
+              <option value="">Select customer...</option>
+              @for (c of customers(); track c.id) {
+                <option [value]="c.id">{{ c.customerName ?? c.name }}</option>
+              }
+            </select>
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::PostingDate' | abpLocalization }}</label>
+            <input type="date" class="form-control" formControlName="postingDate" [class.is-invalid]="form.get('postingDate')?.invalid && form.get('postingDate')?.touched" />
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::SalesOrder' | abpLocalization }}</label>
+            <div class="input-group">
+              <select class="form-select" formControlName="salesOrderId" (change)="onSalesOrderChanged()">
+                <option value="">{{ '::Placeholder:SelectSalesOrder' | abpLocalization }}</option>
+                @for (so of availableSOs(); track so.id) {
+                  <option [value]="so.id">{{ so.orderNumber }} — {{ so.orderDate | date:'dd/MM/yyyy' }} ({{ so.grandTotal | number:'1.2-2' }})</option>
+                }
+              </select>
+              @if (isLoadingSOItems()) {
+                <span class="input-group-text"><span class="spinner-border spinner-border-sm"></span></span>
+              }
+            </div>
+            @if (!form.get('customerId')?.value) {
+              <small class="text-muted">{{ '::SelectCustomerToLoadOrders' | abpLocalization }}</small>
+            }
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::Warehouse' | abpLocalization }}</label>
+            <select class="form-select" formControlName="warehouseId" [class.is-invalid]="form.get('warehouseId')?.invalid && form.get('warehouseId')?.touched">
+              <option value="">{{ '::SelectWarehouse' | abpLocalization }}</option>
+              @for (wh of warehouses(); track wh.id) {
+                <option [value]="wh.id">{{ wh.name }}</option>
+              }
+            </select>
+          </div>
+        </div>
+
+        <!-- Line Items -->
+        <div class="mt-3">
+          <div class="d-flex align-items-center mb-2">
+            <h6 class="fw-medium mb-0">{{ '::Items' | abpLocalization }}</h6>
+            <div class="btn-group ms-auto">
+              @if (availablePickLists().length > 0) {
+                <select class="form-select form-select-sm" style="width: auto;" (change)="getItemsFromPickList($any($event.target).value)">
+                  <option value="">{{ '::GetItemsFromPickList' | abpLocalization }}</option>
+                  @for (pl of availablePickLists(); track pl.id) {
+                    <option [value]="pl.id">{{ pl.pickListNumber || pl.id?.substring(0,8) }}</option>
+                  }
+                </select>
+              }
+              @if (isLoadingPickListItems()) {
+                <span class="spinner-border spinner-border-sm ms-2"></span>
+              }
+            </div>
+          </div>
+          @for (item of items.controls; track $index; let i = $index) {
+            <div [formGroup]="$any(item)" class="row mb-2 align-items-center">
+              <div class="col-3">
+                <select class="form-select form-select-sm" formControlName="itemId">
+                  <option value="">{{ '::SelectItem' | abpLocalization }}</option>
+                  @for (item of availableItems(); track item.id) {
+                    <option [value]="item.id">{{ item.itemCode ?? item.itemName }}</option>
+                  }
+                </select>
+              </div>
+              <div class="col-3">
+                <input type="text" class="form-control form-control-sm" formControlName="description" [placeholder]="'::Placeholder:Description' | abpLocalization" />
+              </div>
+              <div class="col-2">
+                <input type="number" class="form-control form-control-sm" formControlName="quantity" [placeholder]="'::Placeholder:Qty' | abpLocalization" />
+              </div>
+              <div class="col-2">
+                <input type="number" class="form-control form-control-sm" formControlName="unitPrice" [placeholder]="'::Rate' | abpLocalization" />
+              </div>
+              <div class="col-1">
+                <input type="text" class="form-control form-control-sm" formControlName="uom" [placeholder]="'::Placeholder:Uom' | abpLocalization" />
+              </div>
+              <div class="col-1">
+                <button type="button" class="btn btn-sm btn-outline-danger" (click)="removeItem(i)">
+                  <i class="fa fa-trash"></i>
+                </button>
+              </div>
+              @if (item.get('itemId')?.value) {
+                <div class="col-12 ps-3 mb-1">
+                  <app-stock-availability
+                    [itemId]="item.get('itemId')!.value"
+                    [requiredQty]="item.get('quantity')?.value || 0"
+                    [warehouseId]="form.get('warehouseId')?.value || ''"
+                  />
+                </div>
+              }
+            </div>
+          }
+          <button type="button" class="btn btn-outline-secondary btn-sm mt-2" (click)="addItemRow()">
+            <i class="fa fa-plus me-1"></i> {{ '::AddRow' | abpLocalization }}
+          </button>
+        </div>
+
+        <!-- Batch Expiry Warning (per DO-NOT: prevent shipping expired stock) -->
+        @if (!isReturn && items.length > 0) {
+          <app-batch-expiry-warning
+            [itemIds]="getItemIds()"
+            [companyId]="form.get('companyId')?.value || ''" />
+        }
+
+        <div class="d-flex justify-content-end gap-2 pt-3">
+          <button type="button" class="btn btn-outline-secondary" routerLink="/sales/delivery-notes"><i class="fa fa-times me-1"></i>{{ '::Cancel' | abpLocalization }}
+          </button>
+          <button type="submit" class="btn btn-primary">
+            <i class="fa fa-save me-1"></i> {{ '::Save' | abpLocalization }}
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+</abp-page>

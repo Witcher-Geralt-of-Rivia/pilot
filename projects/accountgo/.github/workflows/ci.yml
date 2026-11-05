@@ -1,0 +1,248 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect Changed Paths
+    runs-on: ubuntu-latest
+    outputs:
+      ci: ${{ steps.filter.outputs.ci }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+      worker: ${{ steps.filter.outputs.worker }}
+      backend: ${{ steps.filter.outputs.backend }}
+      database: ${{ steps.filter.outputs.database }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            ci:
+              - '.github/workflows/ci.yml'
+            frontend:
+              - 'src/Web/**'
+            worker:
+              - 'src/Api/*.ts'
+              - 'src/Api/test/**'
+              - 'src/Api/package.json'
+              - 'src/Api/wrangler.jsonc'
+            backend:
+              - 'src/Core/**'
+              - 'src/Dto/**'
+              - 'src/Services/**'
+              - 'src/ServiceDefaults/**'
+              - 'src/MigrationService/**'
+              - 'src/src.AppHost/**'
+              - 'src/Api/**/*.cs'
+              - 'src/Api/**/*.csproj'
+              - 'src/Api/appsettings*.json'
+              - 'test/AccountGo.BackendTests/**'
+              - 'test/AccountGo.ServicesTests/**'
+              - 'accountgo.sln'
+              - 'Directory.Build.props'
+              - 'Directory.Build.targets'
+            database:
+              - 'src/Api/Data/**'
+              - 'src/Core/Domain/**'
+              - 'scripts/**'
+              - 'db/**'
+              - 'test/AccountGo.BackendTests/PostgresTestDatabase.cs'
+              - 'test/AccountGo.BackendTests/MultiTenancy/**'
+              - 'test/AccountGo.BackendTests/MultiTenancyPhase3Tests.cs'
+              - 'test/AccountGo.BackendTests/PostgresConnectionStringTests.cs'
+              - 'test/AccountGo.BackendTests/Architecture/**'
+              - 'test/AccountGo.ServicesTests/WorkspacePolicyCoordinationRaceTests.cs'
+              - 'test/AccountGo.ServicesTests/PersonalWorkspaceConversionScriptTests.cs'
+
+  api:
+    name: Build API
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.ci == 'true' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.database == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore src/Api/Api.csproj
+
+      - name: Build
+        run: dotnet build src/Api/Api.csproj -c Release --no-restore
+
+  web:
+    name: Build Web
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.ci == 'true' || needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: src/Web/pnpm-lock.yaml
+
+      - name: Install
+        working-directory: src/Web
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        working-directory: src/Web
+        run: pnpm run build
+
+      - name: Test
+        working-directory: src/Web
+        run: pnpm test
+
+  api-tests:
+    name: API tests (SQLite)
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.ci == 'true' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.database == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Backend tests
+        run: dotnet test test/AccountGo.BackendTests/AccountGo.BackendTests.csproj -c Release
+
+      - name: Services tests
+        run: dotnet test test/AccountGo.ServicesTests/AccountGo.ServicesTests.csproj -c Release
+
+  api-tests-postgres:
+    name: API tests (Postgres)
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.ci == 'true' || needs.changes.outputs.database == 'true'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # One throwaway database per test; see test/AccountGo.BackendTests/PostgresTestDatabase.cs.
+      ACCOUNTGO_TEST_POSTGRES: Host=localhost;Port=5432;Username=postgres;Password=postgres;Maximum Pool Size=5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # The roles a hosted Postgres (Supabase) has, so the Data API lockdown runs as it does there.
+      - name: Create hosted API roles
+        env:
+          PGPASSWORD: postgres
+        run: psql -h localhost -U postgres -c "CREATE ROLE anon NOLOGIN" -c "CREATE ROLE authenticated NOLOGIN"
+
+      - name: Multi-tenancy and architecture tests
+        run: >-
+          dotnet test test/AccountGo.BackendTests/AccountGo.BackendTests.csproj -c Release
+          --filter "FullyQualifiedName~MultiTenancyPhase3Tests|FullyQualifiedName~PostgresConnectionString|FullyQualifiedName~Architecture|FullyQualifiedName~WorkspaceOperatingPolicyMigrationRehearsal"
+          -- xUnit.MaxParallelThreads=4
+
+      # pg_dump refuses a server newer than itself. Ubuntu's default repository may not carry 17;
+      # use PostgreSQL's signed repository and select the matching binaries explicitly.
+      - name: Install PostgreSQL 17 client tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl ca-certificates
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl --fail --show-error --silent --location \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            --output /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+          /usr/lib/postgresql/17/bin/psql --version
+          /usr/lib/postgresql/17/bin/pg_dump --version
+          /usr/lib/postgresql/17/bin/pg_restore --version
+
+      # Dedicated multi-connection policy races and the personal-workspace conversion rehearsal, on PostgreSQL.
+      # The rehearsal drives scripts/personal-workspace-conversion.sh with psql, pg_dump and pg_restore.
+      - name: Workspace policy races and conversion rehearsal
+        run: >-
+          dotnet test test/AccountGo.ServicesTests/AccountGo.ServicesTests.csproj -c Release
+          --filter "FullyQualifiedName~WorkspacePolicyCoordinationRaceTests|FullyQualifiedName~PersonalWorkspaceConversionScriptTests"
+          -- xUnit.MaxParallelThreads=4
+
+  worker-tests:
+    name: Worker tests
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.ci == 'true' || needs.changes.outputs.worker == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Loads the .ts modules directly: needs Node with type stripping on by default.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Test
+        working-directory: src/Api
+        run: npm test
+
+  ci-status:
+    name: CI Status
+    needs: [changes, api, web, api-tests, api-tests-postgres, worker-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate overall CI result
+        run: |
+          echo "Changes detection: ${{ needs.changes.result }}"
+          echo "Build API: ${{ needs.api.result }}"
+          echo "Build Web: ${{ needs.web.result }}"
+          echo "API tests (SQLite): ${{ needs.api-tests.result }}"
+          echo "API tests (Postgres): ${{ needs.api-tests-postgres.result }}"
+          echo "Worker tests: ${{ needs.worker-tests.result }}"
+
+          if [ "${{ needs.changes.result }}" = "failure" ] || [ "${{ needs.changes.result }}" = "cancelled" ]; then
+            echo "::error::Path detection job failed or was cancelled."
+            exit 1
+          fi
+
+          FAILED="${{ contains(needs.*.result, 'failure') }}"
+          CANCELLED="${{ contains(needs.*.result, 'cancelled') }}"
+          if [ "$FAILED" = "true" ] || [ "$CANCELLED" = "true" ]; then
+            echo "::error::One or more executed CI jobs failed or were cancelled."
+            exit 1
+          fi
+
+          echo "All required checks passed successfully."

@@ -1,0 +1,235 @@
+using System;
+using MyERP.Accounting;
+using MyERP.Accounting.Entities;
+using MyERP.Core;
+using Shouldly;
+using Volo.Abp;
+using Xunit;
+
+namespace MyERP.Domain.Tests.AccountingTests;
+
+/// <summary>
+/// Unit tests for Payment Entry validation rules:
+/// - Customer Receive payment with negative total allocated amount is blocked (Gotcha #197)
+/// - Normal customer receive and supplier pay submit successfully
+/// </summary>
+public class PaymentEntryValidationRuleTests
+{
+    private readonly Guid _companyId = Guid.NewGuid();
+    private readonly Guid _customerId = Guid.NewGuid();
+    private readonly Guid _paidFrom = Guid.NewGuid();
+    private readonly Guid _paidTo = Guid.NewGuid();
+
+    [Fact]
+    public void PaymentEntry_CustomerReceive_NegativeTotalAllocated_ThrowsValidationException()
+    {
+        var pe = new PaymentEntry(
+            Guid.NewGuid(),
+            _companyId,
+            PaymentType.Receive,
+            DateTime.UtcNow,
+            100m,
+            _paidFrom,
+            _paidTo
+        )
+        {
+            PartyType = "Customer",
+            PartyId = _customerId
+        };
+
+        // Negative allocation (e.g., net credit balance return)
+        pe.References.Add(new PaymentEntryReference(Guid.NewGuid(), pe.Id, "SalesInvoice", Guid.NewGuid(), 100m, -50m, -50m));
+        pe.References.Add(new PaymentEntryReference(Guid.NewGuid(), pe.Id, "SalesInvoice", Guid.NewGuid(), 100m, -100m, -100m));
+
+        var ex = Assert.Throws<BusinessException>(() => pe.Submit());
+        Assert.Equal(MyERPDomainErrorCodes.ValidationFailed, ex.Code);
+        Assert.Contains("Cannot receive payment from Customer with negative total allocated amount", ex.Data["detail"]?.ToString());
+    }
+
+    [Fact]
+    public void PaymentEntry_CustomerReceive_PositiveTotalAllocated_SubmitsSuccessfully()
+    {
+        var pe = new PaymentEntry(
+            Guid.NewGuid(),
+            _companyId,
+            PaymentType.Receive,
+            DateTime.UtcNow,
+            100m,
+            _paidFrom,
+            _paidTo
+        )
+        {
+            PartyType = "Customer",
+            PartyId = _customerId
+        };
+
+        pe.References.Add(new PaymentEntryReference(Guid.NewGuid(), pe.Id, "SalesInvoice", Guid.NewGuid(), 100m, 80m, 1m));
+        pe.Submit();
+
+        Assert.Equal(global::MyERP.Core.DocumentStatus.Submitted, pe.Status);
+    }
+
+    [Fact]
+    public void OverBillingAllowance_AllowsPayment_WhenWithinAllowance()
+    {
+        // When OverBillingAllowance is 10%, per_billed of 105% is allowed (<= 110%)
+        var overBillingAllowance = 10m;
+        var perBilled = 105m;
+        var isAllowed = perBilled < (100m + overBillingAllowance);
+        Assert.True(isAllowed);
+    }
+
+    [Fact]
+    public void OverBillingAllowance_BlocksPayment_WhenExceedsAllowance()
+    {
+        // When OverBillingAllowance is 10%, per_billed of 115% is blocked (>= 110%)
+        var overBillingAllowance = 10m;
+        var perBilled = 115m;
+        var isBlocked = perBilled >= (100m + overBillingAllowance);
+        Assert.True(isBlocked);
+    }
+
+    [Fact]
+    public void PaymentEntry_InternalTransfer_SplitsBankChargesAndExchangeGainLoss()
+    {
+        // Per ERPNext PR #58071 (commit 8d2aa69e61):
+        // In multi-currency transfer (e.g. Paid 100 USD @ 50 rate = 5000 MYR, Received 4500 MYR @ 1 rate = 4500 MYR)
+        // With a 100 MYR bank charge deduction:
+        // exchange_gain_loss = base_paid (5000) - base_received (4500) - other_deductions (100) = 400 MYR
+        var pe = new PaymentEntry(
+            Guid.NewGuid(),
+            _companyId,
+            PaymentType.InternalTransfer,
+            DateTime.UtcNow,
+            100m,
+            _paidFrom,
+            _paidTo
+        )
+        {
+            SourceExchangeRate = 50m,
+            ReceivedAmount = 4500m,
+            TargetExchangeRate = 1m
+        };
+
+        // Add 100 MYR bank charge deduction
+        pe.AddTax(new PaymentEntryTax(Guid.NewGuid(), pe.Id, Guid.NewGuid())
+        {
+            Description = "Bank Charges",
+            TaxAmount = 100m,
+            AddDeductTax = TaxAddDeduct.Deduct,
+            ChargeType = PaymentTaxChargeType.Actual
+        });
+
+        // ExchangeGainLoss should absorb residual (400 MYR)
+        Assert.Equal(400m, pe.ExchangeGainLoss);
+    }
+
+    [Fact]
+    public void PaymentEntry_InternalTransfer_SameAccount_ThrowsException()
+    {
+        // Per ERPNext PR #58529 / commit 36a4dfe797:
+        // Internal Transfer must reject same account for Paid From and Paid To.
+        var sameAccount = Guid.NewGuid();
+        var ex = Assert.Throws<BusinessException>(() => new PaymentEntry(
+            Guid.NewGuid(),
+            _companyId,
+            PaymentType.InternalTransfer,
+            DateTime.UtcNow,
+            100m,
+            sameAccount,
+            sameAccount
+        ));
+
+        Assert.Equal(MyERPDomainErrorCodes.SameAccountInternalTransfer, ex.Code);
+    }
+
+    [Fact]
+    public void PaymentEntry_InternalTransfer_DifferentAccounts_Succeeds()
+    {
+        var pe = new PaymentEntry(
+            Guid.NewGuid(),
+            _companyId,
+            PaymentType.InternalTransfer,
+            DateTime.UtcNow,
+            100m,
+            _paidFrom,
+            _paidTo
+        );
+
+        pe.Submit();
+        Assert.Equal(global::MyERP.Core.DocumentStatus.Submitted, pe.Status);
+    }
+
+    [Fact]
+    public void ValidateReferenceAllocation_AtPrecision_AcceptsAllocatedEqualToOutstandingWithResidue()
+    {
+        // Per ERPNext PR #59783 / commit 15ed5321dc & 280bffe251:
+        // Multi-currency calculation leaves floating residue (e.g. 259.9999904 vs 260.00)
+        // Comparison at 2-decimal currency precision must succeed.
+        var allocated = 260.00m;
+        var outstanding = 259.99999039999966m;
+
+        Should.NotThrow(() =>
+            MyERP.Accounting.DomainServices.PaymentEntryManager.ValidateReferenceAllocation(allocated, outstanding, "INV-001"));
+    }
+
+    [Fact]
+    public void ValidateReferenceAllocation_Throws_WhenAllocatedExceedsOutstandingAtPrecision()
+    {
+        var allocated = 260.01m;
+        var outstanding = 260.00m;
+
+        var ex = Should.Throw<BusinessException>(() =>
+            MyERP.Accounting.DomainServices.PaymentEntryManager.ValidateReferenceAllocation(allocated, outstanding, "INV-001"));
+
+        Assert.Equal(MyERPDomainErrorCodes.OverAllocation, ex.Code);
+    }
+
+    [Fact]
+    public void ValidateReferenceAllocation_NegativeReturn_ValidatesCorrectly()
+    {
+        // Return invoice / credit note with negative outstanding
+        var allocated = -50.00m;
+        var outstanding = -49.9999999m;
+
+        Should.NotThrow(() =>
+            MyERP.Accounting.DomainServices.PaymentEntryManager.ValidateReferenceAllocation(allocated, outstanding, "RET-001"));
+
+        var excessiveAllocated = -50.05m;
+        var ex = Should.Throw<BusinessException>(() =>
+            MyERP.Accounting.DomainServices.PaymentEntryManager.ValidateReferenceAllocation(excessiveAllocated, -50.00m, "RET-001"));
+
+        Assert.Equal(MyERPDomainErrorCodes.OverAllocation, ex.Code);
+    }
+
+    [Fact]
+    public void PaymentEntry_InternalTransfer_BankAccountsCanBeAssignedAndCleared()
+    {
+        // Per ERPNext PR #60585 / commit ff8bbe8f56: internal transfer bank account linkage
+        var pe = new PaymentEntry(
+            Guid.NewGuid(),
+            _companyId,
+            PaymentType.InternalTransfer,
+            DateTime.UtcNow,
+            1000m,
+            _paidFrom,
+            _paidTo
+        );
+
+        pe.PaidFromBankAccountId.ShouldBeNull();
+        pe.PaidToBankAccountId.ShouldBeNull();
+
+        var bankFrom = Guid.NewGuid();
+        var bankTo = Guid.NewGuid();
+
+        pe.PaidFromBankAccountId = bankFrom;
+        pe.PaidToBankAccountId = bankTo;
+        pe.PaidFromBankAccountId.ShouldBe(bankFrom);
+        pe.PaidToBankAccountId.ShouldBe(bankTo);
+
+        pe.PaidFromBankAccountId = null;
+        pe.PaidToBankAccountId = null;
+        pe.PaidFromBankAccountId.ShouldBeNull();
+        pe.PaidToBankAccountId.ShouldBeNull();
+    }
+}

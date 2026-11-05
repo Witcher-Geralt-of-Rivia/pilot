@@ -1,0 +1,468 @@
+import { DurableObject } from "cloudflare:workers";
+import {
+  CAPACITY_POOL_HEADER,
+  parseCapacityPool,
+  resolvePoolInstanceType,
+  type CapacityPool,
+} from "./container-capacity";
+import { constantTimeEqual } from "./constant-time";
+import {
+  BuildMismatchError,
+  ContainerConfigError,
+  StartupInterruptedError,
+  buildContainerEnvVars,
+  errorText,
+  isStartupTransient,
+  isTransientContainerError,
+  requirePersistentDatabase,
+  resolveInternalSyncKey,
+  serviceUnavailable,
+  sleep,
+} from "./container-shared";
+import { shouldSkipPortsReady, type ReadyTiming } from "./ports-ready";
+import {
+  ContainerUnavailableError,
+  PayloadTooLargeError,
+  RestoreState,
+  bufferRequest,
+  fetchFromContainer,
+  maxRequestBodyBytesForRoute,
+  payloadTooLargeResponse,
+  toRequest,
+  unavailableResponse,
+  watchContainerExit,
+  type ContainerHost,
+} from "./container-proxy";
+import {
+  isServerTimingEnabled,
+  logSlowWorkerRequest,
+  scrubPathForLog,
+  withServerTiming,
+  type TimingSegment,
+} from "./server-timing";
+import type { Env } from "./worker-env";
+
+const CONTAINER_PORT = 8001;
+const PORT_READY_TIMEOUT_MS = 90_000;
+const CONTAINER_RETRY_ATTEMPTS = 4;
+const CONTAINER_RETRY_BASE_DELAY_MS = 750;
+/** Match V1 sleepAfter = 15m so cold starts do not thrash. */
+const INACTIVITY_TIMEOUT_MS = 15 * 60 * 1000;
+const PORT_POLL_INTERVAL_MS = 500;
+/**
+ * One readiness probe. getTcpPort().fetch() has no timeout of its own, and a probe that connects while the app is
+ * still booting can wait forever; the 2026-10-28 rollback (requests hung ~90 s, 0 CPU) matched that. Bound each
+ * attempt so the loop keeps polling and its deadline applies.
+ */
+const PORT_PROBE_TIMEOUT_MS = 3_000;
+
+/**
+ * Phase 0 V2 writer: durable_object scheduling policy, instance size at start().
+ * Still one shared writer per deploy version when routed from the Worker flag.
+ * Does not extend @cloudflare/containers Container (unsupported for this policy).
+ */
+export class AccountGoApiContainerV2 extends DurableObject<Env> {
+  private readonly restoreState = new RestoreState();
+  private readonly host: ContainerHost;
+  private initPromise: Promise<void> | null = null;
+  private loggedMismatch = false;
+  /** Pool this object serves (from the Worker's pool header); decides the instance size at start(). */
+  private pool: CapacityPool = "free";
+
+  /** True only while the running container is the one the last build check passed against. */
+  get restored(): boolean {
+    return this.restoreState.restored;
+  }
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    const container = ctx.container;
+    if (container?.running) {
+      void ctx.blockConcurrencyWhile(() =>
+        container.setInactivityTimeout(INACTIVITY_TIMEOUT_MS)
+      );
+    }
+    const self = this;
+    this.host = {
+      get restored() {
+        return self.restored;
+      },
+      isRunning: () => this.isContainerRunning(),
+      ensureReady: () => this.ensurePortsReady(),
+      ensureRestored: (readyTiming) => this.ensureInitialized(readyTiming),
+      invalidate: (reason) => this.invalidate(reason),
+      dispatch: (request) => this.dispatch(request),
+      log: (message) => console.warn(`[worker-v2] ${message}`),
+    };
+  }
+
+  private invalidate(reason: string): void {
+    if (this.restoreState.invalidate()) {
+      console.warn(`[worker-v2] restore required: ${reason}`);
+    }
+  }
+
+  private buildEnvVars(): Record<string, string> {
+    return buildContainerEnvVars(this.env as unknown as Record<string, unknown>, CONTAINER_PORT);
+  }
+
+  private async destroyContainer(reason?: string): Promise<void> {
+    const container = this.ctx.container;
+    if (!container) return;
+    try {
+      if (container.running) {
+        await container.destroy(reason ?? "destroyed");
+      }
+    } catch (err) {
+      console.error("[worker-v2] destroy failed:", errorText(err));
+    }
+    this.invalidate(reason ?? "destroyed");
+    this.loggedMismatch = false;
+  }
+
+  private async ensureContainerStarted(): Promise<void> {
+    const container = this.ctx.container;
+    if (!container) {
+      throw new Error("No container is configured for AccountGoApiContainerV2");
+    }
+
+    if (!container.running) {
+      // A container that is not running must pass the build check again before it serves anything.
+      this.invalidate("container is starting");
+      const images = container.images;
+      if (!images?.base) {
+        throw new Error("Container image 'base' is not configured for AccountGoApiContainerV2");
+      }
+      const instance = resolvePoolInstanceType(this.pool, this.env);
+      console.warn(`[worker-v2] starting ${this.pool} pool container on ${instance}`);
+      container.start({
+        image: images.base,
+        instance,
+        enableInternet: true,
+        env: this.buildEnvVars(),
+      });
+      await container.setInactivityTimeout(INACTIVITY_TIMEOUT_MS);
+    }
+  }
+
+  private async waitForPortReady(): Promise<void> {
+    const container = this.ctx.container;
+    if (!container) {
+      throw new Error("No container is configured for AccountGoApiContainerV2");
+    }
+
+    const deadline = Date.now() + PORT_READY_TIMEOUT_MS;
+    let lastErr: unknown;
+    while (Date.now() < deadline) {
+      try {
+        if (!container.running) {
+          await this.ensureContainerStarted();
+        }
+        const port = container.getTcpPort(CONTAINER_PORT);
+        // TCP accept is enough; ASP.NET may not expose Worker /healthz.
+        const probe = await withTimeout(
+          port.fetch(`http://127.0.0.1:${CONTAINER_PORT}/`, {
+            method: "GET",
+            signal: AbortSignal.timeout(PORT_PROBE_TIMEOUT_MS),
+          }),
+          PORT_PROBE_TIMEOUT_MS,
+          `port ${CONTAINER_PORT} probe`
+        );
+        // Any HTTP response means the listener is up (including 404).
+        void probe.body?.cancel();
+        return;
+      } catch (err) {
+        lastErr = err;
+        await sleep(PORT_POLL_INTERVAL_MS);
+      }
+    }
+    throw lastErr instanceof Error
+      ? lastErr
+      : new Error(`Container port ${CONTAINER_PORT} not ready within ${PORT_READY_TIMEOUT_MS}ms`);
+  }
+
+  private async ensurePortsReady(): Promise<void> {
+    await this.ensureContainerStarted();
+    await this.waitForPortReady();
+  }
+
+  private isContainerRunning(): boolean {
+    return !!this.ctx.container?.running;
+  }
+
+  /** Port fetch; never starts a container. */
+  private async dispatch(request: Request): Promise<Response> {
+    const container = this.ctx.container;
+    if (!container) {
+      throw new Error("No container is configured for AccountGoApiContainerV2");
+    }
+    return await container.getTcpPort(CONTAINER_PORT).fetch(request);
+  }
+
+  /** Internal build-check calls; replayable because a failed check is simply redone. */
+  private containerFetchWithRetry(
+    input: string,
+    init: RequestInit | undefined,
+    label: string,
+    readyTiming?: ReadyTiming
+  ): Promise<Response> {
+    return fetchFromContainer(this.host, () => new Request(input, init), {
+      label,
+      method: init?.method ?? "GET",
+      requireRestored: false,
+      replayable: true,
+      readyTiming,
+      attempts: CONTAINER_RETRY_ATTEMPTS,
+      baseDelayMs: CONTAINER_RETRY_BASE_DELAY_MS,
+      sleep,
+    });
+  }
+
+  private async initialize(readyTiming?: ReadyTiming): Promise<void> {
+    const token = this.restoreState.current();
+    watchContainerExit(this.ctx.container, this.restoreState, token, (m) =>
+      console.warn(`[worker-v2] ${m}`)
+    );
+    requirePersistentDatabase(this.env);
+    const syncKey = resolveInternalSyncKey(this.env);
+
+    if (this.env.BUILD_SHA) {
+      if (!syncKey) {
+        console.error(
+          "Cold start check failed: INTERNAL_SYNC_KEY (or SECRET_KEY fallback) is not configured."
+        );
+        throw new Error("INTERNAL_SYNC_KEY is not configured.");
+      }
+
+      const buildRes = await this.containerFetchWithRetry(
+        "http://127.0.0.1:8001/api/internal/build",
+        {
+          method: "GET",
+          headers: { "x-internal-key": syncKey },
+        },
+        "build-check",
+        readyTiming
+      );
+
+      if (!buildRes.ok) {
+        const errText = await buildRes.text().catch(() => "");
+        console.error(
+          `[worker-v2] Build check failed: status=${buildRes.status} body=${errText.slice(0, 300)}`
+        );
+        throw new Error(`Build check failed with status ${buildRes.status}`);
+      }
+
+      const buildData = (await buildRes.json()) as { sha?: string };
+      const containerSha = buildData?.sha?.trim();
+      const expectedSha = this.env.BUILD_SHA.trim();
+
+      if (containerSha && expectedSha && containerSha !== expectedSha) {
+        if (!this.loggedMismatch) {
+          this.loggedMismatch = true;
+          console.warn(
+            `[worker-v2] BUILD_SHA mismatch: container=${containerSha}, expected=${expectedSha}. Destroying container.`
+          );
+        }
+        await this.destroyContainer("build-mismatch");
+        throw new BuildMismatchError("Container build version mismatch, reloading...");
+      }
+    }
+
+    // Commit only if the build check ran against the container that is running now.
+    if (!this.isContainerRunning() || !this.restoreState.commit(token)) {
+      throw new StartupInterruptedError();
+    }
+  }
+
+  private async ensureInitialized(readyTiming?: ReadyTiming): Promise<void> {
+    if (this.restored) return;
+
+    const runOnce = async (): Promise<void> => {
+      const p = (this.initPromise ??= this.initialize(readyTiming));
+      try {
+        await p;
+      } finally {
+        // Settled either way; a later invalidation must start a fresh check.
+        if (this.initPromise === p) {
+          this.initPromise = null;
+        }
+      }
+    };
+
+    try {
+      await runOnce();
+    } catch (err) {
+      if (!isStartupTransient(err)) {
+        throw err;
+      }
+      console.warn(`[worker-v2] initialize retry after transient failure: ${errorText(err)}`);
+      await sleep(CONTAINER_RETRY_BASE_DELAY_MS);
+      const readyStarted = Date.now();
+      await this.ensurePortsReady();
+      if (readyTiming) readyTiming.readyMs += Date.now() - readyStarted;
+      await runOnce();
+    }
+  }
+
+  override async fetch(request: Request): Promise<Response> {
+    const pool = parseCapacityPool(request.headers.get(CAPACITY_POOL_HEADER));
+    if (pool) this.pool = pool;
+    const url = new URL(request.url);
+    const timingEnabled = isServerTimingEnabled(this.env);
+    const workerStarted = Date.now();
+    const cold = !this.restored;
+    const scrubbedRoute = scrubPathForLog(url.pathname);
+    const readyTiming: ReadyTiming = { readyMs: 0 };
+
+    const finish = (response: Response, extra: TimingSegment[] = []): Response => {
+      const workerMs = Date.now() - workerStarted;
+      const segments: TimingSegment[] = [];
+      if (readyTiming.readyMs > 0) {
+        segments.push({ name: "ready", dur: readyTiming.readyMs });
+      }
+      segments.push(...extra, { name: "worker", dur: workerMs });
+      if (cold) segments.push({ name: "cold", desc: "1" });
+      const timed = withServerTiming(response, segments, timingEnabled);
+      logSlowWorkerRequest({
+        route: scrubbedRoute,
+        status: timed.status,
+        segments,
+        workerMs,
+      });
+      return timed;
+    };
+
+    if (url.pathname === "/restart-container" || request.headers.get("x-restart-container") === "true") {
+      const secret = this.env.SECRET_KEY || this.env.SECRET__key;
+      const providedKey = request.headers.get("x-internal-key");
+      if (!secret || !providedKey || !constantTimeEqual(secret, providedKey)) {
+        return finish(
+          new Response(
+            JSON.stringify({
+              title: "Not Found",
+              status: 404,
+              detail: "Not Found",
+            }),
+            { status: 404, headers: { "content-type": "application/problem+json" } }
+          )
+        );
+      }
+
+      try {
+        await this.destroyContainer("restart");
+      } catch (err: unknown) {
+        console.error("[worker-v2] Failed to destroy container on restart:", err);
+        return finish(
+          new Response(
+            JSON.stringify({
+              title: "Internal Server Error",
+              status: 500,
+              detail: "Failed to restart container",
+            }),
+            { status: 500, headers: { "content-type": "application/problem+json" } }
+          )
+        );
+      }
+      return finish(
+        new Response(JSON.stringify({ status: "container restarted" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        })
+      );
+    }
+
+    if (!shouldSkipPortsReady(this.isContainerRunning(), this.restored)) {
+      try {
+        const readyStarted = Date.now();
+        await this.ensurePortsReady();
+        readyTiming.readyMs += Date.now() - readyStarted;
+      } catch (err) {
+        console.error("[worker-v2] Container startup timed out or failed:", err);
+        return finish(serviceUnavailable("Service is starting up, please retry in a few seconds", 5));
+      }
+    }
+
+    if (!this.restored) {
+      try {
+        await this.ensureInitialized(readyTiming);
+      } catch (prepErr: unknown) {
+        if (prepErr instanceof BuildMismatchError) {
+          return finish(serviceUnavailable(prepErr.message, 5));
+        }
+
+        if (prepErr instanceof ContainerConfigError) {
+          console.error(`[worker-v2] ${prepErr.message}`);
+          return finish(serviceUnavailable("Service is not configured, please try again later", 60));
+        }
+
+        console.error("[worker-v2] Container initialization failed:", prepErr);
+        return finish(serviceUnavailable("Service is starting up, please retry in a few seconds", 5));
+      }
+    }
+
+    const cleanHeaders = new Headers(request.headers);
+    cleanHeaders.delete("x-container-name");
+    cleanHeaders.delete(CAPACITY_POOL_HEADER);
+    cleanHeaders.delete("x-internal-key");
+    cleanHeaders.delete("x-restart-container");
+
+    const httpUrl = request.url.replace(/^https:/i, "http:");
+    const maxBytes = maxRequestBodyBytesForRoute(url.pathname, request.method);
+
+    try {
+      // Buffered so a retry resends the same bytes.
+      const buffered = await bufferRequest(httpUrl, request, cleanHeaders, { maxBytes });
+      const containerStarted = Date.now();
+      const containerRes = await fetchFromContainer(this.host, () => toRequest(buffered), {
+        label: `proxy ${request.method} ${scrubbedRoute}`,
+        method: request.method,
+        requireRestored: true,
+        readyTiming,
+        attempts: CONTAINER_RETRY_ATTEMPTS,
+        baseDelayMs: CONTAINER_RETRY_BASE_DELAY_MS,
+        sleep,
+      });
+      const containerMs = Date.now() - containerStarted;
+
+      // 101 upgrades: pass through untouched (no header mutation, no body read).
+      if (containerRes.status === 101) {
+        return containerRes;
+      }
+
+      return finish(containerRes, [{ name: "container", dur: containerMs }]);
+    } catch (err) {
+      console.error(
+        `[worker-v2] Proxy failed method=${request.method} path=${scrubbedRoute}: ${errorText(err)}`
+      );
+      if (err instanceof PayloadTooLargeError) {
+        return finish(payloadTooLargeResponse(err));
+      }
+      if (err instanceof ContainerUnavailableError) {
+        return finish(unavailableResponse(err));
+      }
+      if (err instanceof BuildMismatchError) {
+        return finish(serviceUnavailable(err.message, 5));
+      }
+      this.invalidate("proxy failed");
+      return finish(
+        serviceUnavailable(
+          isTransientContainerError(err)
+            ? "Service is starting up, please retry in a few seconds"
+            : "Upstream container error, please retry",
+          5
+        )
+      );
+    }
+  }
+}
+
+/** Rejects when <paramref name="promise"/> has not settled within <paramref name="ms"/> (backstop for the abort signal). */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}

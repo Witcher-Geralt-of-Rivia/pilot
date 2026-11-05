@@ -1,0 +1,31 @@
+:host {
+  display: block;
+}
+
+// ── Print Layout ──
+@media print {
+  // Hide all screen-only elements — print layout component handles rendering
+  :host ::ng-deep .lpx-sidebar,
+  :host ::ng-deep .lpx-navbar,
+  :host ::ng-deep .lpx-topbar,
+  :host ::ng-deep .lpx-footer,
+  :host ::ng-deep abp-breadcrumb,
+  :host ::ng-deep .abp-subheader,
+  .btn-group,
+  .btn,
+  app-breadcrumb,
+  app-document-workflow,
+  app-activity-log {
+    display: none !important;
+  }
+
+  // Hide the detail cards — professional print layout component takes over
+  .card {
+    display: none !important;
+  }
+
+  // Show the print layout component
+  app-invoice-print-layout {
+    display: block !important;
+  }
+}

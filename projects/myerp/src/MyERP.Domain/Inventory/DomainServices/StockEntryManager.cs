@@ -1,0 +1,1801 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Core.DomainServices;
+using MyERP.Core.Entities;
+using MyERP.Inventory.Entities;
+using MyERP.Manufacturing;
+using MyERP.Manufacturing.Entities;
+using MyERP.Purchasing.Entities;
+using Volo.Abp;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Domain.Services;
+
+namespace MyERP.Inventory.DomainServices;
+
+/// <summary>
+/// Domain service for Stock Entry business rules.
+/// Validates warehouse assignments, purpose-specific rules, and material transfer limits.
+/// </summary>
+public class StockEntryManager : DomainService
+{
+    private readonly IRepository<Warehouse, Guid> _warehouseRepository;
+    private readonly IRepository<Item, Guid> _itemRepository;
+    private readonly CompanyRestrictionValidationService _companyRestriction;
+    private readonly IRepository<Company, Guid>? _companyRepository;
+
+    protected StockEntryManager()
+    {
+        _warehouseRepository = null!;
+        _itemRepository = null!;
+        _companyRestriction = null!;
+    }
+
+    public StockEntryManager(
+        IRepository<Warehouse, Guid> warehouseRepository,
+        IRepository<Item, Guid> itemRepository,
+        CompanyRestrictionValidationService companyRestriction,
+        IRepository<Company, Guid>? companyRepository = null)
+    {
+        _warehouseRepository = warehouseRepository;
+        _itemRepository = itemRepository;
+        _companyRestriction = companyRestriction;
+        _companyRepository = companyRepository;
+    }
+
+    /// <summary>
+    /// Validates warehouse assignments based on Stock Entry purpose.
+    /// Per DO-NOT: "Allow same-warehouse Material Transfer when all inventory dimensions are identical"
+    /// </summary>
+    public async Task ValidateWarehousesAsync(StockEntry entry)
+    {
+        var warehouseIds = entry.Items
+            .SelectMany(i => new[] { i.SourceWarehouseId, i.TargetWarehouseId })
+            .Where(id => id.HasValue)
+            .Select(id => id!.Value)
+            .Distinct()
+            .ToArray();
+        var itemIds = entry.Items
+            .Select(i => i.ItemId)
+            .Distinct()
+            .ToArray();
+        if (_companyRestriction != null)
+        {
+            await _companyRestriction.ValidateTransactionCompanyAsync(
+                "StockEntry", entry.CompanyId,
+                itemIds: itemIds,
+                warehouseIds: warehouseIds);
+        }
+
+        // Per ERPNext PR #60189 (commit 5b1bade8a2): exclude the company's sample retention warehouse from source warehouses
+        var compRepo = _companyRepository ?? LazyServiceProvider?.LazyGetService<IRepository<Company, Guid>>();
+        if (compRepo != null)
+        {
+            var company = await compRepo.FindAsync(entry.CompanyId);
+            if (company?.SampleRetentionWarehouseId != null)
+            {
+                var sampleWarehouseId = company.SampleRetentionWarehouseId.Value;
+                foreach (var item in entry.Items)
+                {
+                    if (item.SourceWarehouseId == sampleWarehouseId)
+                    {
+                        var itemName = (await _itemRepository.FindAsync(item.ItemId))?.ItemName ?? item.ItemId.ToString();
+                        throw new BusinessException(MyERPDomainErrorCodes.CannotConsumeFromSampleRetentionWarehouse)
+                            .WithData("itemName", itemName)
+                            .WithData("warehouseId", sampleWarehouseId);
+                    }
+                }
+            }
+        }
+
+        foreach (var item in entry.Items)
+        {
+            var isTransfer = entry.EntryType is StockEntryType.MaterialTransfer
+                or StockEntryType.MaterialTransferForManufacture
+                or StockEntryType.SendToWarehouse
+                or StockEntryType.SendToSubcontractor
+                or StockEntryType.SubcontractingDelivery
+                or StockEntryType.SubcontractingReturn;
+
+            if (isTransfer)
+            {
+                if (!item.SourceWarehouseId.HasValue)
+                    throw new BusinessException(MyERPDomainErrorCodes.MissingWarehouse)
+                        .WithData("field", "SourceWarehouse");
+
+                if (!item.TargetWarehouseId.HasValue)
+                    throw new BusinessException(MyERPDomainErrorCodes.MissingWarehouse)
+                        .WithData("field", "TargetWarehouse");
+
+                if (item.SourceWarehouseId == item.TargetWarehouseId)
+                    throw new BusinessException(MyERPDomainErrorCodes.SameWarehouseTransfer);
+            }
+
+            var isReceipt = entry.EntryType is StockEntryType.MaterialReceipt
+                or StockEntryType.ReceiveAtWarehouse
+                or StockEntryType.Adjustment;
+
+            if (isReceipt && !item.TargetWarehouseId.HasValue)
+                throw new BusinessException(MyERPDomainErrorCodes.MissingWarehouse)
+                    .WithData("field", "TargetWarehouse");
+
+            // For Manufacture and Repack entries: finished goods and secondary items require TargetWarehouse; raw materials require SourceWarehouse (ERPNext PR #54849, PR #54866, PR #60421)
+            if (entry.EntryType is StockEntryType.Manufacture)
+            {
+                if (item.IsFinishedItem || !string.IsNullOrWhiteSpace(item.SecondaryItemType))
+                {
+                    if (item.SourceWarehouseId.HasValue) item.SourceWarehouseId = null;
+                    if (!item.TargetWarehouseId.HasValue)
+                        throw new BusinessException(MyERPDomainErrorCodes.MissingWarehouse)
+                            .WithData("field", "TargetWarehouse");
+                }
+                else
+                {
+                    // Output row that is neither finished good nor secondary item (ERPNext PR #60421 / commit 00ca106bf5)
+                    if (item.TargetWarehouseId.HasValue && !item.SourceWarehouseId.HasValue)
+                    {
+                        var rowIdx = entry.Items.ToList().IndexOf(item) + 1;
+                        var itemName = _itemRepository != null ? (await _itemRepository.FindAsync(item.ItemId))?.ItemName : null;
+                        itemName ??= item.ItemId.ToString();
+                        throw new BusinessException(MyERPDomainErrorCodes.ManufactureUnvaluedOutput)
+                            .WithData("row", rowIdx)
+                            .WithData("item", itemName);
+                    }
+
+                    if (item.TargetWarehouseId.HasValue) item.TargetWarehouseId = null;
+                    if (!item.SourceWarehouseId.HasValue)
+                        throw new BusinessException(MyERPDomainErrorCodes.MissingWarehouse)
+                            .WithData("field", "SourceWarehouse");
+                }
+            }
+            else if (entry.EntryType is StockEntryType.Repack)
+            {
+                if (item.IsFinishedItem)
+                {
+                    if (item.SourceWarehouseId.HasValue) item.SourceWarehouseId = null;
+                    if (!item.TargetWarehouseId.HasValue)
+                        throw new BusinessException(MyERPDomainErrorCodes.MissingWarehouse)
+                            .WithData("field", "TargetWarehouse");
+                }
+            }
+            else if (entry.EntryType is StockEntryType.Disassemble)
+            {
+                if (item.IsFinishedItem)
+                {
+                    if (item.TargetWarehouseId.HasValue) item.TargetWarehouseId = null;
+                    if (!item.SourceWarehouseId.HasValue)
+                        throw new BusinessException(MyERPDomainErrorCodes.MissingWarehouse)
+                            .WithData("field", "SourceWarehouse");
+                }
+                else
+                {
+                    if (item.SourceWarehouseId.HasValue) item.SourceWarehouseId = null;
+                    if (!item.TargetWarehouseId.HasValue)
+                        throw new BusinessException(MyERPDomainErrorCodes.MissingWarehouse)
+                            .WithData("field", "TargetWarehouse");
+                }
+            }
+
+            var isIssue = entry.EntryType is StockEntryType.MaterialIssue;
+
+            if (isIssue && !item.SourceWarehouseId.HasValue)
+                throw new BusinessException(MyERPDomainErrorCodes.MissingWarehouse)
+                    .WithData("field", "SourceWarehouse");
+
+            // Group warehouse validation
+            if (item.SourceWarehouseId.HasValue && _warehouseRepository != null)
+            {
+                var source = await _warehouseRepository.FindAsync(item.SourceWarehouseId.Value);
+                if (source?.IsGroup == true)
+                    throw new BusinessException(MyERPDomainErrorCodes.GroupWarehouseCannotReceiveStock)
+                        .WithData("warehouseName", source.Name);
+            }
+
+            if (item.TargetWarehouseId.HasValue && _warehouseRepository != null)
+            {
+                var target = await _warehouseRepository.FindAsync(item.TargetWarehouseId.Value);
+                if (target?.IsGroup == true)
+                    throw new BusinessException(MyERPDomainErrorCodes.GroupWarehouseCannotReceiveStock)
+                        .WithData("warehouseName", target.Name);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Validates all items are active and stock-trackable for stock entries.
+    /// Filters out service items (MaintainStock=false) with a warning.
+    /// </summary>
+    public async Task ValidateItemsAsync(StockEntry entry)
+    {
+        if (!entry.Items.Any())
+            throw new BusinessException(MyERPDomainErrorCodes.DocumentMustHaveItems);
+
+        foreach (var seItem in entry.Items)
+        {
+            var item = await _itemRepository.FindAsync(seItem.ItemId);
+            if (item == null) continue;
+
+            if (!item.IsActive)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ItemInactive)
+                    .WithData("itemCode", item.ItemCode)
+                    .WithData("itemName", item.ItemName);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Validates material transfer qty doesn't exceed the limit for manufacturing.
+    /// Per DO-NOT: "Allow excess material transfer for manufacture beyond required_qty - already_transferred_qty"
+    /// Exception: returns and "Material Transferred" backflush mode.
+    /// </summary>
+    public void ValidateTransferQty(decimal requiredQty, decimal transferredQty, decimal requestedQty,
+        bool isReturn = false, bool isMaterialTransferredMode = false, decimal extraMaterialPercentage = 0m, int qtyPrecision = 6,
+        decimal? consumedQty = null)
+    {
+        if (isReturn)
+        {
+            // Per ERPNext PR #59616 / commit 73cb8718a9: component return cannot exceed unconsumed materials in WIP
+            if (consumedQty.HasValue)
+            {
+                var returnableQty = Math.Max(0, transferredQty - consumedQty.Value);
+                var roundedReturnRequest = Math.Round(requestedQty, qtyPrecision);
+                var roundedReturnable = Math.Round(returnableQty, qtyPrecision);
+                if (roundedReturnRequest > roundedReturnable)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                        .WithData("detail", $"Return quantity {requestedQty} cannot exceed available unconsumed quantity {returnableQty}.");
+                }
+            }
+            return;
+        }
+
+        if (isMaterialTransferredMode) return;
+
+        var extraQty = extraMaterialPercentage > 0 ? (requiredQty * extraMaterialPercentage / 100m) : 0m;
+        var maxAllowedTotal = requiredQty + extraQty;
+
+        var roundedRequest = Math.Round(requestedQty, qtyPrecision);
+        var roundedPending = Math.Round(maxAllowedTotal - transferredQty, qtyPrecision);
+        var allowed = roundedPending < 0 ? 0m : roundedPending;
+
+        if (roundedRequest > allowed)
+        {
+            throw new BusinessException("MyERP:05030")
+                .WithData("required", requiredQty)
+                .WithData("transferred", transferredQty)
+                .WithData("requested", requestedQty)
+                .WithData("allowed", allowed);
+        }
+    }
+
+    /// <summary>
+    /// Validates that Stock Entry rows linked to Material Request rows match the MR Item.
+    /// Per ERPNext PR #59679 (commit bd4bf5ee25): unlinked rows must not abort validation of subsequent rows.
+    /// </summary>
+    public async Task ValidateMaterialRequestItemsAsync(
+        StockEntry entry,
+        IRepository<MaterialRequest, Guid> mrRepository)
+    {
+        var mrLinkedRows = entry.Items.Where(i => i.MaterialRequestItemId.HasValue).ToList();
+        if (!mrLinkedRows.Any())
+            return;
+
+        var mrItemIds = mrLinkedRows.Select(i => i.MaterialRequestItemId!.Value).Distinct().ToList();
+        var mrQuery = await mrRepository.GetQueryableAsync();
+        var affectedMRs = mrQuery.Where(mr => mr.Items.Any(i => mrItemIds.Contains(i.Id))).ToList();
+        var mrItemMap = affectedMRs.SelectMany(mr => mr.Items).ToDictionary(i => i.Id);
+
+        for (int idx = 0; idx < entry.Items.Count; idx++)
+        {
+            var row = entry.Items[idx];
+            if (!row.MaterialRequestItemId.HasValue)
+                continue; // ERPNext PR #59679 / commit bd4bf5ee25: skip unlinked row, do not return!
+
+            if (!mrItemMap.TryGetValue(row.MaterialRequestItemId.Value, out var mrItem))
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.MaterialRequestItemNotFound)
+                    .WithData("materialRequestItemId", row.MaterialRequestItemId.Value);
+            }
+
+            if (mrItem.ItemId != row.ItemId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Item for row {idx + 1} does not match Material Request.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Validates Work Order status for stock entries.
+    /// Refuses new MaterialTransferForManufacture and Manufacture stock entries against a Closed Work Order.
+    /// Per ERPNext PR #60647 / commit f9d019aa90.
+    /// Also refuses transactions against Stopped Work Orders.
+    /// </summary>
+    public void ValidateWorkOrderStatus(StockEntry entry, WorkOrder? wo)
+    {
+        if (!entry.WorkOrderId.HasValue || wo == null)
+            return;
+
+        if (wo.Status == WorkOrderStatus.Stopped)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("detail", $"Transaction not allowed against stopped Work Order {wo.WorkOrderNumber ?? wo.Id.ToString()}");
+        }
+
+        if (wo.Status == WorkOrderStatus.Closed &&
+            !entry.IsReturn &&
+            (entry.EntryType == StockEntryType.MaterialTransferForManufacture || entry.EntryType == StockEntryType.Manufacture))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.StockEntryAgainstClosedWorkOrder)
+                .WithData("workOrder", wo.WorkOrderNumber ?? wo.Id.ToString())
+                .WithData("detail", $"Transaction not allowed against closed Work Order {wo.WorkOrderNumber ?? wo.Id.ToString()}");
+        }
+    }
+
+    /// <summary>
+    /// Validates that component returns against a Work Order are allowed only after the Work Order is Completed or Closed.
+    /// Per ERPNext PR #59617 (commit b4d6595f94).
+    /// </summary>
+    public void ValidateWorkOrderStatusForReturn(StockEntry entry, WorkOrder? wo)
+    {
+        if (!entry.IsReturn || !entry.WorkOrderId.HasValue || wo == null)
+            return;
+
+        if (wo.Status is not (WorkOrderStatus.Completed or WorkOrderStatus.Closed))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("detail", $"Components can be returned only after Work Order {wo.WorkOrderNumber ?? wo.Id.ToString()} is Completed or Closed");
+        }
+    }
+
+    /// <summary>
+    /// Validates component return quantities against unconsumed transferred materials in a Work Order.
+    /// Per ERPNext PR #59616 and PR #60421 (commit 00ca106bf5): aggregates returned qty across rows by item
+    /// and ensures it does not exceed unconsumed transferred quantity.
+    /// </summary>
+    public void ValidateWorkOrderReturnItems(StockEntry entry, WorkOrder? wo)
+    {
+        if (!entry.IsReturn || !entry.WorkOrderId.HasValue || wo == null)
+            return;
+
+        var returnedByItem = entry.Items
+            .Where(i => i.SourceWarehouseId.HasValue)
+            .GroupBy(i => i.ItemId)
+            .ToDictionary(g => g.Key, g => g.Sum(i => i.Quantity * (i.ConversionFactor > 0 ? i.ConversionFactor : 1m)));
+
+        foreach (var (itemId, returnedQty) in returnedByItem)
+        {
+            var matchingItems = wo.RequiredItems.Where(ri => ri.ItemId == itemId).ToList();
+            var returnable = matchingItems.Sum(ri => Math.Max(0m, ri.TransferredQuantity - ri.ConsumedQuantity));
+            var existingWoItem = matchingItems.FirstOrDefault();
+
+            if (returnedQty > returnable)
+            {
+                var itemName = existingWoItem?.ItemName ?? itemId.ToString();
+                throw new BusinessException(MyERPDomainErrorCodes.WorkOrderExcessReturn)
+                    .WithData("item", itemName)
+                    .WithData("returned", returnedQty)
+                    .WithData("workOrder", wo.WorkOrderNumber ?? wo.Id.ToString())
+                    .WithData("unconsumed", returnable);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Checks whether <paramref name="alternativeItemId"/> is a registered alternative for <paramref name="originalItemId"/>
+    /// (either direct 1-way or reverse 2-way).
+    /// Maps to ERPNext stock/doctype/item_alternative/item_alternative.py: is_alternative_item (PR #60130 / commit 3b014ad602).
+    /// </summary>
+    public static bool IsAlternativeItem(
+        Guid originalItemId,
+        Guid alternativeItemId,
+        IEnumerable<ItemAlternative> alternatives)
+    {
+        if (originalItemId == Guid.Empty || alternativeItemId == Guid.Empty || alternatives == null)
+            return false;
+
+        return alternatives.Any(a =>
+            (a.ItemId == originalItemId && a.AlternativeItemId == alternativeItemId) ||
+            (a.ItemId == alternativeItemId && a.AlternativeItemId == originalItemId && a.TwoWay));
+    }
+
+    /// <summary>
+    /// Validates alternative item substitutions on Work Order Stock Entries
+    /// (MaterialTransferForManufacture, Manufacture, MaterialConsumptionForManufacture).
+    /// If an alternative item pair was already transferred in a submitted non-return MaterialTransferForManufacture
+    /// entry for the Work Order, consuming or returning it is permitted even if alternative approval was later removed.
+    /// Maps to ERPNext stock/doctype/stock_entry/stock_entry.py: validate_work_order_alternative_items (PR #60130 / commit 3b014ad602).
+    /// </summary>
+    public void ValidateWorkOrderAlternativeItems(
+        StockEntry entry,
+        WorkOrder? wo,
+        IEnumerable<ItemAlternative> alternatives,
+        IEnumerable<StockEntry>? submittedWorkOrderEntries = null,
+        IReadOnlyDictionary<Guid, string>? itemCodeMap = null)
+    {
+        if (!entry.WorkOrderId.HasValue || wo == null)
+            return;
+
+        if (entry.EntryType is not (
+            StockEntryType.MaterialTransferForManufacture or
+            StockEntryType.Manufacture or
+            StockEntryType.MaterialConsumptionForManufacture))
+        {
+            return;
+        }
+
+        var transferredAlternativePairs = new HashSet<(Guid OriginalItemId, Guid AlternativeItemId)>();
+        if (submittedWorkOrderEntries != null)
+        {
+            foreach (var se in submittedWorkOrderEntries)
+            {
+                if (se.Id == entry.Id ||
+                    se.WorkOrderId != wo.Id ||
+                    se.EntryType != StockEntryType.MaterialTransferForManufacture ||
+                    se.IsReturn ||
+                    se.Status is not (Core.DocumentStatus.Submitted or Core.DocumentStatus.Posted))
+                {
+                    continue;
+                }
+
+                foreach (var item in se.Items)
+                {
+                    if (item.OriginalItemId.HasValue && item.OriginalItemId.Value != item.ItemId)
+                    {
+                        transferredAlternativePairs.Add((item.OriginalItemId.Value, item.ItemId));
+                    }
+                }
+            }
+        }
+
+        var canUseAlreadyTransferred =
+            entry.EntryType is StockEntryType.Manufacture or StockEntryType.MaterialConsumptionForManufacture ||
+            (entry.EntryType == StockEntryType.MaterialTransferForManufacture && entry.IsReturn);
+
+        var altList = alternatives?.ToList() ?? new List<ItemAlternative>();
+
+        for (int idx = 0; idx < entry.Items.Count; idx++)
+        {
+            var row = entry.Items[idx];
+            if (!row.OriginalItemId.HasValue || row.OriginalItemId.Value == row.ItemId)
+                continue;
+
+            var pair = (row.OriginalItemId.Value, row.ItemId);
+            if (canUseAlreadyTransferred && transferredAlternativePairs.Contains(pair))
+                continue;
+
+            if (!wo.AllowAlternativeItem)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.WorkOrderDoesNotAllowAlternativeItems)
+                    .WithData("row", idx + 1)
+                    .WithData("workOrder", wo.WorkOrderNumber ?? wo.Id.ToString());
+            }
+
+            if (!IsAlternativeItem(row.OriginalItemId.Value, row.ItemId, altList))
+            {
+                var altCode = itemCodeMap != null && itemCodeMap.TryGetValue(row.ItemId, out var ac) ? ac : row.ItemId.ToString();
+                var origCode = itemCodeMap != null && itemCodeMap.TryGetValue(row.OriginalItemId.Value, out var oc) ? oc : row.OriginalItemId.Value.ToString();
+
+                throw new BusinessException(MyERPDomainErrorCodes.ItemIsNotAlternativeOfOriginal)
+                    .WithData("row", idx + 1)
+                    .WithData("item", altCode)
+                    .WithData("originalItem", origCode);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Calculates the effective finished goods completed quantity covered by transferred raw materials.
+    /// Per ERPNext PR #58482 (commit b90e3d4656):
+    /// When transferring materials against a Work Order or Job Card, caps fg_completed_qty
+    /// to the minimum coverage across all required raw material lines.
+    /// </summary>
+    public decimal CalculateMaterialCoverage(
+        decimal targetFgQty,
+        IReadOnlyDictionary<Guid, decimal> requiredQuantities,
+        IReadOnlyDictionary<Guid, decimal> transferredQuantities)
+    {
+        if (targetFgQty <= 0 || requiredQuantities.Count == 0)
+            return 0;
+
+        var coverages = new List<decimal>();
+        foreach (var (itemId, reqQty) in requiredQuantities)
+        {
+            if (reqQty <= 0) continue;
+            var transferred = transferredQuantities.TryGetValue(itemId, out var t) ? t : 0m;
+            var proportion = transferred / reqQty;
+            coverages.Add(proportion * targetFgQty);
+        }
+
+        if (coverages.Count == 0)
+            return targetFgQty;
+
+        var minCoverage = coverages.Min();
+        return Math.Round(Math.Min(targetFgQty, Math.Max(0, minCoverage)), 4);
+    }
+
+    /// <summary>
+    /// Calculates the incremental finished goods completed quantity covered by this transfer entry.
+    /// Per ERPNext PR #58382 (commit 5fa68dd068):
+    /// covered_by_entry = max(0, covered_after - covered_before).
+    /// </summary>
+    public decimal CalculateIncrementalMaterialCoverage(
+        decimal targetFgQty,
+        IReadOnlyDictionary<Guid, decimal> requiredQuantities,
+        IReadOnlyDictionary<Guid, decimal> alreadyTransferredQuantities,
+        IReadOnlyDictionary<Guid, decimal> entryTransferredQuantities)
+    {
+        var beforeCoverage = CalculateMaterialCoverage(targetFgQty, requiredQuantities, alreadyTransferredQuantities);
+
+        var totalTransferred = new Dictionary<Guid, decimal>();
+        foreach (var (id, req) in requiredQuantities)
+        {
+            var already = alreadyTransferredQuantities.TryGetValue(id, out var a) ? a : 0m;
+            var entry = entryTransferredQuantities.TryGetValue(id, out var e) ? e : 0m;
+            totalTransferred[id] = already + entry;
+        }
+
+        var afterCoverage = CalculateMaterialCoverage(targetFgQty, requiredQuantities, totalTransferred);
+        return Math.Max(0, afterCoverage - beforeCoverage);
+    }
+
+    /// <summary>
+    /// Validates Repack Stock Entry rules.
+    /// Per ERPNext: Repack converts items from one form to another (split/merge/repackage).
+    /// 
+    /// Rules:
+    /// 1. Must have at least one outgoing (source) and one incoming (target/FG) item
+    /// 2. Items with only TargetWarehouse are FG (marked IsFinishedItem=true)
+    /// 3. Items with only SourceWarehouse are consumed materials
+    /// 4. Multiple FG items require SetBasicRateManually=true on each FG
+    /// 5. Both source and target warehouse allowed on same item (transfer+repack)
+    /// </summary>
+    public void ValidateRepackItems(StockEntry entry)
+    {
+        if (entry.EntryType != StockEntryType.Repack) return;
+
+        var outgoingItems = entry.Items.Where(i => i.SourceWarehouseId.HasValue).ToList();
+        var incomingItems = entry.Items.Where(i => i.TargetWarehouseId.HasValue && !i.SourceWarehouseId.HasValue).ToList();
+
+        if (!outgoingItems.Any())
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.RepackMissingItems)
+                .WithData("reason", "Repack requires at least one outgoing (source) item");
+        }
+
+        if (!incomingItems.Any())
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.RepackMissingItems)
+                .WithData("reason", "Repack requires at least one incoming (target/finished) item");
+        }
+
+        // Multiple FG items require manual rate setting
+        if (incomingItems.Count > 1)
+        {
+            foreach (var fg in incomingItems)
+            {
+                if (!fg.SetBasicRateManually)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.RepackMultiFgManualRate)
+                        .WithData("reason", "Multiple finished goods in Repack require SetBasicRateManually=true on each item");
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Validates Manufacture Stock Entry rules.
+    /// Per ERPNext stock_entry.py:
+    /// 1. Only ONE unique finished item is allowed per Manufacture entry.
+    /// 2. For Quantity (Manufactured Qty / FgCompletedQty) is mandatory when linked to a Work Order (PR #58005).
+    /// </summary>
+    public void ValidateManufactureItems(StockEntry entry, bool trackSemiFinishedGoods = false)
+    {
+        if (entry.EntryType != StockEntryType.Manufacture && entry.EntryType != StockEntryType.MaterialConsumptionForManufacture) return;
+
+        if (entry.EntryType == StockEntryType.Manufacture)
+        {
+            // Per ERPNext PR #61950 (commit 28c89dba2a): ensure at least one finished good row exists
+            var hasFgItem = entry.Items.Any(i => i.IsFinishedItem || (i.TargetWarehouseId.HasValue && !i.SourceWarehouseId.HasValue && string.IsNullOrWhiteSpace(i.SecondaryItemType)));
+            if (entry.Items.Any() && !hasFgItem)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", "There must be at least 1 Finished Good in a Manufacture stock entry.");
+            }
+
+            // Per ERPNext PR #60421 / commit 00ca106bf5:
+            // Output rows received into target warehouse must be either finished good or secondary item
+            var hasExplicitFg = entry.Items.Any(i => i.IsFinishedItem);
+            foreach (var item in entry.Items)
+            {
+                if (item.TargetWarehouseId.HasValue && !item.SourceWarehouseId.HasValue)
+                {
+                    if (hasExplicitFg && !item.IsFinishedItem && string.IsNullOrWhiteSpace(item.SecondaryItemType))
+                    {
+                        throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                            .WithData("detail", $"Item {item.ItemId} is received but is neither the finished good nor a secondary item. Set its Secondary Item Type or remove the row.");
+                    }
+                }
+            }
+
+            var distinctFgItemCount = entry.Items
+                .Where(i => i.TargetWarehouseId.HasValue && !i.SourceWarehouseId.HasValue && (i.IsFinishedItem || string.IsNullOrWhiteSpace(i.SecondaryItemType)))
+                .Select(i => i.ItemId)
+                .Distinct()
+                .Count();
+
+            if (distinctFgItemCount > 1)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ManufactureMultiFgItemsNotAllowed);
+            }
+
+            // Per ERPNext PR #59881 (commit 8148dd486b / commit 4029c1198a):
+            // Reject manual costs above the consumed raw material cost when there are remaining FG rows
+            var rawMaterialCost = entry.Items
+                .Where(i => i.SourceWarehouseId.HasValue && !i.IsFinishedItem)
+                .Sum(i => i.Quantity * (i.ValuationRate ?? 0m));
+
+            var manualFgCost = entry.Items
+                .Where(i => (i.IsFinishedItem || !i.SourceWarehouseId.HasValue)
+                    && i.TargetWarehouseId.HasValue
+                    && i.SetBasicRateManually
+                    && !i.AllowZeroValuationRate)
+                .Sum(i => i.Quantity * (i.ValuationRate ?? 0m));
+
+            var hasDerivedFg = entry.Items.Any(i =>
+                (i.IsFinishedItem || !i.SourceWarehouseId.HasValue)
+                && i.TargetWarehouseId.HasValue
+                && !i.SetBasicRateManually
+                && !i.AllowZeroValuationRate);
+
+            if (hasDerivedFg && rawMaterialCost > 0 && manualFgCost > rawMaterialCost)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Total value of manually rated finished good rows ({manualFgCost}) exceeds the total consumed raw material cost ({rawMaterialCost}).");
+            }
+        }
+
+        // Per ERPNext PR #58005: mandatory manufactured qty check for manufacture entries
+        if (entry.EntryType == StockEntryType.Manufacture && entry.WorkOrderId.HasValue && !trackSemiFinishedGoods && entry.FgCompletedQty <= 0)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "For Quantity (Manufactured Qty) is mandatory for Work Order manufacture stock entries.");
+        }
+    }
+
+    /// <summary>
+    /// Blocks another manufacture entry once existing entries already cover the work order qty plus allowance.
+    /// Per ERPNext PR #58004 / PR #58005 (commits 22fa520500, 492ee05727):
+    /// Gated to work orders without track_semi_finished_goods.
+    /// </summary>
+    public async Task ValidateDuplicateManufactureEntryAsync(
+        StockEntry entry,
+        IRepository<Manufacturing.Entities.WorkOrder, Guid> woRepository,
+        IRepository<StockEntry, Guid> stockEntryRepository,
+        decimal overproductionPercentage = 0m)
+    {
+        if (entry.EntryType != StockEntryType.Manufacture || !entry.WorkOrderId.HasValue)
+            return;
+
+        var wo = await woRepository.FindAsync(entry.WorkOrderId.Value);
+        if (wo == null || wo.TrackSemiFinishedGoods)
+            return;
+
+        var seQuery = await stockEntryRepository.GetQueryableAsync();
+        var otherEntries = seQuery
+            .Where(se => se.WorkOrderId == entry.WorkOrderId.Value
+                      && se.EntryType == StockEntryType.Manufacture
+                      && se.Status != Core.DocumentStatus.Cancelled
+                      && se.Id != entry.Id)
+            .ToList();
+
+        if (!otherEntries.Any())
+            return;
+
+        var allowedQty = wo.Quantity + (overproductionPercentage / 100m * wo.Quantity);
+
+        // Per ERPNext PR #58004 / PR #58005 (commits 22fa520500, 492ee05727):
+        // Block duplicate manufacture entries when existing non-cancelled entries already cover the work order qty plus allowance.
+        var alreadyEnteredFgQty = otherEntries.Sum(se =>
+        {
+            var fg = se.Items
+                .Where(i => i.ItemId == wo.ItemId && i.TargetWarehouseId.HasValue && !i.SourceWarehouseId.HasValue)
+                .Sum(i => i.Quantity);
+            var loss = se.ProcessLossQty > 0 ? se.ProcessLossQty : Math.Max(0, se.FgCompletedQty - fg);
+            return fg + loss;
+        });
+
+        if (alreadyEnteredFgQty >= allowedQty)
+        {
+            var otherEntryNumbers = string.Join(", ", otherEntries.Select(e => e.EntryNumber));
+            throw new BusinessException(MyERPDomainErrorCodes.DuplicateRecord)
+                .WithData("detail", $"Stock Entries already created for Work Order {wo.WorkOrderNumber ?? wo.Id.ToString()}: {otherEntryNumbers}");
+        }
+    }
+
+    /// <summary>
+    /// Validates manufactured quantity is set (> 0) on manufacture stock entries.
+    /// Per ERPNext PR #58005 (commit b6ca708d9f): Without fg_completed_qty, submit
+    /// never updates or validates the work order's produced qty.
+    /// </summary>
+    public void ValidateManufacturedQty(StockEntry entry, Manufacturing.Entities.WorkOrder? wo = null)
+    {
+        if (entry.EntryType != StockEntryType.Manufacture)
+            return;
+
+        if (!entry.WorkOrderId.HasValue)
+            return;
+
+        if (wo != null && wo.TrackSemiFinishedGoods)
+            return;
+
+        if (entry.FgCompletedQty <= 0)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "For Quantity (Manufactured Qty) is mandatory for manufacture stock entries.");
+        }
+    }
+
+    /// <summary>
+    /// Validates that operations (Job Cards) for a Work Order have completed sufficient quantity
+    /// before allowing a Manufacture or Material Consumption for Manufacture Stock Entry.
+    /// Per ERPNext PR #58000 / commit 401eb30963 & 26a05044c0:
+    /// Gated to work orders without track_semi_finished_goods.
+    /// Non-corrective, non-cancelled job cards are evaluated per operation.
+    /// Total completed qty (entry.FgCompletedQty + wo.ProducedQuantity) must not exceed
+    /// allowed qty: opCompletedQty + opProcessLossQty + (allowancePct / 100 * opCompletedQty).
+    /// </summary>
+    public async Task ValidateOperationsCompletedAsync(
+        StockEntry entry,
+        IRepository<Manufacturing.Entities.WorkOrder, Guid> woRepository,
+        IRepository<Manufacturing.Entities.JobCard, Guid> jobCardRepository,
+        decimal overproductionPercentage = 0m)
+    {
+        if (!entry.WorkOrderId.HasValue)
+            return;
+
+        if (entry.EntryType != StockEntryType.Manufacture &&
+            entry.EntryType != StockEntryType.MaterialConsumptionForManufacture)
+            return;
+
+        var wo = await woRepository.FindAsync(entry.WorkOrderId.Value);
+        if (wo == null || wo.TrackSemiFinishedGoods)
+            return;
+
+        var jcQuery = await jobCardRepository.GetQueryableAsync();
+        var jobCards = jcQuery
+            .Where(jc => jc.WorkOrderId == entry.WorkOrderId.Value &&
+                         jc.Status != Manufacturing.JobCardStatus.Cancelled &&
+                         !jc.IsCorrective)
+            .ToList();
+
+        if (!jobCards.Any())
+            return;
+
+        var totalCompletedQty = Math.Round(entry.FgCompletedQty + wo.ProducedQuantity, 4);
+
+        // Group job cards by operation
+        var opGroups = jobCards.GroupBy(jc => jc.BomOperationId ?? jc.OperationId);
+
+        foreach (var group in opGroups)
+        {
+            var opCompletedQty = group.Sum(jc => jc.CompletedQty);
+            var opProcessLossQty = group.Sum(jc => jc.ProcessLossQty);
+            var allowedQty = Math.Round(
+                opCompletedQty + opProcessLossQty + (overproductionPercentage / 100m * opCompletedQty), 4);
+
+            if (totalCompletedQty > allowedQty)
+            {
+                var activeJc = group.FirstOrDefault();
+                throw new BusinessException(MyERPDomainErrorCodes.OperationsNotComplete)
+                    .WithData("workOrder", wo.WorkOrderNumber ?? wo.Id.ToString())
+                    .WithData("totalCompletedQty", totalCompletedQty)
+                    .WithData("allowedQty", allowedQty)
+                    .WithData("jobCardId", activeJc?.Id.ToString() ?? string.Empty)
+                    .WithData("detail", $"Operation is not completed for {totalCompletedQty} qty of finished goods in Work Order {wo.WorkOrderNumber ?? wo.Id.ToString()}. Please update operation status via Job Card {activeJc?.Id}.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Qty of the received finished good rows whose rate is derived from the consumed cost.
+    /// Manual and zero-valued rows take no share, so the others carry the whole cost (PR #59881 / commit 37f16db9d8).
+    /// </summary>
+    public static decimal GetFinishedItemsQty(IEnumerable<StockEntryItem> items)
+    {
+        return items
+            .Where(d => (d.IsFinishedItem || (!d.SourceWarehouseId.HasValue && string.IsNullOrWhiteSpace(d.SecondaryItemType)))
+                && d.TargetWarehouseId.HasValue
+                && !d.SetBasicRateManually
+                && !d.AllowZeroValuationRate)
+            .Sum(d => d.Quantity);
+    }
+
+    /// <summary>
+    /// Calculates valuation rate for Repack FG items.
+    /// Derived rate is split over all eligible finished good rows (PR #59881).
+    /// Takes manual finished good value and scrap out of repack cost (PR #60421 / commit 00ca106bf5).
+    /// </summary>
+    public decimal CalculateRepackFgRate(IReadOnlyList<StockEntryItem> items, decimal? fgQty = null)
+    {
+        var resolvedFgQty = fgQty.HasValue && fgQty.Value > 0 ? fgQty.Value : GetFinishedItemsQty(items);
+        if (resolvedFgQty <= 0) return 0;
+
+        var totalOutgoingCost = items
+            .Where(i => i.SourceWarehouseId.HasValue && !i.IsFinishedItem)
+            .Sum(i => i.Quantity * (i.ValuationRate ?? 0));
+
+        var manualCost = items
+            .Where(d => (d.IsFinishedItem || !d.SourceWarehouseId.HasValue)
+                && d.TargetWarehouseId.HasValue
+                && d.SetBasicRateManually
+                && !d.AllowZeroValuationRate)
+            .Sum(d => d.Quantity * (d.ValuationRate ?? 0m));
+
+        var scrapCost = items
+            .Where(d => d.TargetWarehouseId.HasValue
+                && !d.SourceWarehouseId.HasValue
+                && !d.IsFinishedItem
+                && !string.IsNullOrWhiteSpace(d.SecondaryItemType))
+            .Sum(d => d.Quantity * (d.ValuationRate ?? 0m));
+
+        var netOutgoingCost = Math.Max(0m, totalOutgoingCost - scrapCost - manualCost);
+        return Math.Round(netOutgoingCost / resolvedFgQty, 4);
+    }
+
+    /// <summary>
+    /// Calculates basic valuation rate for manufactured FG item(s).
+    /// Cost is split over all eligible finished good rows (PR #59881 / commit 37f16db9d8).
+    /// Deducts value of manually-rated finished good rows (commit 8148dd486b).
+    /// Retains co-product cost share for co-products not made (PR #60421 / commit 00ca106bf5).
+    /// Per ERPNext PR #57334: when inputs are consumed at zero cost (e.g. free raw materials),
+    /// rate remains zero (plus additional operating cost) and must not fall back to BOM or standard rates.
+    /// </summary>
+    public decimal CalculateManufactureFgRate(
+        IReadOnlyList<StockEntryItem> items,
+        decimal? fgQty = null,
+        decimal additionalOperatingCost = 0m,
+        decimal? bomEstimatedCost = null,
+        bool viaRepost = false,
+        decimal costAllocationPercentage = 100m)
+    {
+        var resolvedFgQty = fgQty.HasValue && fgQty.Value > 0 ? fgQty.Value : GetFinishedItemsQty(items);
+        if (resolvedFgQty <= 0) return 0m;
+
+        var rawMaterialItems = items.Where(i => i.SourceWarehouseId.HasValue && !i.IsFinishedItem).ToList();
+        var hasConsumptionBasis = rawMaterialItems.Count > 0;
+
+        var outgoingCost = rawMaterialItems.Sum(i => i.Quantity * (i.ValuationRate ?? 0m));
+
+        var manualCost = items
+            .Where(d => (d.IsFinishedItem || !d.SourceWarehouseId.HasValue)
+                && d.TargetWarehouseId.HasValue
+                && d.SetBasicRateManually
+                && !d.AllowZeroValuationRate)
+            .Sum(d => d.Quantity * (d.ValuationRate ?? 0m));
+
+        if (!hasConsumptionBasis && bomEstimatedCost.HasValue && manualCost <= 0)
+        {
+            outgoingCost = bomEstimatedCost.Value;
+        }
+
+        var costLeft = outgoingCost - manualCost;
+        if (costAllocationPercentage < 100m && costAllocationPercentage >= 0m)
+        {
+            costLeft *= (costAllocationPercentage / 100m);
+        }
+
+        if (viaRepost || costLeft < 0)
+        {
+            costLeft = Math.Max(costLeft, 0m);
+        }
+
+        var totalFgCost = costLeft + additionalOperatingCost;
+        return Math.Round(Math.Max(totalFgCost, 0m) / resolvedFgQty, 4);
+    }
+
+    /// <summary>
+    /// Computes cost allocation percentage for finished goods, giving it the share of co-products not made.
+    /// Per ERPNext PR #60421 / commit 00ca106bf5: if co-products defined in BOM are omitted in the Stock Entry,
+    /// their cost share is retained by the finished good instead of being lost.
+    /// </summary>
+    public decimal GetFinishedGoodCostAllocationPercentage(
+        IReadOnlyList<StockEntryItem> items,
+        IReadOnlyList<(Guid BomSecondaryItemId, decimal CostAllocationPercentage)> bomSecondaryItems)
+    {
+        var presentBomSecondaryItemIds = items
+            .Where(i => i.BomSecondaryItemId.HasValue && i.Quantity > 0)
+            .Select(i => i.BomSecondaryItemId!.Value)
+            .ToHashSet();
+
+        if (presentBomSecondaryItemIds.Count == 0 || bomSecondaryItems == null || bomSecondaryItems.Count == 0)
+        {
+            return 100m;
+        }
+
+        var allocatedPer = bomSecondaryItems
+            .Where(b => presentBomSecondaryItemIds.Contains(b.BomSecondaryItemId))
+            .Sum(b => b.CostAllocationPercentage);
+
+        return Math.Max(0m, 100m - allocatedPer);
+    }
+
+    /// <summary>
+    /// Validates Disassemble Stock Entry rules.
+    /// Per ERPNext: Disassemble reverses a Manufacture entry — breaks FG back into components.
+    /// 
+    /// Rules:
+    /// 1. Must have a source stock entry (the original Manufacture entry)
+    /// 2. FG consumption qty cannot exceed source manufacture FG qty
+    /// 3. Material output qty must follow scale factor: source_row_qty × (disassemble_qty / source_fg_qty)
+    /// 4. Cannot disassemble from a different Work Order's stock entry
+    /// </summary>
+    public void ValidateDisassembleItems(StockEntry entry, StockEntry? sourceEntry)
+    {
+        if (entry.EntryType != StockEntryType.Disassemble) return;
+
+        if (sourceEntry == null && entry.SourceStockEntryId.HasValue)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.DisassembleSourceNotFound)
+                .WithData("reason", "Source manufacture stock entry not found");
+        }
+
+        if (sourceEntry != null)
+        {
+            // Cross-WO guard
+            if (entry.WorkOrderId.HasValue && sourceEntry.WorkOrderId.HasValue
+                && entry.WorkOrderId != sourceEntry.WorkOrderId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.DisassembleCrossWorkOrder)
+                    .WithData("reason", "Cannot disassemble from a different Work Order's stock entry");
+            }
+
+            // FG consumption must not exceed source FG qty
+            if (entry.FgCompletedQty > sourceEntry.FgCompletedQty)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.DisassembleQtyExceedsSource)
+                    .WithData("disassembleQty", entry.FgCompletedQty)
+                    .WithData("sourceQty", sourceEntry.FgCompletedQty)
+                    .WithData("reason", "Disassemble qty exceeds source manufacture FG qty");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Validates scale factor for Disassemble items against source entry.
+    /// Per PR #57710: quantities are aggregated in stock UOM (using StockQty) to avoid
+    /// cross-UOM mismatches when the same item appears across manufacture entries in different UOMs.
+    /// Every non-FG row's stock qty must equal: source_stock_qty × (disassemble_qty / source_fg_qty).
+    /// Tolerance: 1/(10^precision) for float rounding only.
+    /// </summary>
+    public void ValidateDisassembleScaleFactor(
+        IReadOnlyList<StockEntryItem> disassemblyItems,
+        IReadOnlyList<StockEntryItem> sourceItems,
+        decimal disassembleQty,
+        decimal sourceFgQty,
+        int precision = 4)
+    {
+        if (sourceFgQty <= 0) return;
+
+        var scaleFactor = disassembleQty / sourceFgQty;
+        var tolerance = 1m / (decimal)Math.Pow(10, precision);
+
+        var groupedDisassembly = disassemblyItems
+            .Where(i => !i.IsFinishedItem)
+            .GroupBy(i => (i.SourceStockEntryDetailId, i.ItemId));
+
+        foreach (var group in groupedDisassembly)
+        {
+            decimal sourceStockQty;
+            if (group.Key.SourceStockEntryDetailId.HasValue)
+            {
+                var sourceItem = sourceItems.FirstOrDefault(s => s.Id == group.Key.SourceStockEntryDetailId.Value);
+                if (sourceItem == null) continue;
+                sourceStockQty = sourceItem.StockQty;
+            }
+            else
+            {
+                var matchingSource = sourceItems.Where(s => s.ItemId == group.Key.ItemId && !s.IsFinishedItem).ToList();
+                if (matchingSource.Count == 0) continue;
+                sourceStockQty = matchingSource.Sum(s => s.StockQty);
+            }
+
+            // Per PR #57710 & commits b9121c2188/54fcf4abd5: compare aggregated StockQty across batch-split rows
+            var actualStockQty = group.Sum(i => i.StockQty);
+            var expectedStockQty = Math.Round(sourceStockQty * scaleFactor, precision);
+            var diff = Math.Abs(actualStockQty - expectedStockQty);
+
+            if (diff > tolerance)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.DisassembleScaleFactorMismatch)
+                    .WithData("itemId", group.Key.ItemId)
+                    .WithData("expectedQty", expectedStockQty)
+                    .WithData("actualQty", actualStockQty)
+                    .WithData("scaleFactor", scaleFactor);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Validates standalone BOM disassembly rows against the BOM when no source manufacture entry is referenced.
+    /// Per ERPNext PR #60421 / commit 00ca106bf5: checks that every disassembled component belongs to the BOM
+    /// and its received quantity matches BOM quantity * fgCompletedQty.
+    /// </summary>
+    public void ValidateDisassembleMaterialsAgainstBom(
+        StockEntry entry,
+        IReadOnlyList<(Guid ItemId, decimal Qty)> bomItems,
+        int precision = 4)
+    {
+        if (entry.EntryType != StockEntryType.Disassemble || entry.SourceStockEntryId.HasValue)
+            return;
+
+        if (bomItems == null || bomItems.Count == 0 || entry.FgCompletedQty <= 0)
+            return;
+
+        var expectedQtyMap = bomItems.ToDictionary(
+            b => b.ItemId,
+            b => Math.Round(b.Qty * entry.FgCompletedQty, precision));
+
+        var tolerance = 1m / (decimal)Math.Pow(10, precision);
+
+        var receivedComponents = entry.Items
+            .Where(i => i.TargetWarehouseId.HasValue && !i.IsFinishedItem)
+            .GroupBy(i => i.ItemId)
+            .ToDictionary(g => g.Key, g => g.Sum(i => i.Quantity * (i.ConversionFactor > 0 ? i.ConversionFactor : 1m)));
+
+        foreach (var (itemId, actualQty) in receivedComponents)
+        {
+            if (!expectedQtyMap.TryGetValue(itemId, out var expectedQty))
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.DisassembleItemNotInBom)
+                    .WithData("itemId", itemId);
+            }
+
+            if (Math.Abs(actualQty - expectedQty) > tolerance)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.DisassembleScaleFactorMismatch)
+                    .WithData("itemId", itemId)
+                    .WithData("expectedQty", expectedQty)
+                    .WithData("actualQty", actualQty);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Validates consumed raw material quantities against BOM requirements for a Manufacture Stock Entry.
+    /// Per ERPNext PR #60090 / commit 00efe4e233:
+    /// Aggregates consumed items by OriginalItemId ?? ItemId so that alternative item substitutions
+    /// are verified collectively against the required BOM component quantity.
+    /// </summary>
+    public void ValidateManufactureBomComponentQty(
+        StockEntry entry,
+        IReadOnlyList<(Guid ItemId, string ItemCode, decimal Qty)> bomItems,
+        string? bomNumber = null,
+        int precision = 4)
+    {
+        if (entry.EntryType != StockEntryType.Manufacture || entry.FgCompletedQty <= 0 || bomItems == null || bomItems.Count == 0)
+            return;
+
+        var tolerance = 1m / (decimal)Math.Pow(10, precision);
+
+        var consumedByOriginalItem = entry.Items
+            .Where(i => i.SourceWarehouseId.HasValue && !i.IsFinishedItem && string.IsNullOrWhiteSpace(i.SecondaryItemType))
+            .GroupBy(i => i.OriginalItemId ?? i.ItemId)
+            .ToDictionary(g => g.Key, g => g.Sum(i => i.Quantity));
+
+        foreach (var bomItem in bomItems)
+        {
+            var expectedQty = Math.Round(bomItem.Qty * entry.FgCompletedQty, precision);
+            if (consumedByOriginalItem.TryGetValue(bomItem.ItemId, out var actualQty))
+            {
+                if (Math.Abs(actualQty - expectedQty) > tolerance)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                        .WithData("detail", $"For item {bomItem.ItemCode}, the consumed quantity ({actualQty}) should be {expectedQty} according to BOM {bomNumber ?? "referenced"}.");
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Sets AllowAlternativeItem on raw material rows when both the Work Order and the Item master allow it.
+    /// Per ERPNext PR #60090 / commit 00efe4e233.
+    /// </summary>
+    public async Task SetAllowAlternativeItemAsync(
+        StockEntry entry,
+        IRepository<WorkOrder, Guid> woRepository,
+        IRepository<Item, Guid>? itemRepository = null)
+    {
+        if (!entry.WorkOrderId.HasValue)
+            return;
+
+        if (entry.EntryType != StockEntryType.MaterialTransferForManufacture &&
+            entry.EntryType != StockEntryType.Manufacture &&
+            entry.EntryType != StockEntryType.MaterialConsumptionForManufacture)
+            return;
+
+        var wo = await woRepository.FindAsync(entry.WorkOrderId.Value);
+        if (wo == null || !wo.AllowAlternativeItem)
+        {
+            foreach (var item in entry.Items.Where(i => i.SourceWarehouseId.HasValue && !i.IsFinishedItem))
+            {
+                item.AllowAlternativeItem = false;
+            }
+            return;
+        }
+
+        var sourceItems = entry.Items
+            .Where(i => i.SourceWarehouseId.HasValue && !i.IsFinishedItem)
+            .ToList();
+
+        if (!sourceItems.Any()) return;
+
+        var itemIdsToCheck = sourceItems
+            .Select(i => i.OriginalItemId ?? i.ItemId)
+            .Distinct()
+            .ToList();
+
+        var itemRepo = itemRepository ?? _itemRepository;
+        var itemQuery = await itemRepo.GetQueryableAsync();
+        var allowedItemIds = itemQuery
+            .Where(i => itemIdsToCheck.Contains(i.Id) && i.AllowAlternativeItem)
+            .Select(i => i.Id)
+            .ToHashSet();
+
+        foreach (var row in sourceItems)
+        {
+            var baseId = row.OriginalItemId ?? row.ItemId;
+            row.AllowAlternativeItem = allowedItemIds.Contains(baseId);
+        }
+    }
+
+    /// <summary>
+    /// Validates Finished Good Conversion Repack Stock Entry (upstream PR #58479).
+    /// Converts produced finished goods of a Work Order into alternative finished goods.
+    /// </summary>
+    public async Task ValidateFgConversionAsync(
+        StockEntry entry,
+        IRepository<MyERP.Manufacturing.Entities.WorkOrder, Guid> woRepo,
+        IRepository<ItemAlternative, Guid> altRepo,
+        IRepository<StockEntry, Guid> seRepo,
+        IRepository<MyERP.Manufacturing.Entities.ManufacturingSettings, Guid>? mfgSettingsRepo = null)
+    {
+        if (!entry.IsFgConversion) return;
+
+        if (entry.EntryType != StockEntryType.Repack)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "A finished good conversion entry must have the purpose 'Repack'.");
+        }
+
+        if (!entry.WorkOrderId.HasValue)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Work Order is mandatory for a finished good conversion entry.");
+        }
+
+        var settingsRepo = mfgSettingsRepo ?? LazyServiceProvider?.LazyGetService<IRepository<MyERP.Manufacturing.Entities.ManufacturingSettings, Guid>>();
+        bool isAllowed = false;
+        bool hasSettingSource = false;
+        if (settingsRepo != null)
+        {
+            hasSettingSource = true;
+            var settings = await settingsRepo.FindAsync(s => s.CompanyId == entry.CompanyId);
+            if (settings != null)
+            {
+                isAllowed = settings.AllowAlternativeFinishedGoods;
+            }
+        }
+
+        if (!isAllowed && LazyServiceProvider != null)
+        {
+            var settingProvider = LazyServiceProvider.LazyGetService<Volo.Abp.Settings.ISettingProvider>();
+            if (settingProvider != null)
+            {
+                hasSettingSource = true;
+                var abpSettingVal = await settingProvider.GetOrNullAsync(MyERP.Settings.MyERPSettings.Manufacturing.AllowAlternativeFinishedGoods);
+                if (!string.IsNullOrEmpty(abpSettingVal) && bool.TryParse(abpSettingVal, out var parsed))
+                {
+                    isAllowed = parsed;
+                }
+            }
+        }
+
+        if (hasSettingSource && !isAllowed)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Enable 'Allow Alternative Finished Goods' in Manufacturing Settings to make a finished good conversion entry.");
+        }
+
+        var wo = await woRepo.FindAsync(entry.WorkOrderId.Value);
+        if (wo == null)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Linked Work Order not found.");
+        }
+
+        var productionItem = wo.ItemId;
+
+        // Fetch valid alternative items for this production item (both 1-way and 2-way)
+        var altQuery = await altRepo.GetQueryableAsync();
+        var directAlts = altQuery.Where(a => a.ItemId == productionItem).Select(a => a.AlternativeItemId).ToList();
+        var twoWayAlts = altQuery.Where(a => a.AlternativeItemId == productionItem && a.TwoWay).Select(a => a.ItemId).ToList();
+        var allowedAlternatives = directAlts.Concat(twoWayAlts).ToHashSet();
+
+        if (!allowedAlternatives.Any())
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "No Item Alternative records found for the production item.");
+        }
+
+        // Validate consumed quantity of production item
+        var consumedQty = entry.Items
+            .Where(i => i.SourceWarehouseId.HasValue && i.ItemId == productionItem)
+            .Sum(i => i.Quantity);
+
+        if (consumedQty <= 0)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "A finished good conversion entry must consume the production item of the Work Order.");
+        }
+
+        // Validate target alternative items and output qty
+        var outputItems = entry.Items
+            .Where(i => (i.IsFinishedItem || i.TargetWarehouseId.HasValue) && i.ItemId != productionItem)
+            .ToList();
+
+        foreach (var outItem in outputItems)
+        {
+            if (!allowedAlternatives.Contains(outItem.ItemId))
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", "Item is not an alternative item of the production item.");
+            }
+        }
+
+        var outputQty = outputItems.Sum(i => i.Quantity);
+        if (Math.Round(outputQty, 4) != Math.Round(consumedQty, 4))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"Total output quantity of alternative finished goods ({outputQty}) must equal converted quantity ({consumedQty}).");
+        }
+
+        // Available produced quantity check against WO (produced_qty - already_converted_qty)
+        var seQuery = await seRepo.GetQueryableAsync();
+        var alreadyConvertedQty = seQuery
+            .Where(s => s.WorkOrderId == wo.Id && s.IsFgConversion && s.Id != entry.Id && s.Status == MyERP.Core.DocumentStatus.Posted)
+            .SelectMany(s => s.Items)
+            .Where(i => i.ItemId == productionItem && i.SourceWarehouseId.HasValue)
+            .Sum(i => (decimal?)i.Quantity) ?? 0m;
+
+        var availableQty = wo.ProducedQuantity - alreadyConvertedQty;
+        if (consumedQty > availableQty)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"Quantity ({consumedQty}) to convert cannot exceed available produced quantity ({availableQty}) against Work Order {wo.WorkOrderNumber}.");
+        }
+    }
+
+    /// <summary>
+    /// Validates Batch Split Repack Stock Entry (upstream PR #58530).
+    /// Splits consumed batch inventory into one child batch per finished piece.
+    /// <summary>
+    /// Validates Batch Split Repack or Manufacture Stock Entry (upstream PR #58530).
+    /// Splits consumed batch inventory into one child batch per finished piece.
+    /// </summary>
+    public void ValidateBatchSplit(StockEntry entry)
+    {
+        if (entry.WeightPerPiece <= 0) return;
+
+        if (entry.EntryType != StockEntryType.Repack && entry.EntryType != StockEntryType.Manufacture)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Batch Split operation is only supported for 'Repack' and 'Manufacture' Stock Entry purposes.");
+        }
+
+        var sourceItems = entry.Items.Where(i => i.SourceWarehouseId.HasValue && !i.IsFinishedItem && i.SecondaryItemType == null).ToList();
+        var uniqueSourceItemIds = sourceItems.Select(i => i.ItemId).Distinct().ToList();
+
+        if (uniqueSourceItemIds.Count > 1)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Batch Split entry requires exactly one raw material item type to be consumed.");
+        }
+
+        var outputItems = entry.Items.Where(i => i.TargetWarehouseId.HasValue && !i.SourceWarehouseId.HasValue && (i.IsFinishedItem || entry.EntryType == StockEntryType.Repack) && i.SecondaryItemType == null).ToList();
+        var totalOutputQty = outputItems.Sum(i => i.Quantity);
+
+        if (totalOutputQty <= 0)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Batch Split entry must have finished/incoming goods.");
+        }
+
+        var totalPieces = totalOutputQty / entry.WeightPerPiece;
+        if (Math.Abs(totalPieces - Math.Round(totalPieces)) > 0.0001m)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"Total output quantity ({totalOutputQty}) must be an exact multiple of Weight Per Piece ({entry.WeightPerPiece}).");
+        }
+
+        // Validate each consumed line divides into whole pieces
+        foreach (var source in sourceItems)
+        {
+            var pieces = source.Quantity / entry.WeightPerPiece;
+            if (Math.Abs(pieces - Math.Round(pieces)) > 0.0001m)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Consumed quantity ({source.Quantity}) must divide evenly into whole pieces of weight {entry.WeightPerPiece}.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Validates difference / expense accounts on Stock Entry items (ERPNext commit fb819c558e & bba6b0ff45).
+    /// </summary>
+    public async Task ValidateDifferenceAccountAsync(StockEntry entry)
+    {
+        var accountIds = entry.Items
+            .Where(i => i.ExpenseAccountId.HasValue)
+            .Select(i => i.ExpenseAccountId!.Value)
+            .Distinct()
+            .ToList();
+
+        if (!accountIds.Any()) return;
+
+        var accountRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Accounting.Entities.Account, Guid>>();
+        var accountMap = (await accountRepo.GetQueryableAsync())
+            .Where(a => accountIds.Contains(a.Id))
+            .ToDictionary(a => a.Id);
+
+        for (int idx = 0; idx < entry.Items.Count; idx++)
+        {
+            var item = entry.Items[idx];
+            if (!item.ExpenseAccountId.HasValue || !accountMap.TryGetValue(item.ExpenseAccountId.Value, out var acc))
+                continue;
+
+            // Difference account must not be Stock account (ERPNext commit fb819c558e)
+            if (acc.AccountSubType == Accounting.AccountSubType.Stock)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Row #{idx + 1}: The Difference Account '{acc.AccountName}' must not be a Stock type account. Please select a different account.");
+            }
+
+            // Opening stock entry must use Balance Sheet account (e.g. Temporary Opening), not P&L
+            if (entry.IsOpening && (acc.AccountType == Accounting.AccountType.Expense || acc.AccountType == Accounting.AccountType.Revenue))
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Row #{idx + 1}: Difference Account must be an Asset/Liability/Equity account (such as Temporary Opening), since this Stock Entry is an Opening Entry.");
+            }
+
+            // Cost of Goods Sold is only valid for Material Issue entries (ERPNext PR #47452 / commit bba6b0ff45)
+            if (entry.EntryType != StockEntryType.MaterialIssue && acc.AccountSubType == Accounting.AccountSubType.CostOfGoodsSold)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Row #{idx + 1}: You have selected Difference Account '{acc.AccountName}', which is a Cost of Goods Sold type account. Cost of Goods Sold accounts can only be used with Material Issue purpose.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Distributes total additional costs across incoming rows.
+    /// Per ERPNext commit 074c84e880 / PR #58433 and PR #58842 / commit 1728d1b0f5:
+    /// - For Repack/Manufacture: incoming items are finished goods (IsFinishedItem = true).
+    /// - For other purposes: incoming items have TargetWarehouseId != null.
+    /// - Primary allocation basis: proportional to basic amount (Quantity * ValuationRate).
+    /// - Fallback allocation basis: if total basic amount is zero (zero-valued items), proportional to Quantity.
+    /// - Additional costs are redistributed across incoming rows and valuation rate is updated.
+    /// </summary>
+    public static void DistributeAdditionalCosts(StockEntry entry)
+    {
+        foreach (var item in entry.Items)
+        {
+            item.AdditionalCost = 0;
+        }
+
+        if (entry.TotalAdditionalCosts <= 0) return;
+
+        List<StockEntryItem> incomingRows;
+        if (entry.EntryType == StockEntryType.Repack || entry.EntryType == StockEntryType.Manufacture)
+        {
+            incomingRows = entry.Items.Where(i => i.IsFinishedItem).ToList();
+        }
+        else
+        {
+            incomingRows = entry.Items.Where(i => i.TargetWarehouseId.HasValue).ToList();
+        }
+
+        if (!incomingRows.Any()) return;
+
+        var totalBasicAmount = incomingRows.Sum(i => i.Quantity * (i.ValuationRate ?? 0m));
+        var useBasicAmount = totalBasicAmount > 0m;
+        var totalBasis = useBasicAmount
+            ? totalBasicAmount
+            : incomingRows.Sum(i => i.StockQty > 0 ? i.StockQty : i.Quantity);
+
+        if (totalBasis <= 0m) return;
+
+        decimal allocated = 0;
+        for (int i = 0; i < incomingRows.Count; i++)
+        {
+            var row = incomingRows[i];
+            if (i == incomingRows.Count - 1)
+            {
+                row.AdditionalCost = entry.TotalAdditionalCosts - allocated;
+            }
+            else
+            {
+                var basisVal = useBasicAmount
+                    ? row.Quantity * (row.ValuationRate ?? 0m)
+                    : (row.StockQty > 0 ? row.StockQty : row.Quantity);
+                var portion = Math.Round(entry.TotalAdditionalCosts * (basisVal / totalBasis), 4);
+                row.AdditionalCost = portion;
+                allocated += portion;
+            }
+
+            if (row.Quantity > 0)
+            {
+                var rateIncrement = row.AdditionalCost / row.Quantity;
+                row.ValuationRate = (row.ValuationRate ?? 0m) + rateIncrement;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Resolves finished good serial numbers and batch numbers produced in this Stock Entry (Manufacture/Repack).
+    /// Per ERPNext PR #59706 (commit d4f5d39ee8).
+    /// </summary>
+    public static async Task<List<(string? FgSerialNo, string? FgBatchNo)>> GetFinishedGoodTargetsAsync(
+        StockEntry entry,
+        IRepository<SerialAndBatchBundle, Guid> bundleRepo,
+        IRepository<Batch, Guid>? batchRepo = null)
+    {
+        var targets = new List<(string? FgSerialNo, string? FgBatchNo)>();
+        if (entry.EntryType != StockEntryType.Manufacture && entry.EntryType != StockEntryType.Repack)
+            return targets;
+
+        var fgItems = entry.Items.Where(i => i.IsFinishedItem && i.TargetWarehouseId.HasValue).ToList();
+        if (!fgItems.Any()) return targets;
+
+        var fgItemDetailIds = fgItems.Select(i => i.Id).ToList();
+        var bundles = (await bundleRepo.WithDetailsAsync(b => b.Entries))
+            .Where(b => b.VoucherType == "StockEntry" && b.VoucherId == entry.Id && b.VoucherDetailId.HasValue && fgItemDetailIds.Contains(b.VoucherDetailId.Value) && !b.IsCancelled)
+            .ToList();
+
+        var bundleMap = bundles.ToDictionary(b => b.VoucherDetailId!.Value);
+
+        Dictionary<Guid, string>? batchIdToNo = null;
+        if (batchRepo != null)
+        {
+            var batchIds = fgItems.Where(i => i.BatchId.HasValue).Select(i => i.BatchId!.Value)
+                .Concat(bundles.SelectMany(b => b.Entries).Where(e => e.BatchId.HasValue).Select(e => e.BatchId!.Value))
+                .Distinct().ToList();
+            if (batchIds.Any())
+            {
+                var bQuery = await batchRepo.GetQueryableAsync();
+                batchIdToNo = bQuery.Where(b => batchIds.Contains(b.Id)).ToDictionary(b => b.Id, b => b.BatchNo);
+            }
+        }
+
+        foreach (var item in fgItems)
+        {
+            if (bundleMap.TryGetValue(item.Id, out var bundle) && bundle.Entries.Any())
+            {
+                var serialized = bundle.Entries.Any(e => !string.IsNullOrWhiteSpace(e.SerialNo));
+                foreach (var e in bundle.Entries)
+                {
+                    if (serialized && !string.IsNullOrWhiteSpace(e.SerialNo))
+                    {
+                        if (!targets.Any(t => t.FgSerialNo == e.SerialNo))
+                            targets.Add((e.SerialNo, null));
+                    }
+                    else if (e.BatchId.HasValue)
+                    {
+                        var bNo = (batchIdToNo != null && batchIdToNo.TryGetValue(e.BatchId.Value, out var bn)) ? bn : e.BatchId.Value.ToString();
+                        if (!targets.Any(t => t.FgBatchNo == bNo))
+                            targets.Add((null, bNo));
+                    }
+                }
+            }
+            else if (item.BatchId.HasValue)
+            {
+                var bNo = (batchIdToNo != null && batchIdToNo.TryGetValue(item.BatchId.Value, out var bn)) ? bn : item.BatchId.Value.ToString();
+                if (!targets.Any(t => t.FgBatchNo == bNo))
+                    targets.Add((null, bNo));
+            }
+        }
+
+        return targets;
+    }
+
+    /// <summary>
+    /// Validates raw material serial / batch mappings against produced finished goods.
+    /// Per ERPNext PR #59706 (commit d4f5d39ee8).
+    /// </summary>
+    public static async Task ValidateFinishedGoodMappingsAsync(
+        StockEntry entry,
+        IRepository<SerialAndBatchBundle, Guid> bundleRepo,
+        IRepository<Batch, Guid>? batchRepo = null)
+    {
+        if (entry.EntryType != StockEntryType.Manufacture && entry.EntryType != StockEntryType.Repack)
+            return;
+
+        var fgTargets = await GetFinishedGoodTargetsAsync(entry, bundleRepo, batchRepo);
+        var fgSerialSet = fgTargets.Where(t => !string.IsNullOrWhiteSpace(t.FgSerialNo)).Select(t => t.FgSerialNo!).ToHashSet();
+        var fgBatchSet = fgTargets.Where(t => !string.IsNullOrWhiteSpace(t.FgBatchNo)).Select(t => t.FgBatchNo!).ToHashSet();
+
+        var rmItems = entry.Items.Where(i => !i.IsFinishedItem && i.SourceWarehouseId.HasValue && !i.TargetWarehouseId.HasValue).ToList();
+        if (!rmItems.Any()) return;
+
+        var rmDetailIds = rmItems.Select(i => i.Id).ToList();
+        var rmBundles = (await bundleRepo.WithDetailsAsync(b => b.Entries))
+            .Where(b => b.VoucherType == "StockEntry" && b.VoucherId == entry.Id && b.VoucherDetailId.HasValue && rmDetailIds.Contains(b.VoucherDetailId.Value) && !b.IsCancelled)
+            .ToList();
+
+        foreach (var bundle in rmBundles)
+        {
+            foreach (var e in bundle.Entries)
+            {
+                if (!string.IsNullOrWhiteSpace(e.FgSerialNo) && !fgSerialSet.Contains(e.FgSerialNo))
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.InvalidFinishedGoodMapping)
+                        .WithData("rawMaterial", e.SerialNo ?? e.BatchId?.ToString() ?? "Raw Material")
+                        .WithData("target", e.FgSerialNo);
+                }
+                if (!string.IsNullOrWhiteSpace(e.FgBatchNo) && !fgBatchSet.Contains(e.FgBatchNo))
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.InvalidFinishedGoodMapping)
+                        .WithData("rawMaterial", e.SerialNo ?? e.BatchId?.ToString() ?? "Raw Material")
+                        .WithData("target", e.FgBatchNo);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Auto-maps raw materials to finished goods in order when auto_map_raw_materials_to_finished_goods is enabled.
+    /// Per ERPNext PR #59706 (commit d4f5d39ee8).
+    /// </summary>
+    public static async Task AutoMapRawMaterialsToFinishedGoodsAsync(
+        StockEntry entry,
+        IRepository<SerialAndBatchBundle, Guid> bundleRepo,
+        IRepository<Batch, Guid>? batchRepo = null)
+    {
+        if (entry.EntryType != StockEntryType.Manufacture && entry.EntryType != StockEntryType.Repack)
+            return;
+
+        var fgTargets = await GetFinishedGoodTargetsAsync(entry, bundleRepo, batchRepo);
+        if (!fgTargets.Any()) return;
+
+        var rmItems = entry.Items.Where(i => !i.IsFinishedItem && i.SourceWarehouseId.HasValue && !i.TargetWarehouseId.HasValue).ToList();
+        if (!rmItems.Any()) return;
+
+        var rmDetailIds = rmItems.Select(i => i.Id).ToList();
+        var rmBundles = (await bundleRepo.WithDetailsAsync(b => b.Entries))
+            .Where(b => b.VoucherType == "StockEntry" && b.VoucherId == entry.Id && b.VoucherDetailId.HasValue && rmDetailIds.Contains(b.VoucherDetailId.Value) && !b.IsCancelled)
+            .ToList();
+
+        var updatedBundles = new List<SerialAndBatchBundle>();
+        foreach (var bundle in rmBundles)
+        {
+            var hasUnmapped = bundle.Entries.Any(e => string.IsNullOrWhiteSpace(e.FgSerialNo) && string.IsNullOrWhiteSpace(e.FgBatchNo));
+            if (hasUnmapped)
+            {
+                bundle.AutoMapToFinishedGoods(fgTargets);
+                updatedBundles.Add(bundle);
+            }
+        }
+
+        if (updatedBundles.Any())
+        {
+            await bundleRepo.UpdateManyAsync(updatedBundles);
+        }
+    }
+
+    /// <summary>
+    /// Applies batch reservations to Stock Entry lines for Material Transfer for Manufacture.
+    /// Per ERPNext StockEntrySABB.set_serial_batch_based_on_reservation (PR #59755 & PR #59756):
+    /// Distributes reserved batches up to the line quantity, and leaves any unreserved remainder on a row without batch.
+    /// </summary>
+    public async Task ApplyBatchReservationsForTransferAsync(StockEntry entry, StockReservationManager sreManager)
+    {
+        if (entry.EntryType != StockEntryType.MaterialTransferForManufacture || !entry.WorkOrderId.HasValue)
+            return;
+
+        var voucherId = entry.WorkOrderId.Value;
+        var reservedMaterials = await sreManager.GetReservedMaterialsAsync("WorkOrder", voucherId);
+        if (!reservedMaterials.Any(r => r.BatchId.HasValue))
+            return;
+
+        var itemsToProcess = entry.Items.Where(i => !i.BatchId.HasValue && i.SourceWarehouseId.HasValue).ToList();
+        if (!itemsToProcess.Any()) return;
+
+        var reservedBatches = reservedMaterials
+            .Where(r => r.BatchId.HasValue && r.AvailableQty > 0)
+            .GroupBy(r => (r.ItemId, r.WarehouseId))
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        var newItems = new List<StockEntryItem>();
+
+        foreach (var item in itemsToProcess)
+        {
+            var key = (item.ItemId, item.SourceWarehouseId!.Value);
+            if (!reservedBatches.TryGetValue(key, out var batchList) || !batchList.Any(b => b.AvailableQty > 0))
+                continue;
+
+            var remaining = item.Quantity;
+            bool firstAllocated = false;
+
+            foreach (var batch in batchList)
+            {
+                if (remaining <= 0) break;
+                if (batch.AvailableQty <= 0) continue;
+
+                var allocQty = Math.Min(remaining, batch.AvailableQty);
+                batch.AvailableQty -= allocQty;
+                remaining -= allocQty;
+
+                if (!firstAllocated)
+                {
+                    item.BatchId = batch.BatchId;
+                    item.Quantity = allocQty;
+                    firstAllocated = true;
+                }
+                else
+                {
+                    var added = entry.AddItem(
+                        item.ItemId, allocQty, item.SourceWarehouseId, item.TargetWarehouseId,
+                        item.ValuationRate, isFinishedItem: false, batchId: batch.BatchId,
+                        conversionFactor: item.ConversionFactor, stockUom: item.StockUom);
+                    added.CostCenterId = item.CostCenterId;
+                    added.ExpenseAccountId = item.ExpenseAccountId;
+                    added.ProjectId = item.ProjectId;
+                    added.MaterialRequestItemId = item.MaterialRequestItemId;
+                }
+            }
+
+            if (remaining > 0 && firstAllocated)
+            {
+                // Unreserved remainder row (PR #59755)
+                var unreserved = entry.AddItem(
+                    item.ItemId, remaining, item.SourceWarehouseId, item.TargetWarehouseId,
+                    item.ValuationRate, isFinishedItem: false, batchId: null,
+                    conversionFactor: item.ConversionFactor, stockUom: item.StockUom);
+                unreserved.CostCenterId = item.CostCenterId;
+                unreserved.ExpenseAccountId = item.ExpenseAccountId;
+                unreserved.ProjectId = item.ProjectId;
+                unreserved.MaterialRequestItemId = item.MaterialRequestItemId;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Builds the remaining batch pool per (ItemId, WarehouseId, IsFinishedItem) from posted Manufacture
+    /// Stock Entries after subtracting batches already reversed by non-draft, non-cancelled Disassemble entries.
+    /// Per ERPNext commit b9121c2188 (_get_available_batch_nos_from_stock_entries).
+    /// </summary>
+    public static Dictionary<(Guid ItemId, Guid WarehouseId, bool IsFinishedItem), List<(Guid BatchId, decimal AvailableQty)>>
+        BuildAvailableDisassemblyBatchPool(
+            IReadOnlyList<StockEntry> sourceManufactureEntries,
+            IReadOnlyList<StockEntry> priorDisassembleEntries,
+            int precision = 4)
+    {
+        var pool = new Dictionary<(Guid ItemId, Guid WarehouseId, bool IsFinishedItem), List<(Guid BatchId, decimal AvailableQty)>>();
+
+        foreach (var se in sourceManufactureEntries)
+        {
+            if (se.EntryType != StockEntryType.Manufacture
+                || se.Status == Core.DocumentStatus.Draft
+                || se.Status == Core.DocumentStatus.Cancelled)
+            {
+                continue;
+            }
+
+            foreach (var item in se.Items)
+            {
+                if (!item.BatchId.HasValue) continue;
+
+                var isFg = item.IsFinishedItem || (item.TargetWarehouseId.HasValue && !item.SourceWarehouseId.HasValue);
+                var whId = isFg ? item.TargetWarehouseId : item.SourceWarehouseId;
+                if (!whId.HasValue) continue;
+
+                var key = (item.ItemId, whId.Value, isFg);
+                if (!pool.TryGetValue(key, out var list))
+                {
+                    list = new List<(Guid BatchId, decimal AvailableQty)>();
+                    pool[key] = list;
+                }
+
+                var qty = Math.Round(Math.Abs(item.Quantity), precision);
+                if (qty <= 0m) continue;
+
+                var existingIdx = list.FindIndex(x => x.BatchId == item.BatchId.Value);
+                if (existingIdx >= 0)
+                {
+                    list[existingIdx] = (item.BatchId.Value, Math.Round(list[existingIdx].AvailableQty + qty, precision));
+                }
+                else
+                {
+                    list.Add((item.BatchId.Value, qty));
+                }
+            }
+        }
+
+        foreach (var se in priorDisassembleEntries)
+        {
+            if (se.EntryType != StockEntryType.Disassemble
+                || se.Status == Core.DocumentStatus.Draft
+                || se.Status == Core.DocumentStatus.Cancelled)
+            {
+                continue;
+            }
+
+            foreach (var item in se.Items)
+            {
+                if (!item.BatchId.HasValue) continue;
+
+                var isFg = item.IsFinishedItem || (item.SourceWarehouseId.HasValue && !item.TargetWarehouseId.HasValue);
+                var whId = isFg ? item.SourceWarehouseId : item.TargetWarehouseId;
+                if (!whId.HasValue) continue;
+
+                var key = (item.ItemId, whId.Value, isFg);
+                if (!pool.TryGetValue(key, out var list)) continue;
+
+                var usedQty = Math.Round(Math.Abs(item.Quantity), precision);
+                var existingIdx = list.FindIndex(x => x.BatchId == item.BatchId.Value);
+                if (existingIdx >= 0)
+                {
+                    var remaining = Math.Round(list[existingIdx].AvailableQty - usedQty, precision);
+                    list[existingIdx] = (item.BatchId.Value, Math.Max(0m, remaining));
+                }
+            }
+        }
+
+        foreach (var key in pool.Keys.ToList())
+        {
+            pool[key] = pool[key].Where(x => Math.Round(x.AvailableQty, precision) > 0m).ToList();
+        }
+
+        return pool;
+    }
+
+    /// <summary>
+    /// Allocates batch quantities in order up to requiredQty, rounding at precision, skipping exhausted
+    /// batches, and deducting allocated quantities from the pool in-place.
+    /// Per ERPNext commits b9121c2188 &amp; 54fcf4abd5 (_set_disassembly_serial_and_batch_bundle).
+    /// </summary>
+    public static List<(Guid BatchId, decimal Qty)> CollectDisassemblyBatches(
+        Dictionary<(Guid ItemId, Guid WarehouseId, bool IsFinishedItem), List<(Guid BatchId, decimal AvailableQty)>> pool,
+        Guid itemId,
+        Guid warehouseId,
+        bool isFinishedItem,
+        decimal requiredQty,
+        int precision = 4)
+    {
+        var allocations = new List<(Guid BatchId, decimal Qty)>();
+        var remaining = Math.Round(Math.Abs(requiredQty), precision);
+        if (remaining <= 0m) return allocations;
+
+        var key = (itemId, warehouseId, isFinishedItem);
+        if (!pool.TryGetValue(key, out var list) || list.Count == 0)
+            return allocations;
+
+        for (var idx = 0; idx < list.Count && remaining > 0m; idx++)
+        {
+            var (batchId, available) = list[idx];
+            var availRounded = Math.Round(available, precision);
+            if (availRounded <= 0m) continue;
+
+            var take = Math.Round(Math.Min(availRounded, remaining), precision);
+            if (take <= 0m) continue;
+
+            allocations.Add((batchId, take));
+            list[idx] = (batchId, Math.Round(availRounded - take, precision));
+            remaining = Math.Round(remaining - take, precision);
+        }
+
+        return allocations;
+    }
+}

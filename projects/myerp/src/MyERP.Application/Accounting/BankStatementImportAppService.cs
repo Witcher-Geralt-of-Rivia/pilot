@@ -1,0 +1,372 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Accounting.DomainServices;
+using MyERP.Accounting.Entities;
+using MyERP.Permissions;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Guids;
+
+
+namespace MyERP.Accounting;
+
+/// <summary>
+/// Bank Statement Import Service — parses CSV bank statements and creates BankTransaction records.
+/// Supports common Malaysian bank CSV formats (date, description, debit, credit, balance).
+/// 
+/// ERPNext equivalent: banking/doctype/bank_statement_import
+/// </summary>
+[Authorize(MyERPPermissions.PaymentEntries.Default)]
+public class BankStatementImportAppService : ApplicationService, IBankStatementImportAppService
+{
+    private readonly IRepository<BankTransaction, Guid> _transactionRepository;
+    private readonly IRepository<BankAccount, Guid> _bankAccountRepository;
+    private readonly IGuidGenerator _guidGenerator;
+
+    public BankStatementImportAppService(
+        IRepository<BankTransaction, Guid> transactionRepository,
+        IRepository<BankAccount, Guid> bankAccountRepository,
+        IGuidGenerator guidGenerator)
+    {
+        _transactionRepository = transactionRepository;
+        _bankAccountRepository = bankAccountRepository;
+        _guidGenerator = guidGenerator;
+    }
+
+    /// <summary>
+    /// Import bank transactions from a CSV string.
+    /// Expected format: Date,Description,Debit,Credit,Balance
+    /// First row is treated as header and skipped.
+    /// </summary>
+    public async Task<BankStatementImportResult> ImportFromCsvAsync(BankStatementImportInput input)
+    {
+        var bankAccount = await _bankAccountRepository.GetAsync(input.BankAccountId);
+        if (bankAccount.CompanyId != input.CompanyId)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.BankAccountCompanyMismatch)
+                .WithData("bankAccountId", input.BankAccountId)
+                .WithData("companyId", input.CompanyId);
+        }
+        if (!bankAccount.IsCompanyAccount)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.BankAccountMustBeCompanyAccount)
+                .WithData("bankAccountId", input.BankAccountId);
+        }
+
+        var result = new BankStatementImportResult();
+        var lines = input.CsvContent.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+
+
+        if (lines.Length <= 1)
+        {
+            result.Errors.Add("CSV file is empty or contains only a header row.");
+            return result;
+        }
+
+        // Skip header
+        for (int i = 1; i < lines.Length; i++)
+        {
+            var line = lines[i].Trim();
+            if (string.IsNullOrWhiteSpace(line)) continue;
+
+            try
+            {
+                var fields = ParseCsvLine(line);
+                if (fields.Length < 4)
+                {
+                    result.Errors.Add($"Row {i + 1}: insufficient columns (expected at least 4).");
+                    result.SkippedCount++;
+                    continue;
+                }
+
+                var date = ParseDate(fields[0].Trim());
+                var description = fields[1].Trim().Trim('"');
+                var debit = ParseDecimal(fields[2]);
+                var credit = ParseDecimal(fields[3]);
+
+                // Amount: positive = money in (credit), negative = money out (debit)
+                var amount = credit - debit;
+                if (amount == 0)
+                {
+                    result.SkippedCount++;
+                    continue;
+                }
+
+                var transaction = new BankTransaction(
+                    _guidGenerator.Create(),
+                    input.CompanyId,
+                    input.BankAccountId,
+                    date,
+                    description,
+                    amount,
+                    input.TenantId);
+
+                // Set directional amounts (positive = deposit, negative = withdrawal)
+                if (amount > 0)
+                    transaction.Deposit = amount;
+                else
+                    transaction.Withdrawal = Math.Abs(amount);
+
+                // Set currency from input (for validation against bank account)
+                if (!string.IsNullOrWhiteSpace(input.CurrencyCode))
+                    transaction.CurrencyCode = input.CurrencyCode;
+
+                // Normalize any excluded fees and validate included fees
+                transaction.NormalizeFees();
+                transaction.ValidateIncludedFee();
+
+                // Try to extract reference number from description
+                transaction.ReferenceNumber = ExtractReference(description);
+
+                await _transactionRepository.InsertAsync(transaction);
+                result.ImportedCount++;
+            }
+            catch (Exception ex)
+            {
+                result.Errors.Add($"Row {i + 1}: {ex.Message}");
+                result.SkippedCount++;
+            }
+        }
+
+        return result;
+    }
+
+    private static DateTime ParseDate(string value)
+    {
+        // Support common date formats
+        string[] formats = { "dd/MM/yyyy", "yyyy-MM-dd", "MM/dd/yyyy", "d/M/yyyy", "dd-MM-yyyy" };
+        if (DateTime.TryParseExact(value.Trim('"'), formats, CultureInfo.InvariantCulture, DateTimeStyles.None, out var date))
+            return date;
+        return DateTime.Parse(value.Trim('"'), CultureInfo.InvariantCulture);
+    }
+
+    public static decimal ParseDecimal(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return 0;
+        var s = value.Trim().Trim('"').Trim();
+        if (string.IsNullOrWhiteSpace(s)) return 0;
+
+        bool isNegative = false;
+
+        // Parenthetical negative: (1,234.56)
+        if (s.StartsWith("(") && s.EndsWith(")"))
+        {
+            isNegative = true;
+            s = s[1..^1].Trim();
+        }
+
+        // Trailing or leading sign
+        if (s.EndsWith("-") || s.EndsWith("DR", StringComparison.OrdinalIgnoreCase))
+        {
+            isNegative = true;
+            s = s.EndsWith("-") ? s[..^1].Trim() : s[..^2].Trim();
+        }
+        else if (s.EndsWith("CR", StringComparison.OrdinalIgnoreCase))
+        {
+            s = s[..^2].Trim();
+        }
+        else if (s.StartsWith("-"))
+        {
+            isNegative = true;
+            s = s[1..].Trim();
+        }
+        else if (s.StartsWith("+"))
+        {
+            s = s[1..].Trim();
+        }
+
+        // Remove space-separated thousands or non-breaking spaces
+        s = s.Replace(" ", "").Replace("\u00A0", "");
+
+        // Remove currency symbols (e.g. $, RM, EUR, etc.)
+        s = System.Text.RegularExpressions.Regex.Replace(s, @"[^\d.,]", "");
+        if (string.IsNullOrWhiteSpace(s)) return 0;
+
+        // Detect European format: 1.234,56 vs 1,234.56
+        if (s.Contains('.') && s.Contains(','))
+        {
+            if (s.LastIndexOf(',') > s.LastIndexOf('.'))
+            {
+                // European format: 1.234,56 -> 1234.56
+                s = s.Replace(".", "").Replace(',', '.');
+            }
+            else
+            {
+                // Standard format: 1,234.56 -> 1234.56
+                s = s.Replace(",", "");
+            }
+        }
+        else if (s.Contains(','))
+        {
+            var parts = s.Split(',');
+            if (parts.Length == 2 && parts[1].Length <= 2)
+            {
+                // European decimal with no thousand separator: 1234,56
+                s = parts[0] + "." + parts[1];
+            }
+            else
+            {
+                // Thousands separator: 1,234
+                s = s.Replace(",", "");
+            }
+        }
+
+        if (!decimal.TryParse(s, System.Globalization.NumberStyles.Any, CultureInfo.InvariantCulture, out var result))
+            return 0;
+
+        return isNegative ? -result : result;
+    }
+
+    private static string[] ParseCsvLine(string line)
+    {
+        // Simple CSV parser (handles quoted fields with commas)
+        var fields = new List<string>();
+        bool inQuotes = false;
+        var current = "";
+
+        foreach (var ch in line)
+        {
+            if (ch == '"') { inQuotes = !inQuotes; current += ch; }
+            else if (ch == ',' && !inQuotes) { fields.Add(current); current = ""; }
+            else { current += ch; }
+        }
+        fields.Add(current);
+        return fields.ToArray();
+    }
+
+    private static string? ExtractReference(string description)
+    {
+        // Common patterns: "REF: 12345", "TRN/12345", invoice numbers
+        if (description.Contains("REF:", StringComparison.OrdinalIgnoreCase))
+        {
+            var idx = description.IndexOf("REF:", StringComparison.OrdinalIgnoreCase) + 4;
+            return description[idx..].Trim().Split(' ')[0];
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Import bank transactions from an MT940 (SWIFT) formatted bank statement.
+    /// Most Malaysian banks (Maybank, CIMB, Public Bank, etc.) export MT940.
+    /// Uses Mt940Parser domain service for parsing.
+    /// </summary>
+    public async Task<BankStatementImportResult> ImportFromMt940Async(Mt940ImportInput input)
+    {
+        var bankAccount = await _bankAccountRepository.GetAsync(input.BankAccountId);
+        if (bankAccount.CompanyId != input.CompanyId)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.BankAccountCompanyMismatch)
+                .WithData("bankAccountId", input.BankAccountId)
+                .WithData("companyId", input.CompanyId);
+        }
+        if (!bankAccount.IsCompanyAccount)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.BankAccountMustBeCompanyAccount)
+                .WithData("bankAccountId", input.BankAccountId);
+        }
+
+        var result = new BankStatementImportResult();
+        var parser = LazyServiceProvider.LazyGetRequiredService<Mt940Parser>();
+
+
+        var parseResult = parser.Parse(input.Mt940Content);
+
+        if (!parseResult.IsSuccess)
+        {
+            result.Errors.Add(parseResult.ErrorMessage ?? "MT940 parsing failed");
+            result.Errors.AddRange(parseResult.Errors);
+            return result;
+        }
+
+        if (parseResult.TransactionCount == 0)
+        {
+            result.Errors.Add("No transactions found in MT940 statement.");
+            return result;
+        }
+
+        foreach (var tx in parseResult.Transactions)
+        {
+            try
+            {
+                var bankTx = new BankTransaction(
+                    _guidGenerator.Create(),
+                    input.CompanyId,
+                    input.BankAccountId,
+                    tx.ValueDate,
+                    tx.Description ?? "",
+                    tx.Amount,
+                    tenantId: input.TenantId);
+
+                // Set directional amounts
+                bankTx.Deposit = tx.IsCredit ? tx.Amount : 0m;
+                bankTx.Withdrawal = tx.IsCredit ? 0m : tx.Amount;
+
+                if (!string.IsNullOrWhiteSpace(tx.ReferenceNumber))
+                    bankTx.ReferenceNumber = tx.ReferenceNumber;
+
+                if (!string.IsNullOrWhiteSpace(input.CurrencyCode))
+                    bankTx.CurrencyCode = input.CurrencyCode;
+
+                await _transactionRepository.InsertAsync(bankTx);
+                result.ImportedCount++;
+            }
+            catch (Exception ex)
+            {
+                result.Errors.Add($"Transaction {tx.ValueDate:dd/MM/yyyy} {tx.Amount}: {ex.Message}");
+                result.SkippedCount++;
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Extracts the per-transaction reference from MT940 :61: tag data.
+    /// 
+    /// Per ERPNext PR #57382: the mt940 library exposes transaction_reference from the :20: tag,
+    /// which is the statement-level reference identical for every transaction. The real per-transaction
+    /// reference is customer_reference from :61: with overflow handling.
+    /// 
+    /// Resolution chain:
+    /// 1. customer_reference (with extra_details concatenation when at 16-char cap)
+    /// 2. bank_reference (fallback when customer_reference is empty or NONREF)
+    /// 3. transaction_reference (final fallback — statement-level reference)
+    /// </summary>
+    public static string? ExtractMt940TransactionReference(
+        string? customerReference,
+        string? extraDetails,
+        string? bankReference,
+        string? transactionReference)
+    {
+        const int Mt940CustomerReferenceMaxLen = 16;
+
+        var custRef = (customerReference ?? "").Trim();
+
+        // When customer_reference is exactly at MT940 cap (16 chars), overflow spills into extra_details
+        if (custRef.Length == Mt940CustomerReferenceMaxLen)
+        {
+            custRef += (extraDetails ?? "").Trim();
+        }
+
+        // NONREF is the MT940 standard sentinel for "no customer reference"
+        if (!string.IsNullOrEmpty(custRef) && !custRef.Equals("NONREF", StringComparison.OrdinalIgnoreCase))
+        {
+            return custRef;
+        }
+
+        // Fallback to bank_reference, then statement-level transaction_reference
+        var bankRef = (bankReference ?? "").Trim();
+        if (!string.IsNullOrEmpty(bankRef))
+            return bankRef;
+
+        var txnRef = (transactionReference ?? "").Trim();
+        return string.IsNullOrEmpty(txnRef) ? null : txnRef;
+    }
+}
+

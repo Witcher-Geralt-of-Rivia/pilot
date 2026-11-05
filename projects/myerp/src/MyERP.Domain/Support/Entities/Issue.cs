@@ -1,0 +1,307 @@
+using System;
+using Volo.Abp;
+using Volo.Abp.Domain.Entities.Auditing;
+using Volo.Abp.MultiTenancy;
+
+namespace MyERP.Support.Entities;
+
+/// <summary>
+/// Issue — customer support ticket.
+/// Tracks issues raised by customers through various channels.
+/// Supports SLA tracking (response/resolution time).
+/// </summary>
+public class Issue : FullAuditedAggregateRoot<Guid>, IMultiTenant
+{
+    public Guid? TenantId { get; set; }
+    public Guid CompanyId { get; set; }
+
+    public string Subject { get; set; } = null!;
+    public string? Description { get; set; }
+
+    public IssueStatus Status { get; private set; } = IssueStatus.Open;
+
+    /// <summary>Priority: Low, Medium, High, Urgent.</summary>
+    public string Priority { get; set; } = "Medium";
+
+    /// <summary>Issue type (e.g., "Bug", "Feature Request", "Complaint").</summary>
+    public string? IssueType { get; set; }
+
+    /// <summary>Customer who raised the issue.</summary>
+    public Guid? CustomerId { get; set; }
+
+    /// <summary>Contact person at customer.</summary>
+    public Guid? ContactId { get; set; }
+
+    /// <summary>Assigned employee/agent.</summary>
+    public Guid? AssignedToId { get; set; }
+
+    /// <summary>Channel: Email, Phone, Website, Social.</summary>
+    public string? RaisedVia { get; set; }
+
+    /// <summary>Link to the parent issue if this issue was split from another issue.</summary>
+    public Guid? SplitFromIssueId { get; set; }
+
+    public DateTime OpeningDate { get; set; }
+    public DateTime? ResolutionDate { get; set; }
+
+    /// <summary>SLA: first response target (hours).</summary>
+    public decimal? FirstResponseTime { get; set; }
+
+    /// <summary>SLA: resolution target (hours).</summary>
+    public decimal? ResolutionTime { get; set; }
+
+    /// <summary>Working-hours-aware first response due date, per <see cref="ServiceLevelAgreement.ComputeDeadline"/>. Informational only — breach detection still uses the elapsed-vs-target-hours check below.</summary>
+    public DateTime? ResponseByDate { get; set; }
+
+    /// <summary>Working-hours-aware resolution due date, per <see cref="ServiceLevelAgreement.ComputeDeadline"/>. Informational only — breach detection still uses the elapsed-vs-target-hours check below.</summary>
+    public DateTime? ResolutionByDate { get; set; }
+
+    /// <summary>Actual first response datetime.</summary>
+    public DateTime? FirstRespondedOn { get; set; }
+
+    /// <summary>Total hold time in hours (deducted from resolution time for SLA).</summary>
+    public decimal TotalHoldTime { get; set; }
+
+    /// <summary>When the current hold started (null when not on hold).</summary>
+    public DateTime? HoldStartedOn { get; set; }
+
+    /// <summary>Service Level Agreement entity ID (if assigned).</summary>
+    public Guid? ServiceLevelAgreementId { get; set; }
+
+    /// <summary>SLA breach: true if resolution exceeded target time.</summary>
+    public bool IsSlaBreach { get; set; }
+
+    /// <summary>SLA agreement status, recomputed on every state transition.</summary>
+    public AgreementStatus AgreementStatus { get; private set; } = AgreementStatus.FirstResponseDue;
+
+    /// <summary>
+    /// Actual resolution time in hours (excludes hold time).
+    /// Calculated: (ResolutionDate - OpeningDate).TotalHours - TotalHoldTime
+    /// </summary>
+    public decimal ActualResolutionTimeHours
+    {
+        get
+        {
+            if (!ResolutionDate.HasValue) return 0;
+            var totalHours = (decimal)(ResolutionDate.Value - OpeningDate).TotalHours;
+            return Math.Max(0, totalHours - TotalHoldTime);
+        }
+    }
+
+    /// <summary>
+    /// Actual first response time in hours.
+    /// Calculated: (FirstRespondedOn - OpeningDate).TotalHours
+    /// </summary>
+    public decimal ActualFirstResponseTimeHours =>
+        FirstRespondedOn.HasValue
+            ? (decimal)(FirstRespondedOn.Value - OpeningDate).TotalHours
+            : 0;
+
+    public string? Resolution { get; set; }
+
+    protected Issue() { }
+
+    public Issue(Guid id, Guid companyId, string subject, Guid? tenantId = null)
+        : base(id)
+    {
+        CompanyId = companyId;
+        Subject = Check.NotNullOrWhiteSpace(subject, nameof(subject), 500);
+        OpeningDate = DateTime.UtcNow;
+        TenantId = tenantId;
+    }
+
+    /// <summary>Assigns an SLA and its priority-specific (or SLA-default) response/resolution targets.</summary>
+    public void ApplySla(Guid serviceLevelAgreementId, decimal responseTimeHours, decimal resolutionTimeHours,
+        DateTime? responseByDate = null, DateTime? resolutionByDate = null)
+    {
+        ServiceLevelAgreementId = serviceLevelAgreementId;
+        FirstResponseTime = responseTimeHours;
+        ResolutionTime = resolutionTimeHours;
+        ResponseByDate = responseByDate;
+        ResolutionByDate = resolutionByDate;
+    }
+
+    /// <summary>
+    /// Resets SLA tracking metrics and recalculates deadlines.
+    /// Per ERPNext service_level_agreement.reset_service_level_agreement (#6007).
+    /// </summary>
+    public void ResetSla(
+        string resetReason,
+        Guid? newServiceLevelAgreementId = null,
+        decimal? newResponseTime = null,
+        decimal? newResolutionTime = null,
+        DateTime? newResponseBy = null,
+        DateTime? newResolutionBy = null,
+        string? newPriority = null)
+    {
+        if (Status is IssueStatus.Closed or IssueStatus.Cancelled)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        Check.NotNullOrWhiteSpace(resetReason, nameof(resetReason));
+
+        if (!string.IsNullOrWhiteSpace(newPriority))
+            Priority = newPriority;
+
+        if (newServiceLevelAgreementId.HasValue)
+            ServiceLevelAgreementId = newServiceLevelAgreementId.Value;
+
+        if (newResponseTime.HasValue)
+            FirstResponseTime = newResponseTime.Value;
+
+        if (newResolutionTime.HasValue)
+            ResolutionTime = newResolutionTime.Value;
+
+        ResponseByDate = newResponseBy;
+        ResolutionByDate = newResolutionBy;
+
+        OpeningDate = DateTime.UtcNow;
+        FirstRespondedOn = null;
+        TotalHoldTime = 0;
+        HoldStartedOn = null;
+        IsSlaBreach = false;
+        ResolutionDate = null;
+        Resolution = null;
+
+        if (Status == IssueStatus.Replied || Status == IssueStatus.OnHold)
+            Status = IssueStatus.Open;
+
+        AgreementStatus = AgreementStatus.FirstResponseDue;
+    }
+
+    public void Reply()
+    {
+        if (Status == IssueStatus.Open && !FirstRespondedOn.HasValue)
+            FirstRespondedOn = DateTime.UtcNow;
+
+        if (Status == IssueStatus.Open)
+            Status = IssueStatus.Replied;
+
+        UpdateAgreementStatus();
+    }
+
+    public void Hold()
+    {
+        if (Status is IssueStatus.Closed or IssueStatus.Cancelled)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = IssueStatus.OnHold;
+        HoldStartedOn = DateTime.UtcNow;
+        AgreementStatus = AgreementStatus.Paused;
+    }
+
+    public void Reopen(ServiceLevelAgreement? sla = null)
+    {
+        if (Status is not (IssueStatus.Closed or IssueStatus.Replied or IssueStatus.OnHold))
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        var now = DateTime.UtcNow;
+
+        // Accumulate hold time if we're coming off a hold (per ERPNext PR #61495: working hours when SLA provided)
+        if (Status == IssueStatus.OnHold && HoldStartedOn.HasValue)
+        {
+            var holdHours = sla != null
+                ? sla.GetWorkingHoursBetween(HoldStartedOn.Value, now)
+                : Math.Max(0m, (decimal)(now - HoldStartedOn.Value).TotalHours);
+            TotalHoldTime += holdHours;
+            HoldStartedOn = null;
+
+            if (sla != null && holdHours > 0)
+            {
+                if (!FirstRespondedOn.HasValue && ResponseByDate.HasValue)
+                    ResponseByDate = sla.ComputeDeadline(ResponseByDate.Value, holdHours);
+                if (ResolutionByDate.HasValue)
+                    ResolutionByDate = sla.ComputeDeadline(ResolutionByDate.Value, holdHours);
+            }
+        }
+        else if (Status == IssueStatus.Closed && ResolutionDate.HasValue)
+        {
+            // Per ERPNext PR #61466: accumulate closed duration into TotalHoldTime on reopen
+            // so future resolution time excludes the time the issue was closed, regardless of SLA.
+            var closedHours = sla != null
+                ? sla.GetWorkingHoursBetween(ResolutionDate.Value, now)
+                : Math.Max(0m, (decimal)(now - ResolutionDate.Value).TotalHours);
+            TotalHoldTime += closedHours;
+        }
+
+        Status = IssueStatus.Open;
+        ResolutionDate = null;
+        Resolution = null;
+        IsSlaBreach = false;
+        UpdateAgreementStatus();
+    }
+
+    public void Resolve(string? resolution = null, ServiceLevelAgreement? sla = null)
+    {
+        if (Status is IssueStatus.Closed or IssueStatus.Cancelled)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        var now = DateTime.UtcNow;
+
+        // If resolved while on hold, close the hold period first (per ERPNext PR #61495: working hours when SLA provided)
+        if (Status == IssueStatus.OnHold && HoldStartedOn.HasValue)
+        {
+            var holdHours = sla != null
+                ? sla.GetWorkingHoursBetween(HoldStartedOn.Value, now)
+                : Math.Max(0m, (decimal)(now - HoldStartedOn.Value).TotalHours);
+            TotalHoldTime += holdHours;
+            HoldStartedOn = null;
+
+            if (sla != null && holdHours > 0)
+            {
+                if (!FirstRespondedOn.HasValue && ResponseByDate.HasValue)
+                    ResponseByDate = sla.ComputeDeadline(ResponseByDate.Value, holdHours);
+                if (ResolutionByDate.HasValue)
+                    ResolutionByDate = sla.ComputeDeadline(ResolutionByDate.Value, holdHours);
+            }
+        }
+
+        Status = IssueStatus.Closed;
+        ResolutionDate = now;
+        Resolution = resolution;
+
+        // Check SLA breach: actual response or resolution time > target or past deadline (PR #61495)
+        if ((ResolutionTime.HasValue && ActualResolutionTimeHours > ResolutionTime.Value)
+            || (ResolutionByDate.HasValue && ResolutionDate.Value > ResolutionByDate.Value)
+            || (FirstResponseTime.HasValue && ActualFirstResponseTimeHours > FirstResponseTime.Value)
+            || (FirstRespondedOn.HasValue && ResponseByDate.HasValue && FirstRespondedOn.Value > ResponseByDate.Value))
+        {
+            IsSlaBreach = true;
+        }
+
+        AgreementStatus = IsSlaBreach ? AgreementStatus.Failed : AgreementStatus.Fulfilled;
+    }
+
+    public void Cancel()
+    {
+        if (Status == IssueStatus.Cancelled)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = IssueStatus.Cancelled;
+    }
+
+    /// <summary>Recomputes AgreementStatus from the current response/resolution state (called on non-terminal transitions).</summary>
+    public void UpdateAgreementStatus(DateTime? asOfUtc = null)
+    {
+        if (Status is IssueStatus.Closed or IssueStatus.Cancelled)
+            return;
+
+        if (Status == IssueStatus.OnHold)
+        {
+            AgreementStatus = AgreementStatus.Paused;
+            return;
+        }
+
+        var now = asOfUtc ?? DateTime.UtcNow;
+        if ((FirstRespondedOn.HasValue && ResponseByDate.HasValue && FirstRespondedOn.Value > ResponseByDate.Value)
+            || (FirstResponseTime.HasValue && ActualFirstResponseTimeHours > FirstResponseTime.Value)
+            || (!FirstRespondedOn.HasValue && ResponseByDate.HasValue && now > ResponseByDate.Value)
+            || (!ResolutionDate.HasValue && ResolutionByDate.HasValue && now > ResolutionByDate.Value))
+        {
+            IsSlaBreach = true;
+            AgreementStatus = AgreementStatus.Failed;
+            return;
+        }
+
+        AgreementStatus = FirstRespondedOn.HasValue
+            ? AgreementStatus.ResolutionDue
+            : AgreementStatus.FirstResponseDue;
+    }
+}

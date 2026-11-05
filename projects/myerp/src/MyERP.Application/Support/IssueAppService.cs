@@ -1,0 +1,318 @@
+using System;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Permissions;
+using MyERP.Support.Entities;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+
+namespace MyERP.Support;
+
+[Authorize(MyERPPermissions.Issues.Default)]
+public class IssueAppService : ApplicationService, IIssueAppService
+{
+    private readonly IRepository<Issue, Guid> _issueRepository;
+    private readonly IRepository<ServiceLevelAgreement, Guid> _slaRepository;
+
+    public IssueAppService(IRepository<Issue, Guid> issueRepository, IRepository<ServiceLevelAgreement, Guid> slaRepository)
+    {
+        _issueRepository = issueRepository;
+        _slaRepository = slaRepository;
+    }
+
+    public async Task<IssueDto> GetAsync(Guid id)
+    {
+        var issue = await _issueRepository.GetAsync(id);
+        return ObjectMapper.Map<Issue, IssueDto>(issue);
+    }
+
+    public async Task<PagedResultDto<IssueDto>> GetListAsync(GetIssueListDto input)
+    {
+        var query = await _issueRepository.GetQueryableAsync();
+        if (input.Status.HasValue)
+            query = query.Where(i => i.Status == input.Status.Value);
+        if (input.CompanyId.HasValue)
+            query = query.Where(i => i.CompanyId == input.CompanyId.Value);
+        if (!string.IsNullOrWhiteSpace(input.Filter))
+        {
+            var f = input.Filter;
+            query = query.Where(i => i.Subject.Contains(f));
+        }
+
+        var totalCount = query.Count();
+        var items = query.OrderByDescending(i => i.CreationTime)
+            .Skip(input.SkipCount).Take(input.MaxResultCount).ToList();
+
+        return new PagedResultDto<IssueDto>(totalCount, items.Select(ObjectMapper.Map<Issue, IssueDto>).ToList());
+    }
+
+    [Authorize(MyERPPermissions.Issues.Create)]
+    public async Task<IssueDto> CreateAsync(CreateIssueDto input)
+    {
+        if (input.CustomerId.HasValue)
+        {
+            var companyRestriction = LazyServiceProvider.LazyGetRequiredService<MyERP.Core.DomainServices.CompanyRestrictionValidationService>();
+            await companyRestriction.ValidateTransactionCompanyAsync(
+                "Issue", input.CompanyId, customerIds: new[] { input.CustomerId.Value });
+        }
+
+        var issue = new Issue(GuidGenerator.Create(), input.CompanyId, input.Subject, CurrentTenant.Id)
+        {
+            Description = input.Description,
+            Priority = input.Priority ?? "Medium",
+            IssueType = input.IssueType,
+            CustomerId = input.CustomerId,
+            RaisedVia = input.RaisedVia,
+        };
+
+        var sla = await FindApplicableSlaAsync(input.CompanyId, input.CustomerId);
+        if (sla != null)
+        {
+            var (responseHours, resolutionHours) = sla.GetTargets(issue.Priority);
+            issue.ApplySla(sla.Id, responseHours, resolutionHours,
+                sla.ComputeDeadline(issue.OpeningDate, responseHours),
+                sla.ComputeDeadline(issue.OpeningDate, resolutionHours));
+        }
+
+        await _issueRepository.InsertAsync(issue);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "Issue", issue.Id,
+            "Created", issue.CompanyId,
+            issue.Subject, "Draft", issue.Status.ToString(), CurrentUser.Id,
+            $"Issue '{issue.Subject}' created with priority {issue.Priority}", CurrentTenant.Id));
+
+        return ObjectMapper.Map<Issue, IssueDto>(issue);
+    }
+
+    /// <summary>
+    /// Resolves the applicable SLA: a Customer-scoped agreement takes precedence over the company default.
+    /// Mirrors ERPNext's get_active_service_level_agreement_for entity-priority lookup.
+    /// </summary>
+    private async Task<ServiceLevelAgreement?> FindApplicableSlaAsync(Guid companyId, Guid? customerId)
+    {
+        var query = (await _slaRepository.WithDetailsAsync())
+            .Where(s => s.CompanyId == companyId && s.IsActive);
+
+        if (customerId.HasValue)
+        {
+            var scoped = query.FirstOrDefault(s => s.EntityType == "Customer" && s.EntityId == customerId.Value);
+            if (scoped != null) return scoped;
+        }
+
+        return query.FirstOrDefault(s => s.IsDefault);
+    }
+
+    [Authorize(MyERPPermissions.Issues.Edit)]
+    public async Task<IssueDto> ReplyAsync(Guid id)
+    {
+        var issue = await _issueRepository.GetAsync(id);
+        issue.Reply();
+        await _issueRepository.UpdateAsync(issue);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "Issue", issue.Id,
+            "Replied", issue.CompanyId,
+            issue.Subject, issue.Status.ToString(), issue.Status.ToString(), CurrentUser.Id,
+            $"Reply added to issue '{issue.Subject}'", CurrentTenant.Id));
+
+        return ObjectMapper.Map<Issue, IssueDto>(issue);
+    }
+
+    [Authorize(MyERPPermissions.Issues.Edit)]
+    public async Task<IssueDto> ResolveAsync(Guid id, ResolveIssueDto input)
+    {
+        var issue = await _issueRepository.GetAsync(id);
+        var sla = issue.ServiceLevelAgreementId.HasValue
+            ? await _slaRepository.FindAsync(issue.ServiceLevelAgreementId.Value)
+            : null;
+        issue.Resolve(input.Resolution, sla);
+        await _issueRepository.UpdateAsync(issue);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "Issue", issue.Id,
+            "Resolved", issue.CompanyId,
+            issue.Subject, issue.Status.ToString(), "Resolved", CurrentUser.Id,
+            $"Issue {issue.Subject} resolved. Resolution: {input.Resolution}", CurrentTenant.Id));
+
+        return ObjectMapper.Map<Issue, IssueDto>(issue);
+    }
+
+    [Authorize(MyERPPermissions.Issues.Edit)]
+    public async Task<IssueDto> ReopenAsync(Guid id)
+    {
+        var issue = await _issueRepository.GetAsync(id);
+        var sla = issue.ServiceLevelAgreementId.HasValue
+            ? await _slaRepository.FindAsync(issue.ServiceLevelAgreementId.Value)
+            : null;
+        issue.Reopen(sla);
+        await _issueRepository.UpdateAsync(issue);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "Issue", issue.Id,
+            "Reopened", issue.CompanyId,
+            issue.Subject, issue.Status.ToString(), "Open", CurrentUser.Id,
+            $"Issue {issue.Subject} reopened", CurrentTenant.Id));
+
+        return ObjectMapper.Map<Issue, IssueDto>(issue);
+    }
+
+    [Authorize(MyERPPermissions.Issues.Edit)]
+    public async Task<IssueDto> HoldAsync(Guid id)
+    {
+        var issue = await _issueRepository.GetAsync(id);
+        issue.Hold();
+        await _issueRepository.UpdateAsync(issue);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "Issue", issue.Id,
+            "OnHold", issue.CompanyId,
+            issue.Subject, issue.Status.ToString(), "OnHold", CurrentUser.Id,
+            $"Issue {issue.Subject} put on hold", CurrentTenant.Id));
+
+        return ObjectMapper.Map<Issue, IssueDto>(issue);
+    }
+
+    [Authorize(MyERPPermissions.Issues.Create)]
+    public async Task<IssueDto> SplitAsync(Guid id, SplitIssueDto input)
+    {
+        var originalIssue = await _issueRepository.GetAsync(id);
+
+        var splitIssue = new Issue(Guid.NewGuid(), originalIssue.CompanyId, input.Subject, originalIssue.TenantId)
+        {
+            Description = originalIssue.Description,
+            Priority = originalIssue.Priority,
+            IssueType = originalIssue.IssueType,
+            CustomerId = originalIssue.CustomerId,
+            ContactId = originalIssue.ContactId,
+            AssignedToId = originalIssue.AssignedToId,
+            RaisedVia = originalIssue.RaisedVia,
+            SplitFromIssueId = originalIssue.Id
+        };
+
+        var sla = await FindApplicableSlaAsync(splitIssue.CompanyId, splitIssue.CustomerId);
+        if (sla != null)
+        {
+            var (responseHours, resolutionHours) = sla.GetTargets(splitIssue.Priority);
+            splitIssue.ApplySla(sla.Id, responseHours, resolutionHours,
+                sla.ComputeDeadline(splitIssue.OpeningDate, responseHours),
+                sla.ComputeDeadline(splitIssue.OpeningDate, resolutionHours));
+        }
+
+        await _issueRepository.InsertAsync(splitIssue);
+
+        var activityLogRepo = LazyServiceProvider?.LazyGetService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        if (activityLogRepo != null)
+        {
+            await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+                Guid.NewGuid(), "Issue", splitIssue.Id,
+                "Created", splitIssue.CompanyId,
+                splitIssue.Subject, "Draft", splitIssue.Status.ToString(), CurrentUser?.Id,
+                $"Issue '{splitIssue.Subject}' split from '{originalIssue.Subject}'", CurrentTenant?.Id));
+        }
+
+        return MapToDto(splitIssue);
+    }
+
+    [Authorize(MyERPPermissions.Issues.Edit)]
+    public async Task<IssueDto> ResetSlaAsync(Guid id, ResetIssueSlaDto input)
+    {
+        if (string.IsNullOrWhiteSpace(input.ResetReason))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Reset reason is required to reset Service Level Agreement.");
+        }
+
+        var issue = await _issueRepository.GetAsync(id);
+
+        var effectivePriority = input.NewPriority ?? issue.Priority;
+        ServiceLevelAgreement? sla = null;
+        if (input.NewServiceLevelAgreementId.HasValue)
+        {
+            sla = await _slaRepository.FindAsync(input.NewServiceLevelAgreementId.Value);
+        }
+        else if (issue.ServiceLevelAgreementId.HasValue)
+        {
+            sla = await _slaRepository.FindAsync(issue.ServiceLevelAgreementId.Value);
+        }
+        else
+        {
+            sla = await FindApplicableSlaAsync(issue.CompanyId, issue.CustomerId);
+        }
+
+        decimal? responseHours = null;
+        decimal? resolutionHours = null;
+        DateTime? responseByDate = null;
+        DateTime? resolutionByDate = null;
+
+        if (sla != null)
+        {
+            var (respHours, resolHours) = sla.GetTargets(effectivePriority);
+            responseHours = respHours;
+            resolutionHours = resolHours;
+            responseByDate = sla.ComputeDeadline(DateTime.UtcNow, respHours);
+            resolutionByDate = sla.ComputeDeadline(DateTime.UtcNow, resolHours);
+        }
+
+        issue.ResetSla(
+            input.ResetReason,
+            sla?.Id,
+            responseHours,
+            resolutionHours,
+            responseByDate,
+            resolutionByDate,
+            input.NewPriority);
+
+        await _issueRepository.UpdateAsync(issue);
+
+        var activityLogRepo = LazyServiceProvider?.LazyGetService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        if (activityLogRepo != null)
+        {
+            await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+                Guid.NewGuid(), "Issue", issue.Id,
+                "SlaReset", issue.CompanyId,
+                issue.Subject, issue.Status.ToString(), issue.Status.ToString(), CurrentUser?.Id,
+                $"SLA reset for issue '{issue.Subject}'. Reason: {input.ResetReason}", CurrentTenant?.Id));
+        }
+
+        return MapToDto(issue);
+    }
+
+    private static IssueDto MapToDto(Issue issue) => new()
+    {
+        Id = issue.Id,
+        CompanyId = issue.CompanyId,
+        Subject = issue.Subject,
+        Description = issue.Description,
+        Priority = issue.Priority,
+        IssueType = issue.IssueType,
+        CustomerId = issue.CustomerId,
+        AssignedToId = issue.AssignedToId,
+        RaisedVia = issue.RaisedVia,
+        OpeningDate = issue.OpeningDate,
+        ResolutionDate = issue.ResolutionDate,
+        Resolution = issue.Resolution,
+        FirstRespondedOn = issue.FirstRespondedOn,
+        TotalHoldTimeSeconds = (double)(issue.TotalHoldTime * 3600m),
+        ActualResolutionTimeHours = issue.ActualResolutionTimeHours,
+        ActualFirstResponseTimeHours = issue.ActualFirstResponseTimeHours,
+        IsSlaBreach = issue.IsSlaBreach,
+        Status = issue.Status,
+        ServiceLevelAgreementId = issue.ServiceLevelAgreementId,
+        FirstResponseTime = issue.FirstResponseTime,
+        ResolutionTime = issue.ResolutionTime,
+        ResponseByDate = issue.ResponseByDate,
+        ResolutionByDate = issue.ResolutionByDate,
+        AgreementStatus = issue.AgreementStatus,
+        SplitFromIssueId = issue.SplitFromIssueId
+    };
+}
+

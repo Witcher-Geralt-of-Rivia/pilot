@@ -1,0 +1,353 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using MyERP.Accounting.DomainServices;
+using MyERP.Core;
+using Volo.Abp;
+using Volo.Abp.Domain.Entities.Auditing;
+using Volo.Abp.MultiTenancy;
+
+namespace MyERP.Sales.Entities;
+
+/// <summary>
+/// Delivery Note — records goods dispatched to customer.
+/// Maps to ERPNext stock/doctype/delivery_note.
+/// Links to Sales Order and subsequently to Sales Invoice.
+/// </summary>
+public class DeliveryNote : FullAuditedAggregateRoot<Guid>, IMultiTenant, IAccountableDocument, IAmendable
+{
+    public Guid? TenantId { get; set; }
+    public Guid CompanyId { get; set; }
+    public Guid? BranchId { get; set; }
+
+    public string DeliveryNumber { get; set; } = null!;
+    public DateTime PostingDate { get; set; }
+
+    public Guid CustomerId { get; set; }
+
+    /// <summary>Reference to Sales Order this delivery fulfills.</summary>
+    public Guid? SalesOrderId { get; set; }
+
+    /// <summary>Reference to Pick List this delivery fulfills.</summary>
+    public Guid? PickListId { get; set; }
+
+    /// <summary>Target warehouse from which goods are dispatched.</summary>
+    public Guid WarehouseId { get; set; }
+
+    /// <summary>Shipping address (free text or link).</summary>
+    public string? ShippingAddress { get; set; }
+
+    /// <summary>Billing address (auto-resolved from SO or Customer).</summary>
+    public Guid? BillingAddressId { get; set; }
+
+    /// <summary>Shipping address reference (auto-resolved from SO or Customer).</summary>
+    public Guid? ShippingAddressId { get; set; }
+
+    /// <summary>Billing contact person (Contact ID).</summary>
+    public Guid? ContactPersonId { get; set; }
+
+    /// <summary>Shipping contact person (Contact ID) per ERPNext PR #58159.</summary>
+    public Guid? ShippingContactPersonId { get; set; }
+
+    /// <summary>Transporter name or reference.</summary>
+    public string? Transporter { get; set; }
+
+    /// <summary>LR (Lorry Receipt) or tracking number.</summary>
+    public string? TrackingNumber { get; set; }
+
+    public string CurrencyCode { get; set; } = "MYR";
+    public decimal NetTotal { get; set; }
+    public decimal TaxAmount { get; set; }
+    public decimal GrandTotal { get; set; }
+
+    /// <summary>Whether this is a return delivery (reversal).</summary>
+    public bool IsReturn { get; set; }
+
+    /// <summary>If IsReturn, reference to the original delivery note.</summary>
+    public Guid? ReturnAgainstId { get; set; }
+
+    public string? Notes { get; set; }
+
+    // Amendment support
+    public Guid? AmendedFromId { get; set; }
+    public int AmendmentIndex { get; set; }
+
+    public DocumentStatus Status { get; private set; } = DocumentStatus.Draft;
+
+    /// <summary>Exchange rate for multi-currency deliveries (transaction → company currency).</summary>
+    public decimal ExchangeRate { get; set; } = 1m;
+
+    // IAccountableDocument
+    string IAccountableDocument.DocumentType => "DeliveryNote";
+    Guid? IAccountableDocument.CustomerId => CustomerId;
+    Guid? IAccountableDocument.SupplierId => null;
+
+    /// <summary>
+    /// Total stock cost at valuation rate (for COGS GL posting).
+    /// Calculated during submit as SUM(item.StockQty × item.ValuationRate).
+    /// Per ERPNext: GL entry uses actual stock cost, NOT selling price.
+    /// </summary>
+    public decimal StockCostTotal { get; set; }
+    decimal IAccountableDocument.StockCostTotal => StockCostTotal;
+
+    private readonly List<DeliveryNoteItem> _items = new();
+    /// <summary>Rows in document order (Idx), since the database gives no ordering guarantee.</summary>
+    public IReadOnlyList<DeliveryNoteItem> Items => _items.OrderBy(i => i.Idx).ThenBy(i => i.CreationTime).ToList();
+
+    /// <summary>
+    /// Billing completion percentage (0-100).
+    /// Uses weighted sum-of-min formula per ERPNext StatusUpdater / StockController (PR #58869, PR #58953).
+    /// Excludes closed rows (settled by close, per ERPNext PR #57596).
+    /// Preserves original basis when 100% returned.
+    /// </summary>
+    public decimal PerBilled
+    {
+        get
+        {
+            if (!_items.Any()) return 0m;
+            var openItems = _items.Where(i => !i.IsClosed).ToList();
+            var basis = openItems.Count > 0 ? openItems : _items;
+            if (basis.Count == 0) return 0m;
+
+            var basisTotal = basis.Sum(i => Math.Max(0, Math.Abs(i.Quantity) - Math.Abs(i.ReturnedQty)) * i.UnitPrice);
+            if (basisTotal > 0)
+            {
+                var billedAmount = basis.Sum(i => Math.Min(Math.Max(0, Math.Abs(i.Quantity) - Math.Abs(i.ReturnedQty)), Math.Abs(i.BilledQty)) * i.UnitPrice);
+                return Math.Min(100m, Math.Round(billedAmount / basisTotal * 100m, 2));
+            }
+
+            var totalNetQty = basis.Sum(i => Math.Max(0, Math.Abs(i.Quantity) - Math.Abs(i.ReturnedQty)));
+            if (totalNetQty > 0)
+            {
+                var billedQty = basis.Sum(i => Math.Min(Math.Max(0, Math.Abs(i.Quantity) - Math.Abs(i.ReturnedQty)), Math.Abs(i.BilledQty)));
+                return Math.Min(100m, Math.Round(billedQty / totalNetQty * 100m, 2));
+            }
+
+            // All items returned or net is 0. Per ERPNext commit 8290a83591 & PR #60602:
+            // Fall back to original amount/qty basis to determine if it was actually billed before return.
+            // If never billed, PerBilled stays 0 (enabling status "Return Issued"). If billed prior to return, PerBilled stays 100.
+            var origTotal = basis.Sum(i => Math.Abs(i.Quantity) * i.UnitPrice);
+            if (origTotal > 0)
+            {
+                var billedAmt = basis.Sum(i => Math.Min(Math.Abs(i.Quantity), Math.Abs(i.BilledQty)) * i.UnitPrice);
+                return Math.Min(100m, Math.Round(billedAmt / origTotal * 100m, 2));
+            }
+
+            var origQty = basis.Sum(i => Math.Abs(i.Quantity));
+            if (origQty > 0)
+            {
+                var billedQty = basis.Sum(i => Math.Min(Math.Abs(i.Quantity), Math.Abs(i.BilledQty)));
+                return Math.Min(100m, Math.Round(billedQty / origQty * 100m, 2));
+            }
+
+            return 0m;
+        }
+    }
+
+    /// <summary>
+    /// Percentage of delivered quantity returned.
+    /// Per ERPNext: SUM(returned_qty) / SUM(qty) * 100.
+    /// </summary>
+    public decimal PerReturned
+    {
+        get
+        {
+            if (!_items.Any()) return 0;
+            var totalQty = _items.Sum(i => Math.Abs(i.Quantity));
+            if (totalQty == 0) return 0;
+            var totalReturned = _items.Sum(i => Math.Abs(i.ReturnedQty));
+            return Math.Round(totalReturned / totalQty * 100m, 2);
+        }
+    }
+
+    /// <summary>
+    /// Delivery Note Billing Status indicator per ERPNext status updater (PR #58953, PR #58869, commit 8290a83591):
+    /// Draft -> To Bill (0%) -> Partially Billed (0-100%) -> Completed (100%) / Return / Return Issued (100% returned) / Cancelled / Closed
+    /// </summary>
+    public string BillingStatus
+    {
+        get
+        {
+            if (Status == DocumentStatus.Draft) return "Draft";
+            if (Status == DocumentStatus.Cancelled) return "Cancelled";
+            if (Status == DocumentStatus.Closed) return "Closed";
+            // Per ERPNext commit 8290a83591: Completed takes precedence over Return Issued when fully billed
+            if (PerBilled >= 100m) return "Completed";
+            if (IsReturn) return "Return";
+            if (PerReturned >= 100m) return "Return Issued";
+            if (PerBilled > 0m || _items.Any(i => i.BilledQty > 0)) return "Partially Billed";
+            return "To Bill";
+        }
+    }
+
+    public void UpdateBillingStatus()
+    {
+        // PerBilled and PerReturned are computed dynamically from item-level BilledQty and ReturnedQty
+    }
+
+    /// <summary>
+    /// Installation completion percentage. Uses MIN% formula per ERPNext StatusUpdater.
+    /// Excludes closed rows.
+    /// </summary>
+    public decimal PerInstalled
+    {
+        get
+        {
+            if (!_items.Any()) return 0;
+            var openItems = _items.Where(i => !i.IsClosed).ToList();
+            var basis = openItems.Count > 0 ? openItems : _items;
+            return Math.Round(basis.Min(i =>
+            {
+                var netQty = Math.Max(0, Math.Abs(i.Quantity) - Math.Abs(i.ReturnedQty));
+                return netQty == 0 ? 100 : Math.Min(100, Math.Abs(i.InstalledQty) / netQty * 100);
+            }), 2);
+        }
+    }
+
+    /// <summary>
+    /// Delivery Note Installation Status indicator per ERPNext status updater:
+    /// Not Installed -> Partially Installed -> Installed
+    /// </summary>
+    public string InstallationStatus
+    {
+        get
+        {
+            if (Status == DocumentStatus.Draft || Status == DocumentStatus.Cancelled) return "Not Installed";
+            if (PerInstalled >= 100m) return "Installed";
+            if (PerInstalled > 0m || _items.Any(i => i.InstalledQty > 0)) return "Partially Installed";
+            return "Not Installed";
+        }
+    }
+
+    protected DeliveryNote() { }
+
+    public DeliveryNote(Guid id, Guid companyId, Guid customerId, Guid warehouseId, string deliveryNumber, DateTime postingDate, Guid? tenantId = null)
+        : base(id)
+    {
+        CompanyId = Check.NotDefaultOrNull<Guid>(companyId, nameof(companyId));
+        CustomerId = Check.NotDefaultOrNull<Guid>(customerId, nameof(customerId));
+        WarehouseId = Check.NotDefaultOrNull<Guid>(warehouseId, nameof(warehouseId));
+        DeliveryNumber = Check.NotNullOrWhiteSpace(deliveryNumber, nameof(deliveryNumber), 50);
+        PostingDate = postingDate;
+        TenantId = tenantId;
+    }
+
+    public void AddItem(Guid itemId, string description, decimal quantity, decimal unitPrice, decimal taxAmount, string uom = "Unit", Guid? salesOrderItemId = null, Guid? pickListItemId = null)
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        // Per DO-NOT: returns must always have negative qty
+        if (!IsReturn && quantity <= 0)
+            throw new ArgumentException("Quantity must be positive for non-return delivery notes.", nameof(quantity));
+        if (IsReturn && quantity >= 0)
+            throw new ArgumentException("Quantity must be negative for return delivery notes.", nameof(quantity));
+
+        var newItem = new DeliveryNoteItem(
+            Guid.NewGuid(), Id, itemId, description, quantity, unitPrice, taxAmount, uom, salesOrderItemId, pickListItemId);
+        newItem.Idx = _items.Count;
+        _items.Add(newItem);
+
+        RecalculateTotals();
+    }
+
+    public void ClearItems()
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        _items.Clear();
+        RecalculateTotals();
+    }
+
+    public void Submit()
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        if (!_items.Any())
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        // Auto-correct conversion factor when UOM equals StockUOM (gotcha #6171)
+        foreach (var item in _items)
+        {
+            if (!string.IsNullOrEmpty(item.Uom) && !string.IsNullOrEmpty(item.StockUom)
+                && string.Equals(item.Uom, item.StockUom, StringComparison.OrdinalIgnoreCase)
+                && item.ConversionFactor != 1.0m)
+            {
+                item.ConversionFactor = 1.0m;
+            }
+        }
+
+        if (IsReturn && !_items.Any(i => i.Quantity < 0))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "At least one item must be entered with negative quantity in a return document.");
+        }
+
+        Status = DocumentStatus.Submitted;
+        AddLocalEvent(new DeliveryNoteSubmittedEvent(this));
+    }
+
+    public void Cancel()
+    {
+        if (Status != DocumentStatus.Submitted)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = DocumentStatus.Cancelled;
+    }
+
+    /// <summary>Closes an individual item row (per ERPNext PR #57596).</summary>
+    public void CloseItem(Guid itemRowId)
+    {
+        var item = _items.FirstOrDefault(i => i.Id == itemRowId);
+        if (item == null || item.IsClosed) return;
+        if (Math.Abs(item.BilledQty) >= Math.Abs(item.Quantity))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"Item {item.Description} is already completed in full, so there is nothing to close.");
+        }
+        item.IsClosed = true;
+        if (_items.All(i => i.IsClosed))
+        {
+            Status = DocumentStatus.Closed;
+        }
+    }
+
+    /// <summary>Reopens an individual item row.</summary>
+    public void ReopenItem(Guid itemRowId)
+    {
+        var item = _items.FirstOrDefault(i => i.Id == itemRowId);
+        if (item == null || !item.IsClosed) return;
+        item.IsClosed = false;
+        if (Status == DocumentStatus.Closed)
+        {
+            Status = DocumentStatus.Submitted;
+        }
+    }
+
+    /// <summary>Closes the Delivery Note.</summary>
+    public void Close()
+    {
+        if (Status != DocumentStatus.Submitted)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = DocumentStatus.Closed;
+    }
+
+    /// <summary>Reopens a closed Delivery Note.</summary>
+    public void Reopen()
+    {
+        if (Status != DocumentStatus.Closed)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        if (_items.Count > 0 && _items.All(i => i.IsClosed))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Every row of Delivery Note is closed. Reopen the rows you need instead.");
+        }
+        Status = DocumentStatus.Submitted;
+    }
+
+    private void RecalculateTotals()
+    {
+        NetTotal = _items.Sum(i => i.LineTotal);
+        TaxAmount = _items.Sum(i => i.TaxAmount);
+        GrandTotal = NetTotal + TaxAmount;
+    }
+}

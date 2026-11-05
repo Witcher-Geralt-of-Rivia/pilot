@@ -1,0 +1,420 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Volo.Abp;
+using Volo.Abp.Domain.Entities.Auditing;
+using Volo.Abp.MultiTenancy;
+
+namespace MyERP.Manufacturing.Entities;
+
+/// <summary>
+/// Work Order — production execution referencing a BOM.
+/// </summary>
+public class WorkOrder : FullAuditedAggregateRoot<Guid>, IMultiTenant
+{
+    public Guid? TenantId { get; set; }
+
+    public string WorkOrderNumber { get; set; } = null!;
+    public WorkOrderStatus Status { get; private set; }
+
+    public Guid ItemId { get; set; }
+    public Guid BomId { get; set; }
+    public decimal Quantity { get; set; }
+    public decimal ProducedQuantity { get; set; }
+    public decimal DisassembledQuantity { get; set; }
+    public decimal MaterialTransferred { get; set; }
+    public decimal ProcessLossQty { get; set; }
+    public decimal ProcessLossPercentage { get; set; }
+
+    /// <summary>
+    /// Effective FG quantity after process loss deduction.
+    /// Per ERPNext: fg_completed_qty = quantity - process_loss_qty
+    /// </summary>
+    public decimal EffectiveFgQuantity =>
+        ProcessLossQty > 0
+            ? Quantity - ProcessLossQty
+            : (ProcessLossPercentage > 0
+                ? Quantity * (1 - ProcessLossPercentage / 100m)
+                : Quantity);
+
+    /// <summary>
+    /// Percentage of production completed (based on total WO quantity, not FG quantity).
+    /// </summary>
+    public decimal PercentComplete =>
+        Quantity > 0 ? Math.Min(100, Math.Round(ProducedQuantity / Quantity * 100, 2)) : 0;
+
+    public Guid CompanyId { get; set; }
+    public Guid? SalesOrderId { get; set; }
+    public Guid? SalesOrderItemId { get; set; }
+    public Guid? ProductionPlanId { get; set; }
+    public Guid? ProductionPlanItemId { get; set; }
+    public Guid? ProductionPlanSubAssemblyItemId { get; set; }
+    public Guid? MaterialRequestId { get; set; }
+    public Guid? MaterialRequestItemId { get; set; }
+    public Guid? SourceWarehouseId { get; set; }
+    public Guid? WipWarehouseId { get; set; }
+    public Guid? FgWarehouseId { get; set; }
+    public Guid? ScrapWarehouseId { get; set; }
+
+    public DateTime? PlannedStartDate { get; set; }
+    public DateTime? PlannedEndDate { get; set; }
+    public DateTime? ActualStartDate { get; set; }
+    public DateTime? ActualEndDate { get; set; }
+    /// <summary>
+    /// Lead time in minutes calculated from actual start and end dates.
+    /// Maps to ERPNext manufacturing/doctype/work_order/work_order.json (lead_time).
+    /// </summary>
+    public decimal? LeadTime { get; set; }
+
+    public string? Notes { get; set; }
+    public bool TrackSemiFinishedGoods { get; set; }
+    public bool SkipTransfer { get; set; }
+    /// <summary>Backflush from WIP warehouse even when skip_transfer is enabled (ERPNext PR #49280 / commit fe0722c4f1).</summary>
+    public bool FromWipWarehouse { get; set; }
+    /// <summary>
+    /// Whether to reserve raw material stock when Work Order is submitted.
+    /// Maps to ERPNext manufacturing/doctype/work_order/work_order.json (reserve_stock).
+    /// </summary>
+    public bool ReserveStock { get; set; }
+
+    /// <summary>
+    /// Allow substituting required items with registered Item Alternatives during material transfer/consumption.
+    /// Maps to ERPNext manufacturing/doctype/work_order/work_order.json (allow_alternative_item).
+    /// </summary>
+    public bool AllowAlternativeItem { get; set; }
+
+    /// <summary>
+    /// Batch size for manufacturing.
+    /// Maps to ERPNext manufacturing/doctype/work_order/work_order.json (batch_size).
+    /// </summary>
+    public decimal BatchSize { get; set; } = 0m;
+
+    /// <summary>
+    /// Additional operating cost for the work order, distributed to finished goods stock entry.
+    /// Maps to ERPNext manufacturing/doctype/work_order/work_order.json (additional_operating_cost).
+    /// </summary>
+    public decimal AdditionalOperatingCost { get; set; } = 0m;
+
+    public List<WorkOrderItem> RequiredItems { get; private set; } = new();
+
+    protected WorkOrder() { }
+
+    public WorkOrder(Guid id, Guid companyId, string workOrderNumber, Guid itemId, Guid bomId, decimal quantity, Guid? tenantId = null)
+        : base(id)
+    {
+        CompanyId = Check.NotDefaultOrNull<Guid>(companyId, nameof(companyId));
+        WorkOrderNumber = workOrderNumber;
+        ItemId = Check.NotDefaultOrNull<Guid>(itemId, nameof(itemId));
+        BomId = Check.NotDefaultOrNull<Guid>(bomId, nameof(bomId));
+        Quantity = quantity;
+        Status = WorkOrderStatus.Draft;
+        TenantId = tenantId;
+    }
+
+    public void SetPlannedDates(DateTime? startDate, DateTime? endDate)
+    {
+        if (startDate.HasValue && endDate.HasValue && endDate.Value < startDate.Value)
+            throw new BusinessException(MyERPDomainErrorCodes.PlannedEndDateBeforeStartDate);
+        PlannedStartDate = startDate;
+        PlannedEndDate = endDate;
+    }
+
+    public void ClearRequiredItems()
+    {
+        if (Status != WorkOrderStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        RequiredItems.Clear();
+    }
+
+    /// <summary>
+    /// Validates whole number quantity when item stock UOM has MustBeWholeNumber set (gotcha #497).
+    /// </summary>
+    public void ValidateWholeNumberQuantity(bool mustBeWholeNumber)
+    {
+        if (mustBeWholeNumber)
+        {
+            var rounded = Math.Round(Quantity, 4);
+            if (Math.Abs(Math.Round(rounded, 0) - rounded) > 0.0000001m)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Quantity {Quantity} must be a whole number for this item's UOM.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Validates batch size cannot be negative.
+    /// Per ERPNext PR #60647 / commit 3d70a00f40.
+    /// </summary>
+    public void ValidateBatchSize()
+    {
+        if (BatchSize < 0)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.BatchSizeCannotBeNegative)
+                .WithData("batchSize", BatchSize);
+        }
+    }
+
+    public void ValidateDates()
+    {
+        if (PlannedStartDate.HasValue && PlannedEndDate.HasValue && PlannedEndDate.Value < PlannedStartDate.Value)
+            throw new BusinessException(MyERPDomainErrorCodes.PlannedEndDateBeforeStartDate);
+        if (ActualStartDate.HasValue && ActualEndDate.HasValue && ActualEndDate.Value < ActualStartDate.Value)
+            throw new BusinessException(MyERPDomainErrorCodes.ActualEndDateBeforeStartDate);
+    }
+
+    public void Submit()
+    {
+        if (Status != WorkOrderStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        ValidateBatchSize();
+        ValidateDates();
+        Status = WorkOrderStatus.Submitted;
+        if (ReserveStock)
+        {
+            UpdateReservationStatus();
+        }
+    }
+
+    /// <summary>
+    /// Calculates reservation status when Work Order is submitted and ReserveStock is enabled.
+    /// Per ERPNext PR #60161 / commit 1334acafe2:
+    /// - If no items have reservations, status remains unchanged.
+    /// - If any required item has StockReservedQty &lt; RequiredQuantity, status is StockPartiallyReserved.
+    /// - Only if all required items have StockReservedQty &gt;= RequiredQuantity, status is StockReserved.
+    /// </summary>
+    public WorkOrderStatus GetReservationStatus(WorkOrderStatus fallbackStatus = WorkOrderStatus.NotStarted)
+    {
+        if (!ReserveStock || !RequiredItems.Any())
+            return fallbackStatus;
+
+        if (!RequiredItems.Any(r => r.StockReservedQty > 0))
+            return fallbackStatus;
+
+        if (RequiredItems.Any(r => r.StockReservedQty < r.RequiredQuantity))
+            return WorkOrderStatus.StockPartiallyReserved;
+
+        return WorkOrderStatus.StockReserved;
+    }
+
+    public void UpdateReservationStatus()
+    {
+        if (Status is WorkOrderStatus.Submitted or WorkOrderStatus.NotStarted or WorkOrderStatus.StockReserved or WorkOrderStatus.StockPartiallyReserved)
+        {
+            Status = GetReservationStatus(WorkOrderStatus.NotStarted);
+        }
+    }
+
+    public void Start()
+    {
+        if (Status is not (WorkOrderStatus.Submitted or WorkOrderStatus.NotStarted or WorkOrderStatus.StockReserved or WorkOrderStatus.StockPartiallyReserved))
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = WorkOrderStatus.InProcess;
+        ActualStartDate ??= DateTime.UtcNow;
+    }
+
+    public void RecordProduction(decimal quantity, decimal overproductionPercentage = 0, decimal processLoss = 0)
+    {
+        if (Status != WorkOrderStatus.InProcess)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        // Overproduction check: cannot exceed qty × (1 + overproduction_pct/100)
+        // Per ERPNext PR #58847: cumulative manufactured quantity including process loss
+        var maxAllowed = Quantity * (1 + overproductionPercentage / 100m);
+        var totalManufactured = ProducedQuantity + ProcessLossQty + quantity + processLoss;
+        if (totalManufactured > maxAllowed)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.WorkOrderOverproduction)
+                .WithData("maxAllowed", maxAllowed)
+                .WithData("produced", ProducedQuantity + ProcessLossQty)
+                .WithData("attempted", quantity + processLoss);
+        }
+
+        ProducedQuantity += quantity;
+        if (processLoss > 0)
+        {
+            ProcessLossQty += processLoss;
+        }
+
+        // Per ERPNext PR #57895 / #57903 / commit 0eb61c9fac:
+        // Completion is reached when ProducedQuantity + ProcessLossQty covers ordered Quantity
+        if (ProducedQuantity + ProcessLossQty >= Quantity)
+        {
+            Status = WorkOrderStatus.Completed;
+            ActualEndDate = DateTime.UtcNow;
+            CalculateLeadTime();
+        }
+    }
+
+    /// <summary>
+    /// Sets actual start and end dates and recalculates lead time.
+    /// Per ERPNext PR #60196 / commit 1e3b9e39be.
+    /// </summary>
+    public void SetActualDates(DateTime? actualStartDate, DateTime? actualEndDate)
+    {
+        ActualStartDate = actualStartDate;
+        ActualEndDate = actualEndDate;
+        CalculateLeadTime();
+    }
+
+    /// <summary>
+    /// Calculates lead time in minutes from actual start and end dates.
+    /// Maps to ERPNext manufacturing/doctype/work_order/services/operations.py (set_lead_time).
+    /// </summary>
+    public void CalculateLeadTime()
+    {
+        if (ActualStartDate.HasValue && ActualEndDate.HasValue && ActualEndDate.Value >= ActualStartDate.Value)
+        {
+            var diffInMinutes = (decimal)(ActualEndDate.Value - ActualStartDate.Value).TotalMinutes;
+            LeadTime = Math.Max(0m, Math.Round(diffInMinutes, 2));
+        }
+        else
+        {
+            LeadTime = null;
+        }
+    }
+
+    /// <summary>
+    /// Reverses recorded production and process loss (e.g. on Stock Entry cancellation).
+    /// Reopens the Work Order to InProcess if below ordered Quantity.
+    /// Per ERPNext PR #60421 (commit 00ca106bf5): manufactured qty cannot be less than disassembled qty.
+    /// </summary>
+    public void ReverseProduction(decimal quantity, decimal processLoss = 0)
+    {
+        var newProducedQuantity = Math.Max(0, ProducedQuantity - quantity);
+        if (newProducedQuantity < DisassembledQuantity)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ManufactureCannotBeLessThanDisassembled)
+                .WithData("produced", newProducedQuantity)
+                .WithData("disassembled", DisassembledQuantity)
+                .WithData("workOrder", WorkOrderNumber ?? Id.ToString());
+        }
+
+        ProducedQuantity = newProducedQuantity;
+        if (processLoss > 0)
+        {
+            ProcessLossQty = Math.Max(0, ProcessLossQty - processLoss);
+        }
+
+        if (Status == WorkOrderStatus.Completed && (ProducedQuantity + ProcessLossQty) < Quantity)
+        {
+            Status = WorkOrderStatus.InProcess;
+            ActualEndDate = null;
+            LeadTime = null;
+        }
+    }
+
+    /// <summary>
+    /// Refreshes process loss quantity and checks completion for semi-finished goods tracking.
+    /// Per ERPNext commit 0eb61c9fac / PR #57895.
+    /// </summary>
+    public void SetProcessLossQty(decimal totalProcessLoss, decimal overproductionPercentage = 0)
+    {
+        var maxAllowed = Quantity * (1 + overproductionPercentage / 100m);
+        var totalManufactured = ProducedQuantity + totalProcessLoss;
+        if (totalManufactured > maxAllowed)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.WorkOrderOverproduction)
+                .WithData("maxAllowed", maxAllowed)
+                .WithData("produced", ProducedQuantity + ProcessLossQty)
+                .WithData("attempted", totalProcessLoss);
+        }
+
+        ProcessLossQty = totalProcessLoss;
+        if (ProducedQuantity + ProcessLossQty >= Quantity
+            && Status != WorkOrderStatus.Cancelled
+            && Status != WorkOrderStatus.Draft
+            && Status != WorkOrderStatus.Closed
+            && Status != WorkOrderStatus.Stopped)
+        {
+            Status = WorkOrderStatus.Completed;
+            ActualEndDate ??= DateTime.UtcNow;
+            CalculateLeadTime();
+        }
+    }
+
+    public void RecordMaterialTransfer(decimal quantity)
+    {
+        MaterialTransferred += quantity;
+        if ((Status == WorkOrderStatus.Submitted || Status == WorkOrderStatus.StockReserved || Status == WorkOrderStatus.StockPartiallyReserved) && quantity > 0)
+            Status = WorkOrderStatus.NotStarted;
+    }
+
+    /// <summary>Records disassembly qty against produced goods. Per ERPNext: disassembled_qty tracked on WO.</summary>
+    public void RecordDisassembly(decimal quantity)
+    {
+        if (quantity <= 0) return;
+        var availableForDisassembly = ProducedQuantity - DisassembledQuantity;
+        if (quantity > availableForDisassembly)
+            throw new BusinessException(MyERPDomainErrorCodes.WorkOrderOverproduction)
+                .WithData("maxAllowed", availableForDisassembly)
+                .WithData("attempted", quantity);
+        DisassembledQuantity += quantity;
+    }
+
+    /// <summary>Reverses disassembly qty on cancellation. Per ERPNext PR #48184 / commit 3e4d160626.</summary>
+    public void ReverseDisassembly(decimal quantity)
+    {
+        if (quantity <= 0) return;
+        DisassembledQuantity = Math.Max(0, DisassembledQuantity - quantity);
+    }
+
+    public void Stop()
+    {
+        if (Status is WorkOrderStatus.Draft or WorkOrderStatus.Cancelled)
+            throw new BusinessException(MyERPDomainErrorCodes.WorkOrderStatusTransitionRestricted)
+                .WithData("status", Status)
+                .WithData("detail", "Only a submitted Work Order can be closed, stopped or resumed");
+
+        if (Status == WorkOrderStatus.Closed)
+            throw new BusinessException(MyERPDomainErrorCodes.WorkOrderStatusTransitionRestricted)
+                .WithData("detail", "Closed Work Order can not be stopped or Re-opened");
+
+        Status = WorkOrderStatus.Stopped;
+    }
+
+    public void Unstop()
+    {
+        if (Status is WorkOrderStatus.Draft or WorkOrderStatus.Cancelled)
+            throw new BusinessException(MyERPDomainErrorCodes.WorkOrderStatusTransitionRestricted)
+                .WithData("status", Status)
+                .WithData("detail", "Only a submitted Work Order can be closed, stopped or resumed");
+
+        if (Status == WorkOrderStatus.Closed)
+            throw new BusinessException(MyERPDomainErrorCodes.WorkOrderStatusTransitionRestricted)
+                .WithData("detail", "Closed Work Order can not be stopped or Re-opened");
+
+        if (Status != WorkOrderStatus.Stopped)
+            throw new BusinessException(MyERPDomainErrorCodes.WorkOrderStatusTransitionRestricted)
+                .WithData("status", Status)
+                .WithData("detail", "Work Order is not stopped");
+
+        // Per ERPNext PR #60647 / services/status.py: resume to InProcess if started, material transferred or items produced, else NotStarted
+        Status = (ActualStartDate.HasValue || MaterialTransferred > 0 || ProducedQuantity > 0)
+            ? WorkOrderStatus.InProcess
+            : WorkOrderStatus.NotStarted;
+    }
+
+    public void Close()
+    {
+        if (Status is WorkOrderStatus.Draft or WorkOrderStatus.Cancelled)
+            throw new BusinessException(MyERPDomainErrorCodes.WorkOrderStatusTransitionRestricted)
+                .WithData("status", Status)
+                .WithData("detail", "Only a submitted Work Order can be closed, stopped or resumed");
+
+        if (Status == WorkOrderStatus.Closed)
+            throw new BusinessException(MyERPDomainErrorCodes.WorkOrderStatusTransitionRestricted)
+                .WithData("workOrder", WorkOrderNumber ?? Id.ToString())
+                .WithData("detail", $"Work Order {WorkOrderNumber ?? Id.ToString()} is already Closed");
+
+        Status = WorkOrderStatus.Closed;
+    }
+
+    public void Cancel()
+    {
+        // Per DO-NOT: "Cancel Stopped Work Order directly (must Unstop first, then cancel)"
+        if (Status is WorkOrderStatus.Completed or WorkOrderStatus.Cancelled or WorkOrderStatus.Stopped or WorkOrderStatus.Closed)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = WorkOrderStatus.Cancelled;
+    }
+}

@@ -1,0 +1,545 @@
+<abp-page [title]="invoice?.invoiceNumber ?? ('::PurchaseInvoice' | abpLocalization)">
+  @if (!invoice) {
+    <app-loading-overlay />
+  } @else {
+    <app-breadcrumb />
+    <app-document-workflow
+      [currentStatus]="invoice.status!"
+      [availableActions]="workflowActions"
+      (actionTriggered)="onWorkflowAction($event)" />
+
+    <div class="d-flex justify-content-end mt-2 mb-2 gap-2">
+      @if (invoice.status === 'Draft' && canDelete()) {
+        <button class="btn btn-outline-danger btn-sm" (click)="deleteInvoice()">
+          <i class="fa fa-trash me-1"></i>{{ 'Delete' | abpLocalization }}
+        </button>
+      }
+      @if (invoice.status === 'Cancelled' && canCreate()) {
+        <button class="btn btn-outline-success btn-sm" (click)="amend()">
+          <i class="fa fa-file-circle-plus me-1"></i>{{ '::AmendInvoice' | abpLocalization }}
+        </button>
+      }
+      <button class="btn btn-outline-info btn-sm" (click)="printInvoice()">
+        <i class="fa fa-print me-1"></i>{{ '::Print' | abpLocalization }}
+      </button>
+    </div>
+
+    <!-- Quick Payment Dialog (inline — pay supplier without leaving page) -->
+    @if (showQuickPayment()) {
+      <div class="card mt-3 mb-3 border-success">
+        <div class="card-header bg-success-subtle d-flex justify-content-between align-items-center">
+          <h6 class="card-title mb-0"><i class="fa fa-money-bill-wave me-2"></i>{{ '::MakePayment' | abpLocalization }}</h6>
+          <div class="d-flex gap-2">
+            <button type="button" class="btn btn-link btn-sm text-muted" (click)="goToFullPaymentForm()">
+              <i class="fa fa-expand me-1"></i>{{ '::FullForm' | abpLocalization }}
+            </button>
+            <button type="button" class="btn-close" (click)="cancelQuickPayment()"></button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="row g-3">
+            <div class="col-12 col-md-3">
+              <label class="form-label">{{ '::Amount' | abpLocalization }}</label>
+              <div class="input-group">
+                <span class="input-group-text">{{ invoice.currencyCode || ('' | companyCurrency) }}</span>
+                <input type="number" class="form-control" step="0.01" min="0.01"
+                       [ngModel]="quickPaymentAmount()" (ngModelChange)="quickPaymentAmount.set($event)" />
+              </div>
+              @if (getOutstandingAmount() > 0) {
+                <small class="form-text text-muted">{{ '::Outstanding' | abpLocalization }}: {{ getOutstandingAmount() | number:'1.2-2' }}</small>
+              }
+            </div>
+            <div class="col-12 col-md-3">
+              <label class="form-label">{{ '::PaymentDate' | abpLocalization }}</label>
+              <input type="date" class="form-control"
+                     [ngModel]="quickPaymentDate()" (ngModelChange)="quickPaymentDate.set($event)" />
+            </div>
+            <div class="col-12 col-md-3">
+              <label class="form-label">{{ '::ModeOfPayment' | abpLocalization }}</label>
+              <select class="form-select" [ngModel]="quickPaymentMode()" (ngModelChange)="quickPaymentMode.set($event)">
+                <option value="">— {{ '::Select' | abpLocalization }} —</option>
+                @for (mop of modesOfPayment(); track mop.id) {
+                  <option [value]="mop.id">{{ mop.name }}</option>
+                }
+              </select>
+            </div>
+            <div class="col-12 col-md-3">
+              <label class="form-label">{{ '::ReferenceNumber' | abpLocalization }}</label>
+              <input type="text" class="form-control"
+                     [placeholder]="'::Placeholder:ChequeOrTransferRef' | abpLocalization"
+                     [ngModel]="quickPaymentReference()" (ngModelChange)="quickPaymentReference.set($event)" />
+            </div>
+          </div>
+          <div class="d-flex justify-content-end gap-2 mt-3">
+            <button type="button" class="btn btn-outline-secondary" (click)="cancelQuickPayment()">{{ '::Cancel' | abpLocalization }}</button>
+            <button type="button" class="btn btn-success" (click)="submitQuickPayment()" [disabled]="isProcessingPayment() || quickPaymentAmount() <= 0">
+              @if (isProcessingPayment()) { <span class="spinner-border spinner-border-sm me-1"></span> }
+              <i class="fa fa-check me-1"></i>{{ '::MakePayment' | abpLocalization }}
+            </button>
+          </div>
+        </div>
+      </div>
+    }
+
+    <!-- Block Invoice Dialog (inline — hold this invoice from payment) -->
+    @if (showBlockDialog()) {
+      <div class="card mt-3 mb-3 border-warning">
+        <div class="card-header bg-warning-subtle d-flex justify-content-between align-items-center">
+          <h6 class="card-title mb-0"><i class="fa fa-lock me-2"></i>{{ '::BlockInvoice' | abpLocalization }}</h6>
+          <button type="button" class="btn-close" (click)="cancelBlockDialog()"></button>
+        </div>
+        <div class="card-body">
+          <div class="row g-3">
+            <div class="col-12 col-md-6">
+              <label class="form-label">{{ '::HoldComment' | abpLocalization }}</label>
+              <input type="text" class="form-control"
+                     [ngModel]="blockHoldComment()" (ngModelChange)="blockHoldComment.set($event)" />
+            </div>
+            <div class="col-12 col-md-6">
+              <label class="form-label">{{ '::ReleaseDate' | abpLocalization }}</label>
+              <input type="date" class="form-control"
+                     [ngModel]="blockReleaseDate()" (ngModelChange)="blockReleaseDate.set($event)" />
+              <small class="form-text text-muted">{{ '::ReleaseDateMustBeFutureHint' | abpLocalization }}</small>
+            </div>
+          </div>
+          <div class="d-flex justify-content-end gap-2 mt-3">
+            <button type="button" class="btn btn-outline-secondary" (click)="cancelBlockDialog()">{{ '::Cancel' | abpLocalization }}</button>
+            <button type="button" class="btn btn-warning" (click)="submitBlock()">
+              <i class="fa fa-lock me-1"></i>{{ '::BlockInvoice' | abpLocalization }}
+            </button>
+          </div>
+        </div>
+      </div>
+    }
+
+    <div class="card mt-4">
+      <div class="card-body">
+        <div class="row">
+          <div class="col-6 col-md-3 mb-3">
+            <small class="text-muted d-block">{{ '::Supplier' | abpLocalization }}</small>
+            <span class="fw-semibold">{{ invoice.supplierName || '—' }}</span>
+            @if (supplierHoldType()) {
+              <span class="badge bg-danger ms-2"><i class="fa fa-ban me-1"></i>{{ supplierHoldType() }}</span>
+            }
+            @if (invoice.onHold) {
+              <span class="badge bg-warning text-dark ms-2" [title]="invoice.holdComment || ''">
+                <i class="fa fa-lock me-1"></i>{{ '::OnHold' | abpLocalization }}
+                @if (invoice.releaseDate) { ({{ invoice.releaseDate | date:'dd/MM/yyyy' }}) }
+              </span>
+            }
+          </div>
+          <div class="col-6 col-md-3 mb-3">
+            <small class="text-muted d-block">{{ '::IssueDate' | abpLocalization }}</small>
+            <span class="fw-semibold">{{ invoice.issueDate | date:'dd/MM/yyyy' }}</span>
+          </div>
+          <div class="col-6 col-md-3 mb-3">
+            <small class="text-muted d-block">{{ '::DueDate' | abpLocalization }}</small>
+            <span class="fw-semibold">{{ invoice.dueDate | date:'dd/MM/yyyy' }}</span>
+          </div>
+          <div class="col-6 col-md-3 mb-3">
+            <small class="text-muted d-block">{{ '::EInvoiceStatus' | abpLocalization }}</small>
+            <app-lhdn-status-badge [status]="invoice.eInvoiceStatus!" />
+          </div>
+        </div>
+        @if (invoice.supplierInvoiceNumber) {
+          <div class="mt-2">
+            <small class="text-muted d-block">{{ '::SupplierInvoiceNo' | abpLocalization }}</small>
+            <span>{{ invoice.supplierInvoiceNumber }}</span>
+          </div>
+        }
+        @if (invoice.interCompanyInvoiceId) {
+          <div class="mt-2">
+            <span class="badge bg-info-subtle text-info-emphasis">
+              <i class="fa fa-building me-1"></i>{{ '::InterCompanyLinkedTo' | abpLocalization }}
+              {{ invoice.interCompanyInvoiceNumber }} ({{ invoice.interCompanyCompanyName }})
+            </span>
+          </div>
+        }
+        @if (invoice.isReturn) {
+          <div class="mt-2">
+            <span class="badge bg-secondary-subtle text-secondary-emphasis me-2">
+              <i class="fa fa-rotate-left me-1"></i>{{ '::Return' | abpLocalization }}
+            </span>
+            @if (invoice.updateBilledAmountInPurchaseOrder) {
+              <span class="badge bg-success-subtle text-success-emphasis">
+                <i class="fa fa-check me-1"></i>{{ '::UpdateBilledAmountInPurchaseOrder' | abpLocalization }}
+              </span>
+            }
+          </div>
+        }
+      </div>
+    </div>
+
+    <div class="card mt-4">
+      <div class="card-header">
+        <h5 class="card-title mb-0"><i class="fa fa-list me-2"></i>{{ '::Items' | abpLocalization }}</h5>
+      </div>
+      <div class="card-body">
+        <div class="table-responsive">
+          <table class="table table-sm w-100">
+            <thead>
+              <tr>
+                <th>{{ '::Description' | abpLocalization }}</th>
+                <th>{{ '::Qty' | abpLocalization }}</th>
+                <th>{{ '::UnitPrice' | abpLocalization }}</th>
+                <th>{{ '::Tax' | abpLocalization }}</th>
+                <th>{{ '::Total' | abpLocalization }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (row of invoice.items ?? []; track $index) {
+                <tr>
+                  <td>{{ row.description }}</td>
+                  <td>{{ row.quantity | number:'1.2-2' }}</td>
+                  <td>{{ row.unitPrice | number:'1.2-2' }}</td>
+                  <td>{{ row.taxAmount | number:'1.2-2' }}</td>
+                  <td>{{ row.lineTotal | number:'1.2-2' }}</td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- 3-Way Matching Status (PO↔PR↔PI) per item -->
+    @if (matchingData().length > 0) {
+      <div class="card mt-3 mb-3" [class.border-warning]="hasMatchingDiscrepancy()" [class.border-success]="!hasMatchingDiscrepancy()">
+        <div class="card-header py-2 d-flex justify-content-between align-items-center">
+          <span>
+            <i class="fa fa-link me-2"></i>{{ '::ThreeWayMatching' | abpLocalization }}
+          </span>
+          @if (!hasMatchingDiscrepancy()) {
+            <span class="badge bg-success">{{ '::FullyMatched' | abpLocalization }}</span>
+          } @else {
+            <span class="badge bg-warning text-dark">{{ '::Discrepancy' | abpLocalization }}</span>
+          }
+        </div>
+        <div class="card-body p-0">
+          @if (hasMatchingDiscrepancy()) {
+            <div class="alert alert-warning m-2 py-2 small">
+              <i class="fa fa-triangle-exclamation me-1"></i>
+              {{ '::ThreeWayMatchingDiscrepancyWarning' | abpLocalization }}
+            </div>
+          }
+          <table class="table table-sm mb-0">
+            <thead>
+              <tr class="table-light">
+                <th>{{ '::Item' | abpLocalization }}</th>
+                <th class="text-end">{{ '::OrderedQty' | abpLocalization }}</th>
+                <th class="text-end">{{ '::ReceivedQty' | abpLocalization }}</th>
+                <th class="text-end">{{ '::BilledQty' | abpLocalization }}</th>
+                <th class="text-end">{{ '::OrderedRate' | abpLocalization }}</th>
+                <th class="text-end">{{ '::BilledRate' | abpLocalization }}</th>
+                <th class="text-end">{{ '::QtyVariance' | abpLocalization }}</th>
+                <th class="text-end">{{ '::RateVariance' | abpLocalization }}</th>
+                <th class="text-center">{{ '::MatchStatus' | abpLocalization }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (m of matchingData(); track $index) {
+                <tr [class.table-danger]="m.hasDiscrepancy">
+                  <td>{{ m.itemName || m.description || '—' }}</td>
+                  <td class="text-end font-monospace">{{ m.orderedQty | number:'1.2-2' }}</td>
+                  <td class="text-end font-monospace">{{ m.receivedQty | number:'1.2-2' }}</td>
+                  <td class="text-end font-monospace">{{ m.billedQty | number:'1.2-2' }}</td>
+                  <td class="text-end font-monospace">{{ m.orderedRate | number:'1.2-2' }}</td>
+                  <td class="text-end font-monospace">{{ m.billedRate | number:'1.2-2' }}</td>
+                  <td class="text-end font-monospace" [class.text-danger]="m.qtyVariance !== 0">
+                    {{ m.qtyVariance !== 0 ? (m.qtyVariance | number:'1.2-2') : '—' }}
+                  </td>
+                  <td class="text-end font-monospace" [class.text-danger]="m.rateVariance !== 0">
+                    {{ m.rateVariance !== 0 ? (m.rateVariance | number:'1.2-2') : '—' }}
+                  </td>
+                  <td class="text-center">
+                    @if (m.matchLevel === '3-Way') {
+                      <span class="badge bg-success">3-Way</span>
+                    } @else if (m.matchLevel === '2-Way') {
+                      <span class="badge bg-info">2-Way</span>
+                    } @else {
+                      <span class="badge bg-secondary">{{ '::Direct' | abpLocalization }}</span>
+                    }
+                  </td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        </div>
+      </div>
+    }
+
+    <div class="card mt-4" style="max-width: 380px; margin-left: auto">
+      <div class="card-body text-end">
+        <p>{{ '::NetTotal' | abpLocalization }}: <strong>{{ invoice.netTotal | number:'1.2-2' }}</strong></p>
+        <p>{{ '::Tax' | abpLocalization }}: <strong>{{ invoice.taxAmount | number:'1.2-2' }}</strong></p>
+        @if ($any(invoice).discountAmount > 0) {
+          <p class="text-danger">{{ '::Discount' | abpLocalization }}: <strong>-{{ $any(invoice).discountAmount | number:'1.2-2' }}</strong></p>
+        }
+        <hr />
+        <p class="fs-5">{{ '::GrandTotal' | abpLocalization }}: <strong>{{ invoice.grandTotal | number:'1.2-2' }}</strong></p>
+        @if (isMultiCurrency()) {
+          <p class="text-muted small mb-1">{{ '::BaseEquivalent' | abpLocalization }} ({{ '' | companyCurrency }}): {{ $any(invoice).baseGrandTotal | number:'1.2-2' }} @ {{ $any(invoice).exchangeRate | number:'1.4-4' }}</p>
+        }
+        @if (invoice.status === 'Posted') {
+          <hr />
+          <div class="d-flex justify-content-between mb-1">
+            <span class="text-success">{{ '::Paid' | abpLocalization }}</span>
+            <span class="text-success fw-semibold">{{ invoice.amountPaid | number:'1.2-2' }}</span>
+          </div>
+          <div class="d-flex justify-content-between">
+            <span [class.text-danger]="getOutstandingAmount() > 0" [class.fw-semibold]="getOutstandingAmount() > 0">{{ '::Outstanding' | abpLocalization }}</span>
+            <span [class.text-danger]="getOutstandingAmount() > 0" [class.fw-semibold]="getOutstandingAmount() > 0">{{ getOutstandingAmount() | number:'1.2-2' }}</span>
+          </div>
+          @if ((invoice.grandTotal ?? 0) > 0) {
+            <div class="progress mt-2" style="height: 6px;">>
+              <div class="progress-bar" [class.bg-success]="getPaymentPercent() >= 100" [class.bg-primary]="getPaymentPercent() < 100 && getPaymentPercent() > 0" [style.width.%]="getPaymentPercent()"></div>
+            </div>
+          }
+        }
+      </div>
+    </div>
+
+    @if (paymentSchedule().length > 0) {
+      <div class="card mt-4">
+        <div class="card-header">
+          <h5 class="card-title mb-0"><i class="fa fa-calendar-check me-2"></i>{{ '::PaymentSchedule' | abpLocalization }}</h5>
+        </div>
+        <div class="card-body">
+          <table class="table table-sm">
+            <thead>
+              <tr>
+                <th>{{ '::DueDate' | abpLocalization }}</th>
+                <th class="text-end">{{ '::Portion' | abpLocalization }}</th>
+                <th class="text-end">{{ '::Amount' | abpLocalization }}</th>
+                <th class="text-end">{{ '::Paid' | abpLocalization }}</th>
+                <th class="text-end">{{ '::Outstanding' | abpLocalization }}</th>
+                <th class="text-center">{{ '::EarlyDiscount' | abpLocalization }}</th>
+                <th class="text-center">{{ '::Status' | abpLocalization }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (entry of paymentSchedule(); track entry.id) {
+                <tr [class.table-danger]="isTermOverdue(entry)" [class.table-success]="hasActiveDiscount(entry)">
+                  <td>
+                    {{ entry.dueDate | date:'dd/MM/yyyy' }}
+                    @if (isTermOverdue(entry)) {
+                      <span class="badge bg-danger ms-1">{{ '::Overdue' | abpLocalization }}</span>
+                    }
+                  </td>
+                  <td class="text-end">{{ entry.invoicePortion }}%</td>
+                  <td class="text-end font-monospace">{{ entry.paymentAmount | number:'1.2-2' }}</td>
+                  <td class="text-end font-monospace">{{ entry.paidAmount | number:'1.2-2' }}</td>
+                  <td class="text-end font-monospace" [class.text-danger]="entry.outstanding > 0">{{ entry.outstanding | number:'1.2-2' }}</td>
+                  <td class="text-center">
+                    @if (hasActiveDiscount(entry)) {
+                      <div class="d-flex flex-column align-items-center">
+                        <span class="badge bg-success mb-1">
+                          <i class="fa fa-tag me-1"></i>
+                          @if (entry.discountType === 'Percentage') {
+                            {{ entry.discountPercentage }}% {{ '::Off' | abpLocalization }}
+                          } @else {
+                            {{ entry.discountPercentage | number:'1.2-2' }} {{ '::Off' | abpLocalization }}
+                          }
+                        </span>
+                        <small class="text-muted">{{ '::PayBy' | abpLocalization }} {{ entry.discountValidTill | date:'dd/MM' }}</small>
+                        <small class="text-success fw-bold">{{ '::Save' | abpLocalization }} {{ getDiscountSaving(entry) | number:'1.2-2' }}</small>
+                      </div>
+                    } @else if (entry.discountType && entry.discountValidTill && isDiscountExpired(entry)) {
+                      <span class="badge bg-secondary"><i class="fa fa-clock me-1"></i>{{ '::Expired' | abpLocalization }}</span>
+                    } @else {
+                      <span class="text-muted">—</span>
+                    }
+                  </td>
+                  <td class="text-center">
+                    @if (entry.outstanding <= 0.01) {
+                      <span class="badge bg-success">{{ '::Paid' | abpLocalization }}</span>
+                    } @else {
+                      <span class="badge bg-warning text-dark">{{ '::Pending' | abpLocalization }}</span>
+                    }
+                  </td>
+                </tr>
+              }
+            </tbody>
+          </table>
+          @if (getTotalDiscountSavings() > 0) {
+            <div class="alert alert-info d-flex align-items-center mt-2 mb-0" role="alert">
+              <i class="fa fa-piggy-bank me-2"></i>
+              <div>
+                <strong>{{ '::EarlyPaymentSavings' | abpLocalization }}:</strong>
+                {{ '::PayBeforeDiscountExpiry' | abpLocalization }}
+                <span class="fw-bold">{{ getTotalDiscountSavings() | number:'1.2-2' }}</span>
+              </div>
+            </div>
+          }
+        </div>
+      </div>
+    }
+
+    <!-- Tax Withholding (TDS/WHT) — Malaysia Section 107A compliance -->
+    @if (taxWithholdingEntries().length > 0) {
+      <div class="card mb-3 border-warning">
+        <div class="card-header bg-warning bg-opacity-10 d-flex align-items-center gap-2">
+          <i class="fa fa-shield-halved text-warning"></i>
+          <h6 class="card-title mb-0">{{ '::TaxWithholding' | abpLocalization }}</h6>
+          <span class="badge bg-warning text-dark ms-auto">{{ taxWithholdingEntries().length }}</span>
+        </div>
+        <div class="card-body p-0">
+          <div class="table-responsive">
+            <table class="table table-sm mb-0">
+              <thead>
+                <tr class="table-light">
+                  <th>{{ '::TaxCategory' | abpLocalization }}</th>
+                  <th class="text-end">{{ '::Rate' | abpLocalization }} (%)</th>
+                  <th class="text-end">{{ '::TaxableAmount' | abpLocalization }}</th>
+                  <th class="text-end">{{ '::WithheldAmount' | abpLocalization }}</th>
+                  <th>{{ '::Date' | abpLocalization }}</th>
+                  <th>{{ '::Status' | abpLocalization }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                @for (entry of taxWithholdingEntries(); track entry.id) {
+                  <tr>
+                    <td>
+                      {{ entry.taxCategory || '—' }}
+                      @if (entry.hasLDC) {
+                        <span class="badge bg-info ms-1" title="Lower Deduction Certificate">LDC {{ entry.ldcRate }}%</span>
+                      }
+                    </td>
+                    <td class="text-end font-monospace">{{ entry.withholdingRate | number:'1.1-1' }}%</td>
+                    <td class="text-end font-monospace">{{ entry.taxableAmount | number:'1.2-2' }}</td>
+                    <td class="text-end font-monospace fw-bold text-danger">{{ entry.withheldAmount | number:'1.2-2' }}</td>
+                    <td>{{ entry.postingDate | date:'dd/MM/yyyy' }}</td>
+                    <td>
+                      <span class="badge" [class.bg-success]="entry.status === 'Submitted'" [class.bg-secondary]="entry.status === 'Draft'">
+                        {{ entry.status }}
+                      </span>
+                    </td>
+                  </tr>
+                }
+              </tbody>
+              <tfoot>
+                <tr class="table-warning">
+                  <td colspan="3" class="fw-bold text-end">{{ '::TotalWithheld' | abpLocalization }}</td>
+                  <td class="text-end font-monospace fw-bold text-danger">{{ getTotalWithheld() | number:'1.2-2' }}</td>
+                  <td colspan="2"></td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </div>
+      </div>
+    }
+
+    <!-- LHDN e-Invoice Verification Section (self-billed purchase invoices) -->
+    @if (invoice.eInvoiceStatus && invoice.eInvoiceStatus !== 'NotSubmitted') {
+      <div class="card mb-3 border-start border-4 border-primary">
+        <div class="card-header bg-light d-flex align-items-center justify-content-between">
+          <h6 class="card-title mb-0">
+            <i class="fa fa-file-shield me-2 text-primary"></i>{{ '::EInvoice' | abpLocalization }}
+          </h6>
+          <app-lhdn-status-badge [status]="invoice.eInvoiceStatus" />
+        </div>
+        <div class="card-body">
+          <div class="row align-items-center">
+            @if ($any(invoice).lhdnLongId) {
+              <div class="col-auto">
+                <a [href]="getLhdnVerificationUrl()" target="_blank" title="Verify on MyInvois Portal">
+                  <img [src]="getLhdnQrCodeUrl()" alt="LHDN QR" width="96" height="96" class="border rounded" />
+                </a>
+              </div>
+            }
+            <div class="col">
+              @if ($any(invoice).lhdnUuid) {
+                <div class="mb-1">
+                  <small class="text-muted d-block">{{ '::LhdnUuid' | abpLocalization }}</small>
+                  <code class="small">{{ $any(invoice).lhdnUuid }}</code>
+                </div>
+              }
+              @if ($any(invoice).lhdnSubmittedAt) {
+                <div class="mb-1">
+                  <small class="text-muted d-block">{{ '::SubmittedAt' | abpLocalization }}</small>
+                  <span>{{ $any(invoice).lhdnSubmittedAt | date:'dd MMM yyyy, HH:mm' }}</span>
+                </div>
+              }
+              @if (isWithin72HourWindow()) {
+                <div class="mt-1">
+                  <span class="badge bg-success-subtle text-success"><i class="fa fa-clock me-1"></i>{{ '::LhdnCancelWindowActive' | abpLocalization }}</span>
+                </div>
+              }
+              @if ($any(invoice).lhdnLongId) {
+                <div class="mt-2">
+                  <a [href]="getLhdnVerificationUrl()" target="_blank" class="btn btn-sm btn-outline-primary">
+                    <i class="fa fa-external-link-alt me-1"></i>{{ '::VerifyOnLhdn' | abpLocalization }}
+                  </a>
+                </div>
+              }
+            </div>
+          </div>
+        </div>
+      </div>
+    }
+
+    <!-- Payment History (linked Payment Entries) -->
+    @if (linkedPayments().length > 0) {
+      <div class="card mb-3 border-start border-4 border-success">
+        <div class="card-header bg-light d-flex align-items-center justify-content-between">
+          <h6 class="card-title mb-0">
+            <i class="fa fa-money-bill-wave me-2 text-success"></i>{{ '::PaymentsMade' | abpLocalization }}
+            <span class="badge bg-success ms-2">{{ linkedPayments().length }}</span>
+          </h6>
+          <span class="fw-bold text-success">{{ '' | companyCurrency }} {{ getTotalPaid() | number:'1.2-2' }}</span>
+        </div>
+        <div class="card-body p-0">
+          <table class="table table-hover mb-0">
+            <thead class="table-light">
+              <tr>
+                <th>{{ '::PaymentNumber' | abpLocalization }}</th>
+                <th>{{ '::Date' | abpLocalization }}</th>
+                <th class="text-end">{{ '::Amount' | abpLocalization }}</th>
+                <th>{{ '::Reference' | abpLocalization }}</th>
+                <th class="text-center">{{ '::Status' | abpLocalization }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (payment of linkedPayments(); track payment.id) {
+                <tr>
+                  <td>
+                    <a [routerLink]="['/accounting/payments', payment.id]" class="text-decoration-none fw-medium">
+                      {{ payment.paymentNumber || '—' }}
+                    </a>
+                  </td>
+                  <td>{{ payment.postingDate | date:'dd/MM/yyyy' }}</td>
+                  <td class="text-end fw-bold text-success">{{ payment.paidAmount | number:'1.2-2' }}</td>
+                  <td>{{ payment.referenceNumber || '—' }}</td>
+                  <td class="text-center">
+                    <span class="badge" [class]="payment.status === 'Posted' ? 'bg-success' : 'bg-secondary'">
+                      {{ payment.status }}
+                    </span>
+                  </td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        </div>
+      </div>
+    }
+
+    <app-activity-log [documentType]="'PurchaseInvoice'" [documentId]="invoice.id!"></app-activity-log>
+
+    @if (invoice.status !== 'Draft') {
+      <app-document-connections [documentType]="'PurchaseInvoice'" [documentId]="invoice.id!" />
+    }
+
+    @if (invoice.status === 'Posted' || invoice.status === 'Cancelled') {
+      <app-voucher-ledger
+        [voucherType]="'PurchaseInvoice'"
+        [voucherId]="invoice.id!"
+        [showAccounting]="true" />
+    }
+
+    <!-- Print Layout: hidden on screen, shown only in print media -->
+    <app-purchase-invoice-print-layout
+      [invoice]="invoice"
+      [company]="companyData()" />
+  }
+</abp-page>

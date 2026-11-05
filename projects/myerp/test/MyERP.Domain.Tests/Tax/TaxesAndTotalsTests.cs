@@ -1,0 +1,529 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using MyERP.Tax.DomainServices;
+using MyERP.Tax.Entities;
+using Shouldly;
+using Xunit;
+
+namespace MyERP.Tax;
+
+public class TaxesAndTotalsTests
+{
+    private readonly TaxesAndTotalsService _service = new();
+
+    [Fact]
+    public void Calculate_SingleItem_SingleTax_OnNetTotal()
+    {
+        var items = new List<TransactionItem>
+        {
+            new() { ItemId = Guid.NewGuid(), Qty = 2, Rate = 500, NetAmount = 1000 },
+        };
+        var taxes = new List<TransactionTaxRow>
+        {
+            new(Guid.NewGuid(), "SalesInvoice", Guid.NewGuid(), 1, "SST 8%", "On Net Total", 8),
+        };
+
+        var result = _service.Calculate(items, taxes);
+
+        result.NetTotal.ShouldBe(1000m);
+        result.TotalTax.ShouldBe(80m);
+        result.GrandTotal.ShouldBe(1080m);
+    }
+
+    [Fact]
+    public void Calculate_MultipleItems_ProportionalTax()
+    {
+        var items = new List<TransactionItem>
+        {
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 600, NetAmount = 600 },
+            new() { ItemId = Guid.NewGuid(), Qty = 3, Rate = 200, NetAmount = 600 },
+        };
+        var taxes = new List<TransactionTaxRow>
+        {
+            new(Guid.NewGuid(), "SalesInvoice", Guid.NewGuid(), 1, "SST 6%", "On Net Total", 6),
+        };
+
+        var result = _service.Calculate(items, taxes);
+
+        result.NetTotal.ShouldBe(1200m);
+        result.TotalTax.ShouldBe(72m);
+        result.GrandTotal.ShouldBe(1272m);
+    }
+
+    [Fact]
+    public void Calculate_MultipleTaxRows_Cascade()
+    {
+        var parentId = Guid.NewGuid();
+        var items = new List<TransactionItem>
+        {
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 1000, NetAmount = 1000 },
+        };
+        var taxes = new List<TransactionTaxRow>
+        {
+            new(Guid.NewGuid(), "SI", parentId, 1, "SST 10%", "On Net Total", 10),
+            new(Guid.NewGuid(), "SI", parentId, 2, "Cess 1% on SST", "On Previous Row Amount", 1) { ReferenceRowIndex = 1 },
+        };
+
+        var result = _service.Calculate(items, taxes);
+
+        result.NetTotal.ShouldBe(1000m);
+        result.TotalTax.ShouldBe(101m); // 100 + 1
+        result.GrandTotal.ShouldBe(1101m);
+    }
+
+    [Fact]
+    public void Calculate_MultipleItems_OnPreviousRowAmount_UsesEachItemsOwnContribution()
+    {
+        // Round-98 regression: "On Previous Row Amount" must read each item's OWN row-0 tax
+        // contribution, not the row's cumulative running total across every item processed so
+        // far. Item A (net 100): row0 = 10, row1 = 10% of A's own 10 = 1. Item B (net 200):
+        // row0 = 20, row1 = 10% of B's own 20 = 2. Expected row1 total = 1 + 2 = 3, not the
+        // pre-fix 10%×10 (A) + 10%×(10+20) (B, polluted by A's row0) = 1 + 3 = 4.
+        var parentId = Guid.NewGuid();
+        var items = new List<TransactionItem>
+        {
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 100, NetAmount = 100 },
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 200, NetAmount = 200 },
+        };
+        var taxes = new List<TransactionTaxRow>
+        {
+            new(Guid.NewGuid(), "SI", parentId, 1, "SST 10%", "On Net Total", 10),
+            new(Guid.NewGuid(), "SI", parentId, 2, "Cess 10% on SST", "On Previous Row Amount", 10) { ReferenceRowIndex = 1 },
+        };
+
+        var result = _service.Calculate(items, taxes);
+
+        result.NetTotal.ShouldBe(300m);
+        taxes[1].TaxAmount.ShouldBe(3m);
+        result.TotalTax.ShouldBe(33m); // 30 (row0) + 3 (row1)
+        result.GrandTotal.ShouldBe(333m);
+    }
+
+    [Fact]
+    public void Calculate_RoundRowWiseTaxOff_Default_SumsUnroundedThenRoundsOnce()
+    {
+        // 3 items × 5% of 0.05 = 0.0025 each. Summed unrounded = 0.0075, rounded once → 0.01.
+        var items = new List<TransactionItem>
+        {
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 0.05m, NetAmount = 0.05m },
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 0.05m, NetAmount = 0.05m },
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 0.05m, NetAmount = 0.05m },
+        };
+        var taxes = new List<TransactionTaxRow>
+        {
+            new(Guid.NewGuid(), "SI", Guid.NewGuid(), 1, "SST 5%", "On Net Total", 5),
+        };
+
+        var result = _service.Calculate(items, taxes);
+
+        result.TotalTax.ShouldBe(0.01m);
+    }
+
+    [Fact]
+    public void Calculate_RoundRowWiseTaxOn_RoundsEachItemContributionFirst()
+    {
+        // Same inputs as the default-off test, but round_row_wise_tax rounds each
+        // item's 0.0025 contribution down to 0.00 before summing → total 0.00.
+        var items = new List<TransactionItem>
+        {
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 0.05m, NetAmount = 0.05m },
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 0.05m, NetAmount = 0.05m },
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 0.05m, NetAmount = 0.05m },
+        };
+        var taxes = new List<TransactionTaxRow>
+        {
+            new(Guid.NewGuid(), "SI", Guid.NewGuid(), 1, "SST 5%", "On Net Total", 5),
+        };
+
+        var result = _service.Calculate(items, taxes, roundRowWiseTax: true);
+
+        result.TotalTax.ShouldBe(0.00m);
+    }
+
+    [Fact]
+    public void Calculate_ActualTax_FixedAmount()
+    {
+        var items = new List<TransactionItem>
+        {
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 700, NetAmount = 700 },
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 300, NetAmount = 300 },
+        };
+        var taxes = new List<TransactionTaxRow>
+        {
+            new(Guid.NewGuid(), "SI", Guid.NewGuid(), 1, "Shipping", "Actual", 50),
+        };
+
+        var result = _service.Calculate(items, taxes);
+
+        result.NetTotal.ShouldBe(1000m);
+        result.TotalTax.ShouldBe(50m);
+        result.GrandTotal.ShouldBe(1050m);
+    }
+
+    [Fact]
+    public void Calculate_OnItemQuantity_PerUnitTax()
+    {
+        var items = new List<TransactionItem>
+        {
+            new() { ItemId = Guid.NewGuid(), Qty = 5, Rate = 100, NetAmount = 500 },
+        };
+        var taxes = new List<TransactionTaxRow>
+        {
+            new(Guid.NewGuid(), "SI", Guid.NewGuid(), 1, "Excise RM2/unit", "On Item Quantity", 2),
+        };
+
+        var result = _service.Calculate(items, taxes);
+
+        result.NetTotal.ShouldBe(500m);
+        result.TotalTax.ShouldBe(10m);
+        result.GrandTotal.ShouldBe(510m);
+    }
+
+    [Fact]
+    public void Calculate_WithDiscountOnNetTotal()
+    {
+        var items = new List<TransactionItem>
+        {
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 1000, NetAmount = 1000 },
+        };
+        var taxes = new List<TransactionTaxRow>
+        {
+            new(Guid.NewGuid(), "SI", Guid.NewGuid(), 1, "SST 8%", "On Net Total", 8),
+        };
+
+        var result = _service.Calculate(items, taxes, discountAmount: 100, applyDiscountOn: "Net Total");
+
+        result.NetTotal.ShouldBe(900m); // 1000 - 100
+        result.TotalTax.ShouldBe(72m); // 8% of 900
+        result.GrandTotal.ShouldBe(972m);
+    }
+
+    [Fact]
+    public void Calculate_WithDiscountOnGrandTotal()
+    {
+        var items = new List<TransactionItem>
+        {
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 1000, NetAmount = 1000 },
+        };
+        var taxes = new List<TransactionTaxRow>
+        {
+            new(Guid.NewGuid(), "SI", Guid.NewGuid(), 1, "SST 8%", "On Net Total", 8),
+        };
+
+        var result = _service.Calculate(items, taxes, discountAmount: 50, applyDiscountOn: "Grand Total");
+
+        result.NetTotal.ShouldBe(1000m);
+        result.TotalTax.ShouldBe(80m);
+        result.GrandTotal.ShouldBe(1030m); // 1080 - 50
+    }
+
+    [Fact]
+    public void Calculate_MultiCurrency_BaseAmounts()
+    {
+        var items = new List<TransactionItem>
+        {
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 100, NetAmount = 100 },
+        };
+        var taxes = new List<TransactionTaxRow>
+        {
+            new(Guid.NewGuid(), "SI", Guid.NewGuid(), 1, "SST 8%", "On Net Total", 8),
+        };
+
+        var result = _service.Calculate(items, taxes, exchangeRate: 4.5m);
+
+        result.NetTotal.ShouldBe(100m);
+        result.BaseNetTotal.ShouldBe(450m);
+        result.TotalTax.ShouldBe(8m);
+        result.BaseTotalTax.ShouldBe(36m);
+        result.GrandTotal.ShouldBe(108m);
+        result.BaseGrandTotal.ShouldBe(486m);
+    }
+
+    [Fact]
+    public void Calculate_ValuationOnlyTax_ExcludedFromGrandTotal()
+    {
+        var items = new List<TransactionItem>
+        {
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 1000, NetAmount = 1000 },
+        };
+        var taxes = new List<TransactionTaxRow>
+        {
+            new(Guid.NewGuid(), "PI", Guid.NewGuid(), 1, "Customs Duty 5%", "On Net Total", 5) { TaxCategory = "Valuation" },
+            new(Guid.NewGuid(), "PI", Guid.NewGuid(), 2, "SST 8%", "On Net Total", 8) { TaxCategory = "Total" },
+        };
+
+        var result = _service.Calculate(items, taxes);
+
+        result.NetTotal.ShouldBe(1000m);
+        // Valuation tax (50) should NOT be in grand total
+        result.TotalTax.ShouldBe(80m); // only SST
+        result.GrandTotal.ShouldBe(1080m);
+    }
+
+    [Fact]
+    public void Calculate_ZeroItems_ZeroTotals()
+    {
+        var items = new List<TransactionItem>();
+        var taxes = new List<TransactionTaxRow>();
+
+        var result = _service.Calculate(items, taxes);
+
+        result.NetTotal.ShouldBe(0m);
+        result.TotalTax.ShouldBe(0m);
+        result.GrandTotal.ShouldBe(0m);
+    }
+
+    // === Additional Tests: Percentage Discount, Rounding, Multiple Tax Categories ===
+
+    [Fact]
+    public void Calculate_PercentageDiscount_OnNetTotal_ReducesItemAmounts()
+    {
+        var items = new List<TransactionItem>
+        {
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 1000, NetAmount = 1000 },
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 500, NetAmount = 500 },
+        };
+        var taxes = new List<TransactionTaxRow>
+        {
+            new(Guid.NewGuid(), "SalesInvoice", Guid.NewGuid(), 1, "SST 8%", "On Net Total", 8),
+        };
+
+        // 10% discount on net total = 150 discount
+        var discountAmount = 150m;
+        var result = _service.Calculate(items, taxes, discountAmount: discountAmount, applyDiscountOn: "Net Total");
+
+        result.NetTotal.ShouldBe(1350m); // 1500 - 150
+        result.TotalTax.ShouldBe(108m); // 8% of 1350
+        result.GrandTotal.ShouldBe(1458m);
+    }
+
+    [Fact]
+    public void Calculate_DiscountOnGrandTotal_PostTax()
+    {
+        var items = new List<TransactionItem>
+        {
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 1000, NetAmount = 1000 },
+        };
+        var taxes = new List<TransactionTaxRow>
+        {
+            new(Guid.NewGuid(), "SalesInvoice", Guid.NewGuid(), 1, "SST 8%", "On Net Total", 8),
+        };
+
+        var result = _service.Calculate(items, taxes, discountAmount: 50m, applyDiscountOn: "Grand Total");
+
+        result.NetTotal.ShouldBe(1000m);
+        result.TotalTax.ShouldBe(80m);
+        result.GrandTotal.ShouldBe(1030m); // 1080 - 50
+    }
+
+    [Fact]
+    public void Calculate_Rounding_ToNearestWhole()
+    {
+        var items = new List<TransactionItem>
+        {
+            new() { ItemId = Guid.NewGuid(), Qty = 3, Rate = 33.33m, NetAmount = 99.99m },
+        };
+        var taxes = new List<TransactionTaxRow>
+        {
+            new(Guid.NewGuid(), "SalesInvoice", Guid.NewGuid(), 1, "SST 6%", "On Net Total", 6),
+        };
+
+        var result = _service.Calculate(items, taxes);
+
+        result.GrandTotal.ShouldBe(105.99m); // 99.99 + 6.0 = 105.99
+        result.RoundedTotal.ShouldBe(106m); // rounded to nearest whole
+        result.RoundingAdjustment.ShouldBe(0.01m); // 106 - 105.99
+    }
+
+    [Fact]
+    public void Calculate_ValuationOnly_ExcludedFromGrandTotal()
+    {
+        var items = new List<TransactionItem>
+        {
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 1000, NetAmount = 1000 },
+        };
+        var taxes = new List<TransactionTaxRow>
+        {
+            new(Guid.NewGuid(), "PurchaseInvoice", Guid.NewGuid(), 1, "Customs 5%", "On Net Total", 5) { TaxCategory = "Valuation" },
+            new(Guid.NewGuid(), "PurchaseInvoice", Guid.NewGuid(), 2, "SST 8%", "On Net Total", 8) { TaxCategory = "Total" },
+        };
+
+        var result = _service.Calculate(items, taxes);
+
+        // Valuation tax (customs) should NOT be in grand total
+        result.TotalTax.ShouldBe(80m); // only SST
+        result.GrandTotal.ShouldBe(1080m); // net + total-only tax
+    }
+
+    [Fact]
+    public void Calculate_MultiCurrency_BaseTotals()
+    {
+        var items = new List<TransactionItem>
+        {
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 100, NetAmount = 100 }, // 100 USD
+        };
+        var taxes = new List<TransactionTaxRow>
+        {
+            new(Guid.NewGuid(), "SalesInvoice", Guid.NewGuid(), 1, "SST 8%", "On Net Total", 8),
+        };
+
+        decimal exchangeRate = 4.5m; // 1 USD = 4.5 MYR
+        var result = _service.Calculate(items, taxes, exchangeRate: exchangeRate);
+
+        result.NetTotal.ShouldBe(100m);
+        result.BaseNetTotal.ShouldBe(450m); // 100 × 4.5
+        result.BaseGrandTotal.ShouldBe(486m); // 108 × 4.5
+    }
+
+    [Fact]
+    public void Calculate_OnPreviousRowTotal_Cascade()
+    {
+        var items = new List<TransactionItem>
+        {
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 1000, NetAmount = 1000 },
+        };
+        var taxes = new List<TransactionTaxRow>
+        {
+            new(Guid.NewGuid(), "SalesInvoice", Guid.NewGuid(), 1, "SST 6%", "On Net Total", 6),
+            new(Guid.NewGuid(), "SalesInvoice", Guid.NewGuid(), 2, "Cess 1%", "On Previous Row Total", 1) { ReferenceRowIndex = 1 },
+        };
+
+        var result = _service.Calculate(items, taxes);
+
+        // SST: 6% of 1000 = 60
+        // Cess: 1% of (1000 + 60) = 1% of 1060 = 10.6
+        result.TotalTax.ShouldBeInRange(70.5m, 70.7m);
+    }
+
+    [Fact]
+    public void Calculate_DiscountOnNetTotal_RoundingDifferencePreservesTotal()
+    {
+        var items = new List<TransactionItem>
+        {
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 100, NetAmount = 100 },
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 100, NetAmount = 100 },
+            new() { ItemId = Guid.NewGuid(), Qty = 1, Rate = 100, NetAmount = 100 },
+        };
+        var taxes = new List<TransactionTaxRow>();
+
+        var result = _service.Calculate(items, taxes, discountAmount: 10m, applyDiscountOn: "Net Total");
+
+        result.NetTotal.ShouldBe(290m);
+        items.Sum(i => i.DiscountAmount).ShouldBe(10m);
+        foreach (var item in items)
+        {
+            (item.Rate * item.Qty - item.DiscountAmount).ShouldBe(item.NetAmount);
+        }
+    }
+
+    [Fact]
+    public void Calculate_MappedDiscount_ScalesWithConversionFactor()
+    {
+        // Per ERPNext PR #60753 (commit 8cc2a58fe2):
+        // Mapped discount is carried per stock unit and scales with conversion factor
+        var items = new List<TransactionItem>
+        {
+            new()
+            {
+                ItemId = Guid.NewGuid(),
+                Qty = 1,
+                Rate = 1000,
+                NetAmount = 1000,
+                ConversionFactor = 10m, // 1 Box = 10 Units
+                MappedAdditionalDiscountAmount = 10m, // 10 per stock unit
+            },
+        };
+        var taxes = new List<TransactionTaxRow>();
+
+        var result = _service.Calculate(items, taxes, applyDiscountOn: "Net Total");
+
+        // BilledStockQty = 1 * 10 = 10. Discount = 10 * 10 = 100. NetAmount = 1000 - 100 = 900.
+        items[0].DiscountAmount.ShouldBe(100m);
+        items[0].NetAmount.ShouldBe(900m);
+        result.DiscountAmount.ShouldBe(100m);
+        result.NetTotal.ShouldBe(900m);
+        result.GrandTotal.ShouldBe(900m);
+    }
+
+    [Fact]
+    public void Calculate_MappedDiscount_SourceGeneratesDiscountPerStockUnit()
+    {
+        // Per ERPNext PR #60753: source document generates mapped_additional_discount_amount per stock unit
+        var items = new List<TransactionItem>
+        {
+            new()
+            {
+                ItemId = Guid.NewGuid(),
+                Qty = 2,
+                Rate = 500,
+                NetAmount = 1000,
+                ConversionFactor = 5m, // StockQty = 2 * 5 = 10
+            },
+        };
+        var taxes = new List<TransactionTaxRow>();
+
+        var result = _service.Calculate(items, taxes, discountAmount: 100m, applyDiscountOn: "Net Total");
+
+        items[0].DiscountAmount.ShouldBe(100m);
+        items[0].NetAmount.ShouldBe(900m);
+        // Mapped discount per stock unit = 100 / (2 * 5) = 10
+        items[0].MappedAdditionalDiscountAmount.ShouldBe(10m);
+    }
+
+    [Fact]
+    public void Calculate_MappedDiscount_ClearStaleDiscountOnUndiscountedMappedRows()
+    {
+        // Per ERPNext PR #60737 (commit c42b3e8cf5):
+        // If mapped destination rows carry no mapped discount, clear stale header discount total
+        var items = new List<TransactionItem>
+        {
+            new()
+            {
+                ItemId = Guid.NewGuid(),
+                Qty = 2,
+                Rate = 100,
+                NetAmount = 200,
+                MappedAdditionalDiscountAmount = 0m, // Un-discounted row mapped from order
+            },
+        };
+        var taxes = new List<TransactionTaxRow>();
+
+        // Source had discount_amount = 50 copied by mapper, but mapped row has no discount
+        var result = _service.Calculate(items, taxes, discountAmount: 50m, applyDiscountOn: "Net Total", clearStaleMappedDiscount: true);
+
+        // Stale discount is cleared; undiscounted row is not discounted
+        items[0].DiscountAmount.ShouldBe(0m);
+        items[0].NetAmount.ShouldBe(200m);
+        result.DiscountAmount.ShouldBe(0m);
+        result.NetTotal.ShouldBe(200m);
+        result.GrandTotal.ShouldBe(200m);
+    }
+
+    [Fact]
+    public void Calculate_MappedDiscount_PartialMappedQuantityWithUomChange()
+    {
+        // Per ERPNext PR #60753: test UOM change with partial mapped quantity
+        var items = new List<TransactionItem>
+        {
+            new()
+            {
+                ItemId = Guid.NewGuid(),
+                Qty = 4, // 4 individual Units mapped out of a 10-unit Box
+                Rate = 100,
+                NetAmount = 400,
+                ConversionFactor = 1m, // Transaction UOM is Unit
+                MappedAdditionalDiscountAmount = 10m, // Carried from source (10 per stock unit)
+            },
+        };
+        var taxes = new List<TransactionTaxRow>();
+
+        var result = _service.Calculate(items, taxes, applyDiscountOn: "Net Total");
+
+        // BilledStockQty = 4 * 1 = 4. Discount = 10 * 4 = 40. NetAmount = 400 - 40 = 360.
+        items[0].DiscountAmount.ShouldBe(40m);
+        items[0].NetAmount.ShouldBe(360m);
+        result.DiscountAmount.ShouldBe(40m);
+        result.NetTotal.ShouldBe(360m);
+    }
+}

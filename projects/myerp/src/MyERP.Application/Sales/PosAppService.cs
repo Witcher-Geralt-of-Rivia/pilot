@@ -1,0 +1,570 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Core.DomainServices;
+using MyERP.Inventory.DomainServices;
+using MyERP.Inventory.Entities;
+using MyERP.Permissions;
+using MyERP.Sales.Entities;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+
+namespace MyERP.Sales;
+
+/// <summary>
+/// Point of Sale application service.
+/// Creates a Sales Invoice in Posted status directly (like ERPNext POS Invoice).
+/// Deducts stock from the specified warehouse.
+/// </summary>
+[Authorize(MyERPPermissions.SalesInvoices.Create)]
+public class PosAppService : ApplicationService, IPosAppService
+{
+    private readonly IRepository<SalesInvoice, Guid> _invoiceRepository;
+    private readonly IRepository<Item, Guid> _itemRepository;
+    private readonly IDocumentNumberGenerator _numberGenerator;
+    private readonly StockValuationService _stockValuationService;
+    private readonly BinService _binService;
+
+    public PosAppService(
+        IRepository<SalesInvoice, Guid> invoiceRepository,
+        IRepository<Item, Guid> itemRepository,
+        IDocumentNumberGenerator numberGenerator,
+        StockValuationService stockValuationService,
+        BinService binService)
+    {
+        _invoiceRepository = invoiceRepository;
+        _itemRepository = itemRepository;
+        _numberGenerator = numberGenerator;
+        _stockValuationService = stockValuationService;
+        _binService = binService;
+    }
+
+    public async Task<PosInvoiceDto> CompleteSaleAsync(CreatePosInvoiceDto input)
+    {
+        // Validate posting period is not frozen/closed
+        var postingOrchestrator = LazyServiceProvider
+            .LazyGetRequiredService<Accounting.DomainServices.DocumentPostingOrchestrator>();
+        await postingOrchestrator.ValidatePostingPeriodAsync(input.CompanyId, DateTime.UtcNow, "POS Invoice");
+
+        var companyRestriction = LazyServiceProvider.LazyGetRequiredService<MyERP.Core.DomainServices.CompanyRestrictionValidationService>();
+        await companyRestriction.ValidateTransactionCompanyAsync(
+            "POS Invoice", input.CompanyId,
+            itemIds: input.Items.Select(i => i.ItemId).Distinct().ToArray(),
+            customerIds: input.CustomerId.HasValue ? new[] { input.CustomerId.Value } : null);
+
+        // Validate an active POS Opening Entry exists for this POS Profile / company
+        // Per ERPNext PR #46907 / commit 3de1b22480: validate if pos is opened before pos invoice creation
+        var posOpeningRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PosOpeningEntry, Guid>>();
+        var openingQuery = await posOpeningRepo.GetQueryableAsync();
+
+        PosProfile? profile = null;
+        var profileRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PosProfile, Guid>>();
+        var currentUserId = CurrentUser.Id;
+
+        if (input.PosProfileId.HasValue)
+        {
+            var profileQuery = await profileRepo.WithDetailsAsync(x => x.Users);
+            profile = await AsyncExecuter.FirstOrDefaultAsync(profileQuery.Where(x => x.Id == input.PosProfileId.Value));
+            if (profile == null)
+            {
+                throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.EntityNotFound)
+                    .WithData("detail", $"POS Profile {input.PosProfileId.Value} not found.");
+            }
+            if (profile.IsDisabled)
+            {
+                throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"POS Profile '{profile.ProfileName}' is disabled.");
+            }
+
+            // Authorize cashier: if profile has users configured, cashier must be in the list (ERPNext commit 7fc01a6ec8)
+            if (currentUserId.HasValue && profile.Users.Count > 0 && !profile.Users.Any(u => u.UserId == currentUserId.Value))
+            {
+                throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.PosProfileUserNotAuthorized)
+                    .WithData("user", currentUserId.Value.ToString())
+                    .WithData("posProfile", profile.ProfileName);
+            }
+
+            var hasActiveSession = openingQuery.Any(
+                e => e.CompanyId == input.CompanyId
+                    && e.PosProfileId == input.PosProfileId.Value
+                    && e.Status == PosOpeningStatus.Open);
+            if (!hasActiveSession)
+            {
+                var profileName = profile.ProfileName;
+                throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.NoPosOpeningEntry)
+                    .WithData("posProfile", profileName);
+            }
+        }
+        else
+        {
+            // Auto-resolve default POS profile for current user
+            // Per ERPNext PR #58591 (commit 4355f8e60e) & PR #58508 (commit 9018573179)
+            if (currentUserId.HasValue)
+            {
+                var profilesQuery = await profileRepo.WithDetailsAsync(x => x.Users);
+                var activeProfiles = await AsyncExecuter.ToListAsync(
+                    profilesQuery.Where(x => x.CompanyId == input.CompanyId && !x.IsDisabled));
+
+                profile = activeProfiles.FirstOrDefault(p => p.Users.Any(u => u.UserId == currentUserId.Value && u.IsDefault))
+                    ?? activeProfiles.FirstOrDefault(p => p.Users.Any(u => u.UserId == currentUserId.Value))
+                    ?? activeProfiles.FirstOrDefault(p => p.Users.Count == 0);
+            }
+
+            if (profile != null)
+            {
+                input.PosProfileId = profile.Id;
+                var hasActiveSession = openingQuery.Any(
+                    e => e.CompanyId == input.CompanyId
+                        && e.PosProfileId == profile.Id
+                        && e.Status == PosOpeningStatus.Open);
+                if (!hasActiveSession)
+                {
+                    throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.NoPosOpeningEntry)
+                        .WithData("posProfile", profile.ProfileName);
+                }
+            }
+            else
+            {
+                var hasActiveSession = openingQuery.Any(
+                    e => e.CompanyId == input.CompanyId
+                        && e.Status == PosOpeningStatus.Open);
+                if (!hasActiveSession)
+                {
+                    throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.NoPosOpeningEntry)
+                        .WithData("posProfile", "Default");
+                }
+            }
+        }
+
+        var customerId = input.CustomerId
+            ?? throw new Volo.Abp.BusinessException("MyERP:01007")
+                .WithData("documentType", "POS Invoice — CustomerId is required");
+
+        var customerRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Customer, Guid>>();
+        var customer = await customerRepo.GetAsync(customerId);
+        var partyValidation = LazyServiceProvider.LazyGetRequiredService<PartyValidationService>();
+        await partyValidation.ValidatePartyForTransactionAsync("Customer", isDisabled: !customer.IsActive, isFrozen: customer.IsFrozen, customer.Name, input.CompanyId);
+        partyValidation.ValidateCustomerNotBlocked(customer.OnHold, customer.ReleaseDate, customer.Name, DateTime.UtcNow);
+
+        if (!string.IsNullOrWhiteSpace(input.PaymentMethod))
+        {
+            var mopRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Accounting.Entities.ModeOfPayment, Guid>>();
+            var mopQuery = await mopRepo.GetQueryableAsync();
+            var mop = mopQuery.FirstOrDefault(m => m.Name == input.PaymentMethod);
+            if (mop != null && !mop.IsActive)
+            {
+                throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("message", $"Mode of Payment '{mop.Name}' is disabled.");
+            }
+        }
+
+        var invoiceNumber = await _numberGenerator.GenerateAsync("POS", input.CompanyId);
+
+        var invoice = new SalesInvoice(
+            GuidGenerator.Create(),
+            input.CompanyId,
+            customerId,
+            invoiceNumber,
+            DateTime.UtcNow,
+            CurrentTenant.Id);
+
+        // POS always deducts stock
+        invoice.UpdateStock = true;
+        invoice.WarehouseId = input.WarehouseId ?? profile?.WarehouseId;
+        invoice.IsPos = true;
+        invoice.PosProfileId = input.PosProfileId;
+        if (profile?.ProjectId.HasValue == true)
+        {
+            invoice.ProjectId = profile.ProjectId;
+        }
+
+        // Multi-currency handling per ERPNext PR #58599 / commit f16f249a38
+        var currency = !string.IsNullOrWhiteSpace(input.CurrencyCode)
+            ? input.CurrencyCode
+            : profile?.CurrencyCode ?? "MYR";
+        invoice.CurrencyCode = currency;
+
+        if (input.ExchangeRate.HasValue && input.ExchangeRate.Value > 0)
+        {
+            invoice.ExchangeRate = input.ExchangeRate.Value;
+        }
+        else
+        {
+            var companyRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<MyERP.Core.Entities.Company, Guid>>();
+            var company = await companyRepo.GetAsync(input.CompanyId);
+            if (currency != company.CurrencyCode)
+            {
+                var exchangeService = LazyServiceProvider.LazyGetRequiredService<Accounting.DomainServices.CurrencyExchangeService>();
+                invoice.ExchangeRate = await exchangeService.GetExchangeRateAsync(currency, company.CurrencyCode, invoice.IssueDate);
+            }
+            else
+            {
+                invoice.ExchangeRate = 1m;
+            }
+        }
+
+        // POS invoice due date defaults to issue date (ERPNext PR #49232 / commit 77478303fe)
+        invoice.DueDate ??= invoice.IssueDate;
+
+        foreach (var item in input.Items)
+        {
+            invoice.AddItem(item.ItemId, item.Description, item.Quantity, item.UnitPrice, item.TaxAmount);
+        }
+
+        // POS invoices go straight to Posted status; record customer payment received at counter
+        invoice.AmountPaid = Math.Min(input.AmountReceived, invoice.GrandTotal);
+        invoice.Submit();
+        await _invoiceRepository.InsertAsync(invoice, autoSave: true);
+
+        // Post() only flips status — the actual GL/PLE journal entry (AR debit, income/tax
+        // credit) is built here. Without this call every POS sale reached Posted status with
+        // zero ledger impact: no receivable, no revenue, no tax booked.
+        invoice.Post();
+        var glService = LazyServiceProvider.LazyGetRequiredService<Accounting.DomainServices.GlRepostService>();
+        await glService.RebuildSalesInvoiceGlAsync(invoice);
+        await _invoiceRepository.UpdateAsync(invoice, autoSave: true);
+
+        // Deduct stock for stock items
+        if (input.WarehouseId.HasValue)
+        {
+            // Batch load MaintainStock flags to avoid N+1
+            var posItemIds = input.Items.Select(i => i.ItemId).Distinct().ToArray();
+            var itemQuery = await _itemRepository.GetQueryableAsync();
+            var stockItemIds = itemQuery
+                .Where(i => posItemIds.Contains(i.Id) && i.MaintainStock)
+                .Select(i => i.Id)
+                .ToHashSet();
+
+            foreach (var item in input.Items)
+            {
+                if (!stockItemIds.Contains(item.ItemId)) continue;
+
+                await _stockValuationService.CreateLedgerEntryAsync(
+                    input.CompanyId, item.ItemId, input.WarehouseId.Value,
+                    DateTime.UtcNow, -item.Quantity, item.UnitPrice,
+                    "SalesInvoice", invoice.Id, CurrentTenant.Id);
+
+                await _binService.ApplyStockMovementAsync(
+                    item.ItemId, input.WarehouseId.Value, -item.Quantity, -(item.Quantity * item.UnitPrice));
+            }
+        }
+
+        var change = input.AmountReceived - invoice.GrandTotal;
+        var actualChange = change > 0 ? change : 0;
+        var baseChange = Math.Round(actualChange * invoice.ExchangeRate, 2);
+
+        return new PosInvoiceDto
+        {
+            Id = invoice.Id,
+            InvoiceNumber = invoice.InvoiceNumber,
+            IssueDate = invoice.IssueDate,
+            NetTotal = invoice.NetTotal,
+            TaxAmount = invoice.TaxAmount,
+            GrandTotal = invoice.GrandTotal,
+            AmountReceived = input.AmountReceived,
+            Change = actualChange,
+            BaseChange = baseChange,
+            Status = invoice.Status.ToString(),
+        };
+    }
+
+    public async Task<PagedResultDto<PosItemDto>> SearchItemsAsync(PosItemSearchDto input)
+    {
+        var query = await _itemRepository.GetQueryableAsync();
+
+        var hideUnavailable = input.HideUnavailableItems;
+        Guid? warehouseId = input.WarehouseId;
+        HashSet<Guid>? allowedItemGroupIds = null;
+
+        if (input.PosProfileId.HasValue)
+        {
+            var posProfileRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PosProfile, Guid>>();
+            var profileQuery = await posProfileRepo.WithDetailsAsync(x => x.ItemGroups, x => x.Users);
+            var profile = await AsyncExecuter.FirstOrDefaultAsync(profileQuery.Where(x => x.Id == input.PosProfileId.Value));
+            if (profile != null)
+            {
+                // Authorize cashier for POS profile in search (ERPNext commit 7fc01a6ec8)
+                if (CurrentUser.Id.HasValue && profile.Users.Count > 0 && !profile.Users.Any(u => u.UserId == CurrentUser.Id.Value))
+                {
+                    throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.PosProfileUserNotAuthorized)
+                        .WithData("user", CurrentUser.Id.Value.ToString())
+                        .WithData("posProfile", profile.ProfileName);
+                }
+
+                hideUnavailable = hideUnavailable || profile.HideUnavailableItems;
+                warehouseId ??= profile.WarehouseId;
+
+                if (profile.ItemGroups.Any())
+                {
+                    allowedItemGroupIds = await GetAllDescendantAndSelfItemGroupIdsAsync(profile.ItemGroups.Select(g => g.ItemGroupId).ToList());
+                }
+            }
+        }
+
+        if (input.ItemGroupId.HasValue)
+        {
+            var selectedGroupTree = await GetAllDescendantAndSelfItemGroupIdsAsync(new[] { input.ItemGroupId.Value });
+            if (allowedItemGroupIds != null)
+            {
+                allowedItemGroupIds.IntersectWith(selectedGroupTree);
+            }
+            else
+            {
+                allowedItemGroupIds = selectedGroupTree;
+            }
+        }
+
+        if (allowedItemGroupIds != null)
+        {
+            query = query.Where(i => i.ItemGroupId.HasValue && allowedItemGroupIds.Contains(i.ItemGroupId.Value));
+        }
+
+        if (hideUnavailable && warehouseId.HasValue)
+        {
+            // Per ERPNext PR #47493 / commit 57f3489dfa:
+            // Non-stock items (service/digital) are NOT hidden even when HideUnavailableItems is active.
+            // Stock items must have actual_qty > 0 in the specified warehouse.
+            var binRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Bin, Guid>>();
+            var binQuery = await binRepo.GetQueryableAsync();
+            var availableStockItemIds = binQuery
+                .Where(b => b.WarehouseId == warehouseId.Value && b.ActualQty > 0)
+                .Select(b => b.ItemId);
+
+            query = query.Where(i => !i.MaintainStock || availableStockItemIds.Contains(i.Id));
+        }
+
+        if (!string.IsNullOrWhiteSpace(input.Search))
+        {
+            var search = input.Search;
+            query = query.Where(i => i.IsActive &&
+                (i.ItemName.Contains(search) ||
+                 i.ItemCode.Contains(search) ||
+                 (i.Barcode != null && i.Barcode.Contains(search)) ||
+                 i.Barcodes.Any(b => b.Barcode.Contains(search))));
+        }
+        else
+        {
+            query = query.Where(i => i.IsActive);
+        }
+
+        var items = query.Take(input.MaxResultCount).ToList();
+
+        return new PagedResultDto<PosItemDto>(
+            items.Count,
+            items.Select(i => new PosItemDto
+            {
+                Id = i.Id,
+                ItemCode = i.ItemCode,
+                ItemName = i.ItemName,
+                SellingPrice = i.StandardSellingPrice ?? 0,
+                Uom = i.Uom,
+                Barcode = i.Barcode,
+            }).ToList());
+    }
+
+    public async Task<BarcodeScanResultDto> ScanBarcodeAsync(ScanBarcodeInput input)
+    {
+        var query = await _itemRepository.GetQueryableAsync();
+        var barcode = input.Barcode?.Trim();
+        if (string.IsNullOrEmpty(barcode))
+            return new BarcodeScanResultDto { Found = false };
+
+        // Per ERPNext barcode_scanner.js: search barcode → item code → serial no
+        // Also checks the multi-barcode child table (case/carton codes, alternate symbologies)
+        // for items carrying more than one scannable code.
+        var item = query.FirstOrDefault(i =>
+            i.IsActive && (i.Barcode == barcode || i.ItemCode == barcode
+                || i.Barcodes.Any(b => b.Barcode == barcode)));
+
+        if (item == null)
+            return new BarcodeScanResultDto { Found = false };
+
+        return new BarcodeScanResultDto
+        {
+            Found = true,
+            ItemId = item.Id,
+            ItemCode = item.ItemCode,
+            ItemName = item.ItemName,
+            Rate = item.StandardSellingPrice ?? 0,
+            Uom = item.Uom,
+            Barcode = item.Barcode,
+        };
+    }
+
+    [Authorize(MyERPPermissions.SalesInvoices.Default)]
+    public async Task<PosReceiptEmailContentDto> GetReceiptEmailContentAsync(Guid invoiceId)
+    {
+        var invoice = await _invoiceRepository.GetAsync(invoiceId);
+        string defaultText = $"{(invoice.IsPos ? "POS Invoice" : "Sales Invoice")}: {invoice.InvoiceNumber}";
+
+        Core.Entities.EmailTemplate? template = null;
+        if (invoice.PosProfileId.HasValue)
+        {
+            var profileRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PosProfile, Guid>>();
+            var profile = await profileRepo.FindAsync(invoice.PosProfileId.Value);
+            if (profile?.ReceiptEmailTemplateId.HasValue == true)
+            {
+                var templateRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.EmailTemplate, Guid>>();
+                template = await templateRepo.FindAsync(profile.ReceiptEmailTemplateId.Value);
+            }
+        }
+
+        string customerName = string.Empty;
+        var customerRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Customer, Guid>>();
+        var customer = await customerRepo.FindAsync(invoice.CustomerId);
+        if (customer != null) customerName = customer.Name;
+
+        var vars = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["doc.name"] = invoice.InvoiceNumber,
+            ["name"] = invoice.InvoiceNumber,
+            ["invoice_number"] = invoice.InvoiceNumber,
+            ["doc.customer"] = customerName,
+            ["doc.customer_name"] = customerName,
+            ["customer"] = customerName,
+            ["customer_name"] = customerName,
+            ["doc.grand_total"] = invoice.GrandTotal.ToString("F2"),
+            ["grand_total"] = invoice.GrandTotal.ToString("F2"),
+            ["doc.posting_date"] = invoice.IssueDate.ToString("yyyy-MM-dd"),
+            ["posting_date"] = invoice.IssueDate.ToString("yyyy-MM-dd"),
+        };
+
+        var (subject, message) = Core.Entities.EmailTemplate.GetSubjectAndMessage(
+            template,
+            vars,
+            defaultText,
+            defaultText);
+
+        return new PosReceiptEmailContentDto
+        {
+            Subject = subject,
+            Message = message,
+        };
+    }
+
+    /// <summary>
+    /// Computes deterministic default/parent Item Group for a POS Profile using Lowest Common Ancestor (PR #59720).
+    /// </summary>
+    [Authorize(MyERPPermissions.SalesInvoices.Default)]
+    public async Task<ParentItemGroupDto> GetParentItemGroupAsync(Guid posProfileId)
+    {
+        var posProfileRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PosProfile, Guid>>();
+        var profileQuery = await posProfileRepo.WithDetailsAsync(x => x.ItemGroups);
+        var profile = await AsyncExecuter.FirstOrDefaultAsync(profileQuery.Where(x => x.Id == posProfileId));
+
+        var itemGroupRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Inventory.Entities.ItemGroup, Guid>>();
+        var allGroups = await itemGroupRepo.GetListAsync();
+
+        if (profile?.ItemGroups.Any() == true)
+        {
+            var targetIds = profile.ItemGroups.Select(g => g.ItemGroupId).Distinct().ToList();
+            var lca = GetLowestCommonAncestorItemGroup(allGroups, targetIds);
+            if (lca != null)
+            {
+                return new ParentItemGroupDto { Id = lca.Id, Name = lca.Name };
+            }
+        }
+
+        var rootGroup = allGroups.FirstOrDefault(g => !g.ParentId.HasValue && g.IsGroup)
+            ?? allGroups.FirstOrDefault(g => !g.ParentId.HasValue)
+            ?? allGroups.FirstOrDefault();
+
+        return rootGroup != null
+            ? new ParentItemGroupDto { Id = rootGroup.Id, Name = rootGroup.Name }
+            : new ParentItemGroupDto { Id = Guid.Empty, Name = "All Item Groups" };
+    }
+
+    [Authorize(MyERPPermissions.SalesInvoices.Default)]
+    public async Task<List<ParentItemGroupDto>> GetItemGroupsAsync(Guid posProfileId)
+    {
+        var parent = await GetParentItemGroupAsync(posProfileId);
+        var itemGroupRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Inventory.Entities.ItemGroup, Guid>>();
+        var allGroups = await itemGroupRepo.GetListAsync();
+
+        if (parent.Id == Guid.Empty)
+        {
+            return allGroups.Select(g => new ParentItemGroupDto { Id = g.Id, Name = g.Name }).ToList();
+        }
+
+        var descendants = await GetAllDescendantAndSelfItemGroupIdsAsync(new[] { parent.Id });
+        return allGroups
+            .Where(g => descendants.Contains(g.Id))
+            .Select(g => new ParentItemGroupDto { Id = g.Id, Name = g.Name })
+            .ToList();
+    }
+
+    private async Task<HashSet<Guid>> GetAllDescendantAndSelfItemGroupIdsAsync(IEnumerable<Guid> seedGroupIds)
+    {
+        var itemGroupRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Inventory.Entities.ItemGroup, Guid>>();
+        var allGroups = await itemGroupRepo.GetListAsync();
+        var childrenLookup = allGroups
+            .Where(g => g.ParentId.HasValue)
+            .GroupBy(g => g.ParentId!.Value)
+            .ToDictionary(g => g.Key, g => g.Select(x => x.Id).ToList());
+
+        var result = new HashSet<Guid>(seedGroupIds);
+        var queue = new Queue<Guid>(seedGroupIds);
+
+        while (queue.Count > 0)
+        {
+            var current = queue.Dequeue();
+            if (childrenLookup.TryGetValue(current, out var children))
+            {
+                foreach (var child in children)
+                {
+                    if (result.Add(child))
+                    {
+                        queue.Enqueue(child);
+                    }
+                }
+            }
+        }
+
+        return result;
+    }
+
+    public static Inventory.Entities.ItemGroup? GetLowestCommonAncestorItemGroup(
+        List<Inventory.Entities.ItemGroup> allGroups,
+        List<Guid> groupIds)
+    {
+        if (groupIds == null || groupIds.Count == 0) return null;
+        if (groupIds.Count == 1) return allGroups.FirstOrDefault(g => g.Id == groupIds[0]);
+
+        var groupMap = allGroups.ToDictionary(g => g.Id);
+        var paths = new List<List<Guid>>();
+
+        foreach (var id in groupIds)
+        {
+            var path = new List<Guid>();
+            var current = id;
+            var visited = new HashSet<Guid>();
+            while (groupMap.TryGetValue(current, out var node) && visited.Add(current))
+            {
+                path.Add(current);
+                if (!node.ParentId.HasValue) break;
+                current = node.ParentId.Value;
+            }
+            if (path.Count > 0)
+            {
+                paths.Add(path);
+            }
+        }
+
+        if (paths.Count == 0) return null;
+
+        var firstPath = paths[0];
+        foreach (var ancestorId in firstPath)
+        {
+            if (paths.All(p => p.Contains(ancestorId)))
+            {
+                return groupMap.GetValueOrDefault(ancestorId);
+            }
+        }
+
+        return null;
+    }
+}
+

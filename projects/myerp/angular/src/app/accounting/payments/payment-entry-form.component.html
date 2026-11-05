@@ -1,0 +1,399 @@
+<abp-page [title]="'::PaymentEntry' | abpLocalization">
+  <form [formGroup]="form" (ngSubmit)="save()" (appSaveShortcut)="save()">
+    <div class="card mb-4">
+      <div class="card-header">
+        <h5 class="card-title mb-0"><i class="fa fa-money-bill-wave me-2"></i>{{ '::PaymentEntry' | abpLocalization }}</h5>
+      </div>
+      <div class="card-body">
+        <div class="mb-3">
+          <div class="btn-group" role="group">
+            <input type="radio" class="btn-check" formControlName="paymentType" value="Receive" id="ptReceive" />
+            <label class="btn btn-outline-primary" for="ptReceive">{{ '::Receive' | abpLocalization }}</label>
+            <input type="radio" class="btn-check" formControlName="paymentType" value="Pay" id="ptPay" />
+            <label class="btn btn-outline-primary" for="ptPay">{{ '::Pay' | abpLocalization }}</label>
+            <input type="radio" class="btn-check" formControlName="paymentType" value="InternalTransfer" id="ptTransfer" />
+            <label class="btn btn-outline-primary" for="ptTransfer">{{ '::InternalTransfer' | abpLocalization }}</label>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label">{{ '::PaymentDate' | abpLocalization }}</label>
+            <input type="date" class="form-control" formControlName="paymentDate" [class.is-invalid]="form.get('paymentDate')?.invalid && form.get('paymentDate')?.touched" />
+          </div>
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label">{{ '::PartyType' | abpLocalization }}</label>
+            <select class="form-select" formControlName="partyType" [class.is-invalid]="form.get('partyType')?.invalid && form.get('partyType')?.touched">
+              <option value="Customer">{{ '::Customer' | abpLocalization }}</option>
+              <option value="Supplier">{{ '::Supplier' | abpLocalization }}</option>
+            </select>
+          </div>
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label">{{ '::Party' | abpLocalization }}</label>
+            <select class="form-select" formControlName="partyId" (change)="onPartySelected()"
+                    [class.is-invalid]="form.get('partyId')?.invalid && form.get('partyId')?.touched">
+              <option value="">{{ '::SelectParty' | abpLocalization }}</option>
+              @for (party of parties(); track party.id) {
+                <option [value]="party.id">{{ party.name }}</option>
+              }
+            </select>
+          </div>
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label">{{ '::PaidFromAccount' | abpLocalization }}</label>
+            <select class="form-select" formControlName="paidFromAccount" [class.is-invalid]="form.get('paidFromAccount')?.invalid && form.get('paidFromAccount')?.touched">
+              <option value="">{{ '::SelectAccount' | abpLocalization }}</option>
+              @if (form.get('paymentType')?.value === 'Receive') {
+                @for (acct of receivableAccounts(); track acct.id) {
+                  <option [value]="acct.id">{{ acct.accountCode }} — {{ acct.accountName }}</option>
+                }
+              } @else if (form.get('paymentType')?.value === 'InternalTransfer') {
+                @for (acct of bankCashAccounts(); track acct.id) {
+                  @if (acct.id !== form.get('paidToAccount')?.value) {
+                    <option [value]="acct.id">{{ acct.accountCode }} — {{ acct.accountName }}</option>
+                  }
+                }
+              } @else {
+                @for (acct of bankCashAccounts(); track acct.id) {
+                  <option [value]="acct.id">{{ acct.accountCode }} — {{ acct.accountName }}</option>
+                }
+              }
+            </select>
+            <small class="text-muted">
+              @if (form.get('paymentType')?.value === 'Receive') {
+                {{ '::PartyAccount' | abpLocalization }}
+              } @else {
+                {{ '::BankCashAccount' | abpLocalization }}
+              }
+            </small>
+          </div>
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label">{{ '::PaidToAccount' | abpLocalization }}</label>
+            <select class="form-select" formControlName="paidToAccount" [class.is-invalid]="form.get('paidToAccount')?.invalid && form.get('paidToAccount')?.touched">
+              <option value="">{{ '::SelectAccount' | abpLocalization }}</option>
+              @if (form.get('paymentType')?.value === 'Pay') {
+                @for (acct of payableAccounts(); track acct.id) {
+                  <option [value]="acct.id">{{ acct.accountCode }} — {{ acct.accountName }}</option>
+                }
+              } @else if (form.get('paymentType')?.value === 'InternalTransfer') {
+                @for (acct of bankCashAccounts(); track acct.id) {
+                  @if (acct.id !== form.get('paidFromAccount')?.value) {
+                    <option [value]="acct.id">{{ acct.accountCode }} — {{ acct.accountName }}</option>
+                  }
+                }
+              } @else {
+                @for (acct of bankCashAccounts(); track acct.id) {
+                  <option [value]="acct.id">{{ acct.accountCode }} — {{ acct.accountName }}</option>
+                }
+              }
+            </select>
+            <small class="text-muted">
+              @if (form.get('paymentType')?.value === 'Pay') {
+                {{ '::PartyAccount' | abpLocalization }}
+              } @else {
+                {{ '::BankCashAccount' | abpLocalization }}
+              }
+            </small>
+          </div>
+          @if (form.get('paymentType')?.value === 'InternalTransfer') {
+            <div class="col-12 col-md-6 mb-3">
+              <label class="form-label text-muted">{{ '::BankAccountFrom' | abpLocalization }}</label>
+              <input type="text" class="form-control bg-light" readonly
+                     [value]="paidFromBankAccount()?.accountName ?? '—'" />
+            </div>
+            <div class="col-12 col-md-6 mb-3">
+              <label class="form-label text-muted">{{ '::BankAccountTo' | abpLocalization }}</label>
+              <input type="text" class="form-control bg-light" readonly
+                     [value]="paidToBankAccount()?.accountName ?? '—'" />
+            </div>
+          }
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label">{{ '::Amount' | abpLocalization }}</label>
+            <div class="input-group">
+              <span class="input-group-text"><i class="fa fa-money-bill"></i></span>
+              <input type="number" class="form-control" formControlName="amount" [class.is-invalid]="form.get('amount')?.invalid && form.get('amount')?.touched" />
+              <select class="form-select" formControlName="currency" style="max-width: 90px;">
+                <option value="MYR">MYR</option>
+                <option value="USD">USD</option>
+                <option value="SGD">SGD</option>
+                <option value="EUR">EUR</option>
+                <option value="GBP">GBP</option>
+                <option value="AUD">AUD</option>
+                <option value="JPY">JPY</option>
+                <option value="CNY">CNY</option>
+              </select>
+            </div>
+          </div>
+          @if (isMultiCurrency()) {
+            <div class="col-12 col-md-4 mb-3">
+              <label class="form-label">{{ '::ExchangeRate' | abpLocalization }}
+                <small class="text-muted">({{ form.get('currency')?.value }} → MYR)</small>
+              </label>
+              <input type="number" class="form-control" formControlName="exchangeRate" step="0.0001" />
+              <small class="text-muted">{{ '::BaseAmount' | abpLocalization }}: {{ baseAmount() | number:'1.2-2' }} MYR</small>
+            </div>
+          }
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label">{{ '::ModeOfPayment' | abpLocalization }}</label>
+            <select class="form-select" formControlName="modeOfPayment">
+              <option value="">—</option>
+              <option value="Cash">{{ '::Cash' | abpLocalization }}</option>
+              <option value="Bank Transfer">{{ '::BankTransfer' | abpLocalization }}</option>
+              <option value="Wire Transfer">{{ '::WireTransfer' | abpLocalization }}</option>
+              <option value="Credit Card">{{ '::CreditCard' | abpLocalization }}</option>
+              <option value="Cheque">{{ '::Cheque' | abpLocalization }}</option>
+            </select>
+          </div>
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label">{{ '::ReferenceNo' | abpLocalization }}</label>
+            <input type="text" class="form-control" formControlName="reference" [class.is-invalid]="form.get('reference')?.invalid && form.get('reference')?.touched" />
+          </div>
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label">Reference Date</label>
+            <input type="date" class="form-control" formControlName="referenceDate" />
+            <small class="text-muted">Required with Reference No for bank payments.</small>
+          </div>
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label">{{ '::CostCenter' | abpLocalization }}</label>
+            <select class="form-select" formControlName="costCenterId">
+              <option value="">—</option>
+              @for (cc of costCenters(); track cc.id) {
+                <option [value]="cc.id">{{ cc.name }}</option>
+              }
+            </select>
+          </div>
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label">{{ '::Project' | abpLocalization }}</label>
+            <select class="form-select" formControlName="projectId">
+              <option value="">—</option>
+              @for (proj of projects(); track proj.id) {
+                <option [value]="proj.id">{{ proj.name }}</option>
+              }
+            </select>
+          </div>
+          <div class="col-12 col-md-8 mb-3">
+            <label class="form-label">{{ '::Remarks' | abpLocalization }}</label>
+            <input type="text" class="form-control" formControlName="remarks" [class.is-invalid]="form.get('remarks')?.invalid && form.get('remarks')?.touched" />
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Actions -->
+    @if (linkedDocLabel()) {
+      <div class="alert alert-info mb-3">
+        <i class="fa fa-link me-2"></i>{{ linkedDocLabel() }}
+      </div>
+    }
+
+    <!-- Outstanding Invoices — Multi-select allocation -->
+    @if ((outstandingInvoices() ?? []).length > 0) {
+      <div class="card mb-4">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <h6 class="card-title mb-0">
+            <i class="fa fa-file-invoice me-2"></i>{{ '::OutstandingInvoices' | abpLocalization }}
+            <span class="badge bg-danger ms-2">{{ totalInvoiceOutstanding() | number:'1.2-2' }}</span>
+          </h6>
+          <div class="d-flex align-items-center gap-2">
+            <button type="button" class="btn btn-outline-success btn-sm" (click)="autoAllocate()" [disabled]="!(form.get('amount')?.value ?? 0) || (form.get('amount')?.value ?? 0) <= 0">
+              <i class="fa fa-wand-magic-sparkles me-1"></i>{{ '::AllocateAutomatically' | abpLocalization }}
+            </button>
+            @if (totalAllocated() > 0) {
+              <span class="badge" [class.bg-success]="unallocatedAmount() === 0" [class.bg-warning]="unallocatedAmount() > 0" [class.bg-danger]="unallocatedAmount() < 0">
+                {{ '::Allocated' | abpLocalization }}: {{ totalAllocated() | number:'1.2-2' }} / {{ (form.get('amount')?.value ?? 0) | number:'1.2-2' }}
+              </span>
+            }
+          </div>
+        </div>
+        <div class="card-body p-0">
+          <table class="table table-hover table-sm mb-0">
+            <thead class="table-light">
+              <tr>
+                <th style="width: 40px;"></th>
+                <th>{{ '::InvoiceNumber' | abpLocalization }}</th>
+                <th>{{ '::DueDate' | abpLocalization }}</th>
+                <th class="text-end">{{ '::GrandTotal' | abpLocalization }}</th>
+                <th class="text-end">{{ '::Outstanding' | abpLocalization }}</th>
+                <th>{{ '::Status' | abpLocalization }}</th>
+                <th class="text-end" style="width: 150px;">{{ '::AllocatedAmount' | abpLocalization }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (inv of outstandingInvoices(); track inv.invoiceId) {
+                <tr [class.table-active]="isInvoiceSelected(inv.invoiceId)" [class.table-danger]="inv.isOverdue && !isInvoiceSelected(inv.invoiceId)">
+                  <td class="text-center">
+                    <input type="checkbox" class="form-check-input"
+                           [checked]="isInvoiceSelected(inv.invoiceId)"
+                           (change)="toggleInvoice(inv, $event)" />
+                  </td>
+                  <td>{{ inv.invoiceNumber }}</td>
+                  <td>
+                    {{ inv.dueDate | date:'dd/MM/yyyy' }}
+                    @if (inv.isOverdue) {
+                      <span class="badge bg-danger ms-1">{{ inv.daysOverdue }}d</span>
+                    }
+                  </td>
+                  <td class="text-end">{{ inv.grandTotal | number:'1.2-2' }}</td>
+                  <td class="text-end fw-bold text-danger">{{ inv.outstanding | number:'1.2-2' }}</td>
+                  <td>
+                    @if (inv.isOverdue) {
+                      <span class="badge bg-danger"><i class="fa fa-clock me-1"></i>{{ '::Overdue' | abpLocalization }}</span>
+                    } @else {
+                      <span class="badge bg-secondary">{{ '::Pending' | abpLocalization }}</span>
+                    }
+                  </td>
+                  <td class="text-end">
+                    @if (isInvoiceSelected(inv.invoiceId)) {
+                      <input type="number" class="form-control form-control-sm text-end"
+                             [value]="getAllocatedAmount(inv.invoiceId)"
+                             (change)="updateAllocation(inv.invoiceId, $event)"
+                             [max]="inv.outstanding" min="0.01" step="0.01" />
+                    }
+                  </td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        </div>
+      </div>
+    }
+
+    <!-- Outstanding Orders — Advance Payment -->
+    @if ((outstandingOrders() ?? []).length > 0) {
+      <div class="card mb-4 border-info">
+        <div class="card-header bg-info bg-opacity-10">
+          <h6 class="card-title mb-0">
+            <i class="fa fa-receipt me-2 text-info"></i>{{ '::AdvancePaymentAgainstOrders' | abpLocalization }}
+            <span class="badge bg-info ms-2">{{ totalOrderPending() | number:'1.2-2' }}</span>
+          </h6>
+        </div>
+        <div class="card-body p-0">
+          <table class="table table-hover table-sm mb-0">
+            <thead class="table-light">
+              <tr>
+                <th>{{ '::OrderNumber' | abpLocalization }}</th>
+                <th>{{ '::Date' | abpLocalization }}</th>
+                <th class="text-end">{{ '::GrandTotal' | abpLocalization }}</th>
+                <th class="text-end">{{ '::AdvancePaid' | abpLocalization }}</th>
+                <th class="text-end">{{ '::PendingAdvance' | abpLocalization }}</th>
+                <th style="width: 120px;"></th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (order of outstandingOrders(); track order.orderId) {
+                <tr [class.table-active]="form.get('againstOrderId')?.value === order.orderId">
+                  <td>{{ order.orderNumber }}</td>
+                  <td>{{ order.orderDate | date:'dd/MM/yyyy' }}</td>
+                  <td class="text-end">{{ order.grandTotal | number:'1.2-2' }}</td>
+                  <td class="text-end text-success">{{ order.advancePaid | number:'1.2-2' }}</td>
+                  <td class="text-end fw-bold text-info">{{ order.pendingAdvance | number:'1.2-2' }}</td>
+                  <td class="text-end">
+                    <button type="button" class="btn btn-outline-info btn-sm" (click)="selectOrder(order)"
+                            [disabled]="form.get('againstOrderId')?.value === order.orderId">
+                      <i class="fa fa-hand-holding-dollar me-1"></i>{{ '::PayAdvance' | abpLocalization }}
+                    </button>
+                  </td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        </div>
+      </div>
+    }
+
+    <!-- Taxes / Charges — PE's own tax engine (bank charges, withholding, etc. on the payment itself) -->
+    <div class="card mb-4">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h6 class="card-title mb-0"><i class="fa fa-receipt me-2"></i>{{ '::TaxesAndCharges' | abpLocalization }}</h6>
+        <button type="button" class="btn btn-outline-primary btn-sm" (click)="addTaxRow()">
+          <i class="fa fa-plus me-1"></i>{{ '::AddRow' | abpLocalization }}
+        </button>
+      </div>
+      @if (taxRows().length > 0) {
+        <div class="card-body p-0">
+          <table class="table table-sm mb-0">
+            <thead class="table-light">
+              <tr>
+                <th>{{ '::Account' | abpLocalization }}</th>
+                <th>{{ '::ChargeType' | abpLocalization }}</th>
+                <th class="text-end" style="width: 100px;">{{ '::Rate' | abpLocalization }}</th>
+                <th class="text-end" style="width: 130px;">{{ '::Amount' | abpLocalization }}</th>
+                <th>{{ '::AddOrDeduct' | abpLocalization }}</th>
+                <th class="text-center">{{ '::IncludedInPaidAmount' | abpLocalization }}</th>
+                <th>{{ '::Description' | abpLocalization }}</th>
+                <th style="width: 40px;"></th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (row of taxRows(); track $index) {
+                <tr>
+                  <td>
+                    <select class="form-select form-select-sm" [ngModel]="row.accountId" [ngModelOptions]="{standalone: true}"
+                            (ngModelChange)="updateTaxRow($index, {accountId: $event})">
+                      <option value="">{{ '::SelectAccount' | abpLocalization }}</option>
+                      @for (acct of accounts(); track acct.id) {
+                        <option [value]="acct.id">{{ acct.accountCode }} — {{ acct.accountName }}</option>
+                      }
+                    </select>
+                  </td>
+                  <td>
+                    <select class="form-select form-select-sm" [ngModel]="row.chargeType" [ngModelOptions]="{standalone: true}"
+                            (ngModelChange)="updateTaxRow($index, {chargeType: +$event})">
+                      <option [value]="chargeTypes.OnPaidAmount">{{ '::OnPaidAmount' | abpLocalization }}</option>
+                      <option [value]="chargeTypes.Actual">{{ '::Actual' | abpLocalization }}</option>
+                    </select>
+                  </td>
+                  <td class="text-end">
+                    @if (row.chargeType === chargeTypes.OnPaidAmount) {
+                      <input type="number" class="form-control form-control-sm text-end" [ngModel]="row.rate" [ngModelOptions]="{standalone: true}"
+                             (ngModelChange)="updateTaxRow($index, {rate: +$event})" step="0.01" min="0" />
+                    }
+                  </td>
+                  <td class="text-end">
+                    <input type="number" class="form-control form-control-sm text-end" [ngModel]="row.taxAmount"
+                           [ngModelOptions]="{standalone: true}" [readOnly]="row.chargeType === chargeTypes.OnPaidAmount"
+                           (ngModelChange)="updateTaxRow($index, {taxAmount: +$event})" step="0.01" />
+                  </td>
+                  <td>
+                    <select class="form-select form-select-sm" [ngModel]="row.addDeductTax" [ngModelOptions]="{standalone: true}"
+                            (ngModelChange)="updateTaxRow($index, {addDeductTax: +$event})">
+                      <option [value]="addDeductOptions.Add">{{ '::Add' | abpLocalization }}</option>
+                      <option [value]="addDeductOptions.Deduct">{{ '::Deduct' | abpLocalization }}</option>
+                    </select>
+                  </td>
+                  <td class="text-center">
+                    <input type="checkbox" class="form-check-input" [ngModel]="row.includedInPaidAmount"
+                           [ngModelOptions]="{standalone: true}" (ngModelChange)="updateTaxRow($index, {includedInPaidAmount: $event})" />
+                  </td>
+                  <td>
+                    <input type="text" class="form-control form-control-sm" [ngModel]="row.description"
+                           [ngModelOptions]="{standalone: true}" (ngModelChange)="updateTaxRow($index, {description: $event})" />
+                  </td>
+                  <td class="text-center">
+                    <button type="button" class="btn btn-link text-danger btn-sm p-0" (click)="removeTaxRow($index)">
+                      <i class="fa fa-trash"></i>
+                    </button>
+                  </td>
+                </tr>
+              }
+            </tbody>
+            <tfoot>
+              <tr>
+                <td colspan="3" class="text-end fw-bold">{{ '::TotalTaxes' | abpLocalization }}</td>
+                <td class="text-end fw-bold">{{ totalTaxAmount() | number:'1.2-2' }}</td>
+                <td colspan="4"></td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      }
+    </div>
+
+    <div class="d-flex justify-content-end gap-2">
+      <button type="button" class="btn btn-outline-secondary" (click)="cancel()">
+        <i class="fa fa-times me-1"></i>{{ '::Cancel' | abpLocalization }}</button>
+      <button type="submit" class="btn btn-primary" [disabled]="form.invalid">
+        <i class="fa fa-save me-1"></i>{{ '::SavePayment' | abpLocalization }}
+      </button>
+    </div>
+  </form>
+</abp-page>

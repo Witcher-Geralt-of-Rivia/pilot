@@ -1,0 +1,306 @@
+using System;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Core.DomainServices;
+using MyERP.Dtos;
+using MyERP.Inventory.Entities;
+using MyERP.Permissions;
+using MyERP.Settings;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Settings;
+
+namespace MyERP.Inventory;
+
+[Authorize(MyERPPermissions.QualityInspections.Default)]
+public class QualityInspectionAppService : ApplicationService, IQualityInspectionAppService
+{
+    private readonly IRepository<QualityInspection, Guid> _repository;
+    private readonly IDocumentNumberGenerator _numberGenerator;
+
+    public QualityInspectionAppService(
+        IRepository<QualityInspection, Guid> repository,
+        IDocumentNumberGenerator numberGenerator)
+    {
+        _repository = repository;
+        _numberGenerator = numberGenerator;
+    }
+
+    public async Task<PagedResultDto<QualityInspectionDto>> GetListAsync(GetQualityInspectionListDto input)
+    {
+        var query = (await _repository.WithDetailsAsync()).AsQueryable();
+        if (input.CompanyId.HasValue)
+            query = query.Where(q => q.CompanyId == input.CompanyId.Value);
+        if (input.ItemId.HasValue)
+            query = query.Where(q => q.ItemId == input.ItemId.Value);
+        if (input.Status.HasValue)
+            query = query.Where(q => q.Status == input.Status.Value);
+        if (!string.IsNullOrWhiteSpace(input.Filter))
+        {
+            var f = input.Filter;
+            query = query.Where(q => (q.ItemName ?? "").Contains(f));
+        }
+
+        var totalCount = query.Count();
+        var items = query.OrderByDescending(q => q.InspectionDate)
+            .Skip(input.SkipCount).Take(input.MaxResultCount).ToList();
+
+        return new PagedResultDto<QualityInspectionDto>(totalCount, items.Select(x => ObjectMapper.Map<QualityInspection, QualityInspectionDto>(x)).ToList());
+    }
+
+    public async Task<QualityInspectionDto> GetAsync(Guid id)
+    {
+        var qi = (await _repository.WithDetailsAsync()).First(q => q.Id == id);
+        return ObjectMapper.Map<QualityInspection, QualityInspectionDto>(qi);
+    }
+
+    [Authorize(MyERPPermissions.QualityInspections.Create)]
+    public async Task<QualityInspectionDto> CreateAsync(CreateQualityInspectionDto input)
+    {
+        // Validate active item
+        var itemValidation = LazyServiceProvider.LazyGetRequiredService<MyERP.Inventory.DomainServices.ItemTransactionValidationService>();
+        await itemValidation.ValidateItemsForTransactionAsync(new[] { input.ItemId });
+
+        var companyRestriction = LazyServiceProvider.LazyGetRequiredService<Core.DomainServices.CompanyRestrictionValidationService>();
+        await companyRestriction.ValidateTransactionCompanyAsync(
+            "QualityInspection", input.CompanyId, itemIds: new[] { input.ItemId });
+
+        if (input.ReferenceId.HasValue && !string.IsNullOrWhiteSpace(input.ReferenceType))
+        {
+            await ValidateReferenceDocumentCompanyAndStatusAsync(input.CompanyId, input.ItemId, input.ReferenceType, input.ReferenceId.Value);
+        }
+
+        var number = await _numberGenerator.GenerateAsync("QI", input.CompanyId);
+        var qi = new QualityInspection(GuidGenerator.Create(), input.CompanyId, input.ItemId,
+            input.InspectionType, input.InspectionDate, CurrentTenant.Id)
+        {
+            InspectionNumber = number,
+            ItemName = input.ItemName,
+            ReferenceType = input.ReferenceType,
+            ReferenceId = input.ReferenceId,
+            BatchNo = input.BatchNo,
+            SampleSize = input.SampleSize > 0 ? input.SampleSize : 1m,
+            ManualInspection = input.ManualInspection,
+        };
+
+        if (input.ManualInspection && input.Status.HasValue)
+        {
+            qi.SetStatus(input.Status.Value);
+        }
+
+        if (input.Readings != null && input.Readings.Any())
+        {
+            foreach (var r in input.Readings)
+                qi.AddReading(r.Specification, r.ExpectedValue, r.MinValue, r.MaxValue,
+                    r.ReadingValue, r.IsNumeric, r.FormulaBased, r.Formula,
+                    r.ManualInspection, r.Status ?? InspectionStatus.Draft);
+        }
+        else
+        {
+            // Auto-load parameters from Item's Quality Inspection Template if readings not provided
+            var templateRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<QualityInspectionTemplate, Guid>>();
+            var template = (await templateRepo.WithDetailsAsync())
+                .FirstOrDefault(t => t.ItemId == input.ItemId && t.IsEnabled);
+            if (template != null)
+            {
+                foreach (var p in template.Parameters)
+                {
+                    qi.AddReading(p.Specification, p.ExpectedValue, p.MinValue, p.MaxValue,
+                        null, p.IsNumeric, p.FormulaBased, p.Formula);
+                }
+            }
+        }
+
+        await _repository.InsertAsync(qi);
+        return ObjectMapper.Map<QualityInspection, QualityInspectionDto>(qi);
+    }
+
+    [Authorize(MyERPPermissions.QualityInspections.Submit)]
+    public async Task<QualityInspectionDto> SubmitAsync(Guid id)
+    {
+        var qi = (await _repository.WithDetailsAsync()).First(q => q.Id == id);
+        qi.Submit();
+        await _repository.UpdateAsync(qi);
+
+        var activityRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<MyERP.Core.Entities.DocumentActivityLog, Guid>>();
+        await activityRepo.InsertAsync(new MyERP.Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "QualityInspection", qi.Id, "Submitted",
+            qi.CompanyId, qi.InspectionNumber, "Draft", "Submitted",
+            CurrentUser.Id, tenantId: qi.TenantId));
+
+        return ObjectMapper.Map<QualityInspection, QualityInspectionDto>(qi);
+    }
+
+    [Authorize(MyERPPermissions.QualityInspections.Submit)]
+    public async Task<QualityInspectionDto> CancelAsync(Guid id)
+    {
+        var qi = await _repository.GetAsync(id);
+        qi.Cancel();
+        await _repository.UpdateAsync(qi);
+
+        var activityRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<MyERP.Core.Entities.DocumentActivityLog, Guid>>();
+        await activityRepo.InsertAsync(new MyERP.Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "QualityInspection", qi.Id, "Cancelled",
+            qi.CompanyId, qi.InspectionNumber, "Submitted", "Cancelled",
+            CurrentUser.Id, tenantId: qi.TenantId));
+
+        return ObjectMapper.Map<QualityInspection, QualityInspectionDto>(qi);
+    }
+
+    private async Task ValidateReferenceDocumentCompanyAndStatusAsync(
+        Guid companyId, Guid itemId, string referenceType, Guid referenceId)
+    {
+        bool isSubmitted = false;
+        string docNumber = string.Empty;
+        Guid? docCompanyId = null;
+
+        switch (referenceType)
+        {
+            case "PurchaseReceipt":
+            {
+                var repo = LazyServiceProvider.LazyGetRequiredService<IRepository<Purchasing.Entities.PurchaseReceipt, Guid>>();
+                var doc = await repo.FindAsync(referenceId);
+                if (doc != null)
+                {
+                    docCompanyId = doc.CompanyId;
+                    if (doc.Status == Core.DocumentStatus.Submitted)
+                    {
+                        isSubmitted = true;
+                        docNumber = doc.ReceiptNumber;
+                    }
+                }
+                break;
+            }
+            case "PurchaseInvoice":
+            {
+                var repo = LazyServiceProvider.LazyGetRequiredService<IRepository<Purchasing.Entities.PurchaseInvoice, Guid>>();
+                var doc = await repo.FindAsync(referenceId);
+                if (doc != null)
+                {
+                    docCompanyId = doc.CompanyId;
+                    if (doc.Status == Core.DocumentStatus.Submitted)
+                    {
+                        isSubmitted = true;
+                        docNumber = doc.InvoiceNumber;
+                    }
+                }
+                break;
+            }
+            case "DeliveryNote":
+            {
+                var repo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.DeliveryNote, Guid>>();
+                var doc = await repo.FindAsync(referenceId);
+                if (doc != null)
+                {
+                    docCompanyId = doc.CompanyId;
+                    if (doc.Status == Core.DocumentStatus.Submitted)
+                    {
+                        isSubmitted = true;
+                        docNumber = doc.DeliveryNumber;
+                    }
+                }
+                break;
+            }
+            case "SalesInvoice":
+            {
+                var repo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.SalesInvoice, Guid>>();
+                var doc = await repo.FindAsync(referenceId);
+                if (doc != null)
+                {
+                    docCompanyId = doc.CompanyId;
+                    if (doc.Status == Core.DocumentStatus.Submitted)
+                    {
+                        isSubmitted = true;
+                        docNumber = doc.InvoiceNumber;
+                    }
+                }
+                break;
+            }
+            case "StockEntry":
+            {
+                var repo = LazyServiceProvider.LazyGetRequiredService<IRepository<Inventory.Entities.StockEntry, Guid>>();
+                var doc = await repo.FindAsync(referenceId);
+                if (doc != null)
+                {
+                    docCompanyId = doc.CompanyId;
+                    if (doc.Status == Core.DocumentStatus.Submitted)
+                    {
+                        isSubmitted = true;
+                        docNumber = doc.EntryNumber ?? string.Empty;
+                    }
+                }
+                break;
+            }
+            case "WorkOrder":
+            {
+                var repo = LazyServiceProvider.LazyGetRequiredService<IRepository<Manufacturing.Entities.WorkOrder, Guid>>();
+                var doc = await repo.FindAsync(referenceId);
+                if (doc != null)
+                {
+                    docCompanyId = doc.CompanyId;
+                    if (doc.Status == Manufacturing.WorkOrderStatus.Completed)
+                    {
+                        isSubmitted = true;
+                        docNumber = doc.WorkOrderNumber;
+                    }
+                }
+                break;
+            }
+            case "JobCard":
+            {
+                var repo = LazyServiceProvider.LazyGetRequiredService<IRepository<Manufacturing.Entities.JobCard, Guid>>();
+                var doc = await repo.FindAsync(referenceId);
+                if (doc != null)
+                {
+                    docCompanyId = doc.CompanyId;
+                }
+                break;
+            }
+        }
+
+        if (docCompanyId.HasValue && docCompanyId.Value != companyId)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                .WithData("referenceCompany", docCompanyId.Value)
+                .WithData("qualityInspectionCompany", companyId);
+        }
+
+        var allowAfterSubmission = await SettingProvider.IsTrueAsync(
+            MyERPSettings.Stock.AllowToMakeQualityInspectionAfterPurchaseOrDelivery);
+
+        if (!allowAfterSubmission)
+        {
+            var itemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Item, Guid>>();
+            var item = await itemRepo.FindAsync(itemId);
+            if (item != null)
+            {
+                if ((referenceType == "PurchaseReceipt" || referenceType == "PurchaseInvoice")
+                    && !item.InspectionRequiredBeforePurchase)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.QualityInspectionNotRequired)
+                        .WithData("item", item.ItemName)
+                        .WithData("action", "Purchase");
+                }
+
+                if ((referenceType == "DeliveryNote" || referenceType == "SalesInvoice")
+                    && !item.InspectionRequiredBeforeDelivery)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.QualityInspectionNotRequired)
+                        .WithData("item", item.ItemName)
+                        .WithData("action", "Delivery");
+                }
+            }
+
+            if (isSubmitted)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.QualityInspectionNotAllowedAfterSubmission)
+                    .WithData("documentType", referenceType)
+                    .WithData("documentNumber", docNumber);
+            }
+        }
+    }
+}
+

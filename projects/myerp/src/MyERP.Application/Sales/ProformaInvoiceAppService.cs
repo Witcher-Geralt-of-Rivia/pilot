@@ -1,0 +1,359 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authorization;
+using MyERP.Core;
+using MyERP.Core.DomainServices;
+using MyERP.Permissions;
+using MyERP.Sales;
+using MyERP.Sales.Entities;
+using MyERP.Settings;
+using Volo.Abp;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Settings;
+
+namespace MyERP.Sales;
+
+/// <summary>
+/// Proforma Invoice AppService — progressive/partial invoicing before delivery (v16 feature).
+/// Per ERPNext PR #57263. Gated by Selling Settings.EnableProformaInvoice.
+/// </summary>
+[Authorize(MyERPPermissions.SalesInvoices.Default)]
+public class ProformaInvoiceAppService : ApplicationService, IProformaInvoiceAppService
+{
+    private readonly IRepository<ProformaInvoice, Guid> _repository;
+    private readonly IRepository<SalesOrder, Guid> _salesOrderRepository;
+    private readonly IRepository<Customer, Guid> _customerRepository;
+    private readonly IDocumentNumberGenerator _numberGenerator;
+    private readonly ISettingProvider _settingProvider;
+
+    public ProformaInvoiceAppService(
+        IRepository<ProformaInvoice, Guid> repository,
+        IRepository<SalesOrder, Guid> salesOrderRepository,
+        IRepository<Customer, Guid> customerRepository,
+        IDocumentNumberGenerator numberGenerator,
+        ISettingProvider settingProvider)
+    {
+        _repository = repository;
+        _salesOrderRepository = salesOrderRepository;
+        _customerRepository = customerRepository;
+        _numberGenerator = numberGenerator;
+        _settingProvider = settingProvider;
+    }
+
+    public async Task<ProformaInvoiceDto> GetAsync(Guid id)
+    {
+        var entity = await _repository.GetAsync(id);
+        return await MapToDtoAsync(entity);
+    }
+
+    public async Task<PagedResultDto<ProformaInvoiceDto>> GetListAsync(PagedAndSortedResultRequestDto input)
+    {
+        var queryable = await _repository.GetQueryableAsync();
+        var totalCount = queryable.Count();
+        var items = queryable
+            .OrderByDescending(x => x.ProformaDate)
+            .Skip(input.SkipCount)
+            .Take(input.MaxResultCount)
+            .ToList();
+
+        var dtos = new List<ProformaInvoiceDto>();
+        foreach (var item in items)
+            dtos.Add(await MapToDtoAsync(item));
+
+        return new PagedResultDto<ProformaInvoiceDto>(totalCount, dtos);
+    }
+
+    /// <summary>
+    /// Get all proforma invoices for a Sales Order (for the SO detail's Proforma tab).
+    /// </summary>
+    public async Task<List<ProformaInvoiceDto>> GetForSalesOrderAsync(Guid salesOrderId)
+    {
+        await CheckSalesOrderReadPermissionAsync();
+        var queryable = await _repository.GetQueryableAsync();
+        var items = queryable
+            .Where(x => x.SalesOrderId == salesOrderId)
+            .OrderByDescending(x => x.ProformaDate)
+            .ToList();
+
+        var dtos = new List<ProformaInvoiceDto>();
+        foreach (var item in items)
+            dtos.Add(await MapToDtoAsync(item));
+
+        return dtos;
+    }
+
+    /// <summary>
+    /// Get proformed totals per SO item (for the creation dialog showing remaining qty/amount).
+    /// </summary>
+    public async Task<List<ProformedTotalsDto>> GetProformedTotalsAsync(Guid salesOrderId)
+    {
+        await CheckSalesOrderReadPermissionAsync();
+        var so = await _salesOrderRepository.GetAsync(salesOrderId);
+        var queryable = await _repository.GetQueryableAsync();
+        var issuedProformas = queryable
+            .Where(x => x.SalesOrderId == salesOrderId && x.Status == ProformaInvoiceStatus.Issued)
+            .ToList();
+
+        var proformedBySoItem = issuedProformas
+            .SelectMany(p => p.Items)
+            .GroupBy(i => i.SalesOrderItemId)
+            .ToDictionary(
+                g => g.Key,
+                g => (Qty: g.Sum(x => x.Quantity), Amount: g.Sum(x => x.Amount)));
+
+        return so.Items.Select(soItem =>
+        {
+            var proformed = proformedBySoItem.GetValueOrDefault(soItem.Id);
+            return new ProformedTotalsDto
+            {
+                SalesOrderItemId = soItem.Id,
+                ItemCode = soItem.Description ?? string.Empty,
+                ItemName = soItem.Description ?? string.Empty,
+                OrderedQty = soItem.Quantity,
+                OrderedAmount = soItem.Quantity * soItem.UnitPrice,
+                ProformedQty = proformed.Qty,
+                ProformedAmount = proformed.Amount,
+                RemainingQty = Math.Max(0, soItem.Quantity - proformed.Qty),
+                RemainingAmount = Math.Max(0, (soItem.Quantity * soItem.UnitPrice) - proformed.Amount)
+            };
+        }).ToList();
+    }
+
+    /// <summary>
+    /// Create and submit a Proforma Invoice against a submitted Sales Order.
+    /// Per ERPNext: the sole creation path (in_create = true, no direct form creation).
+    /// </summary>
+    [Authorize(MyERPPermissions.SalesInvoices.Create)]
+    public async Task<ProformaInvoiceDto> CreateAsync(CreateProformaInvoiceDto input)
+    {
+        await CheckSalesOrderReadPermissionAsync();
+        if (!await _settingProvider.IsTrueAsync(MyERPSettings.Selling.EnableProformaInvoice))
+            throw new BusinessException(MyERPDomainErrorCodes.ProformaInvoiceDisabled);
+
+        var so = await _salesOrderRepository.GetAsync(input.SalesOrderId);
+
+        // Must be submitted (any active fulfillment status)
+        if (so.Status == DocumentStatus.Draft || so.Status == DocumentStatus.Cancelled)
+            throw new BusinessException(MyERPDomainErrorCodes.DocumentMustBeSubmittedForConversion)
+                .WithData("documentType", "SalesOrder");
+
+        var proformaNumber = await _numberGenerator.GenerateAsync("PRO", so.CompanyId);
+        var proforma = new ProformaInvoice(
+            GuidGenerator.Create(),
+            so.CompanyId,
+            so.Id,
+            so.CustomerId,
+            DateTime.UtcNow.Date,
+            input.BasedOn,
+            so.CurrencyCode);
+
+        proforma.ProformaNumber = proformaNumber;
+        proforma.HideItemQty = input.BasedOn == ProformaInvoiceBasis.Amount && input.HideItemQty;
+
+        // Build SO item lookup
+        var soItems = so.Items.ToDictionary(i => i.Id);
+
+        for (var i = 0; i < input.Items.Count; i++)
+        {
+            var row = input.Items[i];
+            var rowIdx = i + 1;
+
+            if (!soItems.TryGetValue(row.SalesOrderItemId, out var soItem))
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Row #{rowIdx}: The line does not belong to Sales Order {so.OrderNumber}");
+            }
+
+            if (row.Quantity <= 0)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Row #{rowIdx}: Qty must be a positive number");
+            }
+
+            decimal rate;
+            decimal? lineAmount = null;
+            if (input.BasedOn == ProformaInvoiceBasis.Amount)
+            {
+                var amount = row.Amount ?? 0;
+                if (amount <= 0)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                        .WithData("detail", $"Row #{rowIdx}: Amount must be a positive number");
+                }
+                rate = Math.Round(amount / row.Quantity, 4);
+                lineAmount = amount;
+            }
+            else
+            {
+                rate = soItem.UnitPrice;
+            }
+
+            var description = !string.IsNullOrWhiteSpace(row.Description)
+                ? row.Description
+                : soItem.Description ?? string.Empty;
+
+            proforma.AddItem(
+                soItem.Id,
+                soItem.ItemId,
+                soItem.Description ?? string.Empty,
+                soItem.Description ?? string.Empty,
+                row.Quantity,
+                rate,
+                soItem.StockUom,
+                description,
+                lineAmount);
+        }
+
+        if (!proforma.Items.Any())
+            throw new BusinessException("MyERP:01007");
+
+        // Scale taxes and charges to proforma's share of sales order (ERPNext PR #62207 / commits 0b7a2079a9, f374d83521)
+        var lineTotal = proforma.Items.Sum(i => i.Amount);
+        decimal grandTotal = lineTotal;
+        if (so.NetTotal > 0)
+        {
+            var orderShare = lineTotal / so.NetTotal;
+            var proratedTax = Math.Round(so.TaxAmount * orderShare, 2);
+            var proratedShipping = Math.Round(so.ShippingCharge * orderShare, 2);
+            grandTotal = Math.Round(lineTotal + proratedTax + proratedShipping, 2);
+        }
+        proforma.SetGrandTotal(grandTotal);
+
+        // Auto-submit on creation (per ERPNext: proforma is insert+submit in one operation)
+        proforma.Submit();
+
+        await _repository.InsertAsync(proforma);
+        return await MapToDtoAsync(proforma);
+    }
+
+    [Authorize(MyERPPermissions.SalesInvoices.Cancel)]
+    public async Task CancelAsync(Guid id)
+    {
+        var proforma = await _repository.GetAsync(id);
+        proforma.Cancel();
+        await _repository.UpdateAsync(proforma);
+    }
+
+    [Authorize(MyERPPermissions.SalesInvoices.Default)]
+    public async Task<ProformaEmailContentDto> GetEmailContentAsync(Guid id)
+    {
+        var proforma = await _repository.GetAsync(id);
+        var customer = await _customerRepository.FindAsync(proforma.CustomerId);
+        var so = await _salesOrderRepository.FindAsync(proforma.SalesOrderId);
+
+        var templateSetting = await _settingProvider.GetOrNullAsync(MyERPSettings.Selling.ProformaEmailTemplate);
+        Core.Entities.EmailTemplate? template = null;
+        if (!string.IsNullOrWhiteSpace(templateSetting))
+        {
+            var templateRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.EmailTemplate, Guid>>();
+            if (Guid.TryParse(templateSetting, out var templateId))
+            {
+                template = await templateRepo.FindAsync(templateId);
+            }
+            if (template == null)
+            {
+                var queryable = await templateRepo.GetQueryableAsync();
+                template = queryable.FirstOrDefault(t => t.Name == templateSetting);
+            }
+        }
+
+        var customerName = customer?.Name ?? string.Empty;
+        var soNumber = so?.OrderNumber ?? string.Empty;
+        var vars = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["doc.name"] = proforma.ProformaNumber,
+            ["name"] = proforma.ProformaNumber,
+            ["proforma_number"] = proforma.ProformaNumber,
+            ["doc.sales_order"] = soNumber,
+            ["sales_order"] = soNumber,
+            ["sales_order_number"] = soNumber,
+            ["doc.customer"] = customerName,
+            ["doc.customer_name"] = customerName,
+            ["customer_name"] = customerName,
+            ["customer"] = customerName,
+            ["doc.grand_total"] = proforma.GrandTotal.ToString("F2"),
+            ["grand_total"] = proforma.GrandTotal.ToString("F2"),
+        };
+
+        var (subject, message) = Core.Entities.EmailTemplate.GetSubjectAndMessage(
+            template,
+            vars,
+            $"Proforma Invoice {proforma.ProformaNumber}",
+            $"Please find attached the proforma invoice {proforma.ProformaNumber}.");
+
+        return new ProformaEmailContentDto
+        {
+            Subject = subject,
+            Message = message,
+        };
+    }
+
+    [Authorize(MyERPPermissions.SalesInvoices.Edit)]
+    public async Task SendEmailAsync(Guid id, SendProformaEmailDto input)
+    {
+        var proforma = await _repository.GetAsync(id);
+        var content = await GetEmailContentAsync(id);
+        var subject = !string.IsNullOrWhiteSpace(input.Subject) ? input.Subject : content.Subject;
+        var message = !string.IsNullOrWhiteSpace(input.Message) ? input.Message : content.Message;
+
+        proforma.MarkEmailed(input.Recipients);
+        await _repository.UpdateAsync(proforma);
+        // Note: actual email sending would be done via ABP email module with subject & message
+        // This records the intent + timestamps
+    }
+
+    private async Task<ProformaInvoiceDto> MapToDtoAsync(ProformaInvoice entity)
+    {
+        string? customerName = null;
+        string? soNumber = null;
+
+        var customer = await _customerRepository.FindAsync(entity.CustomerId);
+        if (customer != null) customerName = customer.Name;
+
+        var so = await _salesOrderRepository.FindAsync(entity.SalesOrderId);
+        if (so != null) soNumber = so.OrderNumber;
+
+        return new ProformaInvoiceDto
+        {
+            Id = entity.Id,
+            ProformaNumber = entity.ProformaNumber,
+            ProformaDate = entity.ProformaDate,
+            SalesOrderId = entity.SalesOrderId,
+            SalesOrderNumber = soNumber,
+            CustomerId = entity.CustomerId,
+            CustomerName = customerName,
+            BasedOn = entity.BasedOn,
+            HideItemQty = entity.HideItemQty,
+            CurrencyCode = entity.CurrencyCode,
+            GrandTotal = entity.GrandTotal,
+            TotalQty = entity.TotalQty,
+            Status = entity.Status,
+            ProformaPdfUrl = entity.ProformaPdfUrl,
+            SentOn = entity.SentOn,
+            EmailedTo = entity.EmailedTo,
+            Items = entity.Items.Select(i => new ProformaInvoiceItemDto
+            {
+                Id = i.Id,
+                SalesOrderItemId = i.SalesOrderItemId,
+                ItemId = i.ItemId,
+                ItemCode = i.ItemCode,
+                ItemName = i.ItemName,
+                Description = i.Description,
+                Uom = i.Uom,
+                Quantity = i.Quantity,
+                Rate = i.Rate,
+                Amount = i.Amount
+            }).ToList()
+        };
+    }
+
+    private async Task CheckSalesOrderReadPermissionAsync()
+    {
+        // Per ERPNext PR #62405 (commit e5455f7fef): check Sales Order read permission
+        await AuthorizationService.CheckAsync(MyERPPermissions.SalesOrders.Default);
+    }
+}

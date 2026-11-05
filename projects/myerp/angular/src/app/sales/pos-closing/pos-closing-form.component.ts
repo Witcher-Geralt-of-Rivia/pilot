@@ -1,0 +1,320 @@
+import { Component, OnInit, inject, signal } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { ReactiveFormsModule, FormBuilder, FormArray, Validators } from '@angular/forms';
+import { Router } from '@angular/router';
+import { ConfigStateService, LocalizationPipe, LocalizationService } from '@abp/ng.core';
+import { ToasterService } from '@abp/ng.theme.shared';
+import { PosClosingService } from '../../proxy/sales/pos-closing.service';
+import { CompanyContextService } from '../../shared/services/company-context.service';
+import { SaveShortcutDirective } from '../../shared/directives/save-shortcut.directive';
+import { AutoValidationDirective } from '../../shared/directives/auto-validation.directive';
+import { BreadcrumbComponent } from '../../shared/components/breadcrumb/breadcrumb.component';
+import { PosOpeningService } from '../../proxy/sales/pos-opening.service';
+import { ModeOfPaymentService } from '../../proxy/accounting/mode-of-payment.service';
+import type { PosClosingInvoiceDto, PosOpeningDto } from '../../proxy/sales/models';
+import type { ModeOfPaymentDto } from '../../proxy/accounting/models';
+
+@Component({
+  selector: 'app-pos-closing-form',
+  standalone: true,
+  imports: [CommonModule, ReactiveFormsModule, LocalizationPipe, SaveShortcutDirective, AutoValidationDirective, BreadcrumbComponent],
+  template: `
+    <app-breadcrumb />
+    <div class="container-fluid py-3">
+      <h4 class="mb-3">
+        <i class="fa fa-register me-2 text-primary"></i>
+        {{ '::NewPosClosingEntry' | abpLocalization }}
+      </h4>
+
+      <form [formGroup]="form" (appSaveShortcut)="save()">
+        <div class="card shadow-sm mb-3">
+          <div class="card-header"><h6 class="mb-0">{{ '::ClosingDetails' | abpLocalization }}</h6></div>
+          <div class="card-body">
+            <div class="row g-3">
+              <div class="col-md-6">
+                <label class="form-label">{{ '::PosOpeningEntry' | abpLocalization }} *</label>
+                <select class="form-select" formControlName="posOpeningEntryId" (change)="onOpeningEntryChange()">
+                  <option value="">{{ '::SelectOpenEntry' | abpLocalization }}</option>
+                  @for (e of openEntries(); track e.id) {
+                    <option [value]="e.id">{{ e.openingDate | date:'dd/MM/yyyy HH:mm' }} — {{ e.totalOpeningAmount | number:'1.2-2' }}</option>
+                  }
+                </select>
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">{{ '::PostingDate' | abpLocalization }}</label>
+                <input type="datetime-local" class="form-control" formControlName="postingDate" readonly>
+                <small class="text-muted">{{ '::PosClosingAlwaysNow' | abpLocalization }}</small>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Shift Invoices -->
+        <div class="card shadow-sm mb-3">
+          <div class="card-header"><h6 class="mb-0">{{ '::PosInvoices' | abpLocalization }} ({{ shiftInvoices().length }})</h6></div>
+          <div class="card-body p-0">
+            @if (shiftInvoices().length === 0) {
+              <p class="text-muted p-3 mb-0">{{ '::NoUnconsolidatedInvoices' | abpLocalization }}</p>
+            } @else {
+              <table class="table mb-0">
+                <thead>
+                  <tr>
+                    <th>{{ '::InvoiceNumber' | abpLocalization }}</th>
+                    <th class="text-end">{{ '::GrandTotal' | abpLocalization }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  @for (inv of shiftInvoices(); track inv.posInvoiceId) {
+                    <tr>
+                      <td>{{ inv.invoiceNumber }}</td>
+                      <td class="text-end">{{ inv.grandTotal | number:'1.2-2' }}</td>
+                    </tr>
+                  }
+                </tbody>
+              </table>
+            }
+          </div>
+        </div>
+
+        <!-- Payment Reconciliation -->
+        <div class="card shadow-sm mb-3">
+          <div class="card-header d-flex justify-content-between align-items-center">
+            <h6 class="mb-0">{{ '::PaymentReconciliation' | abpLocalization }}</h6>
+            <button type="button" class="btn btn-outline-primary btn-sm" (click)="addPayment()">
+              <i class="fa fa-plus me-1"></i>{{ '::AddPayment' | abpLocalization }}
+            </button>
+          </div>
+          <div class="card-body p-0">
+            <table class="table mb-0">
+              <thead>
+                <tr>
+                  <th>{{ '::PaymentMode' | abpLocalization }}</th>
+                  <th>{{ '::ExpectedAmount' | abpLocalization }}</th>
+                  <th>{{ '::ClosingAmount' | abpLocalization }}</th>
+                  <th>{{ '::Difference' | abpLocalization }}</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody formArrayName="payments">
+                @for (payment of paymentsArray.controls; track $index; let i = $index) {
+                  <tr [formGroupName]="i">
+                    <td>
+                      <select class="form-select form-select-sm" formControlName="modeOfPaymentId">
+                        <option value="">—</option>
+                        @for (m of modesOfPayment(); track m.id) {
+                          <option [value]="m.id">{{ m.name }}</option>
+                        }
+                      </select>
+                    </td>
+                    <td><input type="number" class="form-control form-control-sm" formControlName="expectedAmount" (change)="updateDifference(i)"></td>
+                    <td><input type="number" class="form-control form-control-sm" formControlName="closingAmount" (change)="updateDifference(i)"></td>
+                    <td class="align-middle">
+                      <span [class.text-success]="payment.get('difference')!.value >= 0"
+                            [class.text-danger]="payment.get('difference')!.value < 0">
+                        {{ payment.get('difference')!.value | number:'1.2-2' }}
+                      </span>
+                    </td>
+                    <td>
+                      <button type="button" class="btn btn-outline-danger btn-sm" (click)="removePayment(i)">
+                        <i class="fa fa-trash"></i>
+                      </button>
+                    </td>
+                  </tr>
+                }
+              </tbody>
+              <tfoot>
+                <tr class="table-light fw-bold">
+                  <td>{{ '::Total' | abpLocalization }}</td>
+                  <td>{{ totalExpected() | number:'1.2-2' }}</td>
+                  <td>{{ totalClosing() | number:'1.2-2' }}</td>
+                  <td [class.text-success]="totalDifference() >= 0" [class.text-danger]="totalDifference() < 0">
+                    {{ totalDifference() | number:'1.2-2' }}
+                  </td>
+                  <td></td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </div>
+
+        <div class="d-flex justify-content-end gap-2">
+          <button type="button" class="btn btn-outline-secondary" (click)="goBack()">{{ '::Cancel' | abpLocalization }}</button>
+          <button type="button" class="btn btn-primary" (click)="save()" [disabled]="saving() || !form.value.posOpeningEntryId">
+            <i class="fa fa-save me-1"></i>{{ '::Save' | abpLocalization }}
+          </button>
+        </div>
+      </form>
+    </div>
+  `,
+})
+export class PosClosingFormComponent implements OnInit {
+  private fb = inject(FormBuilder);
+  private router = inject(Router);
+  private service = inject(PosClosingService);
+  private toaster = inject(ToasterService);
+  private companyContext = inject(CompanyContextService);
+  private posOpeningService = inject(PosOpeningService);
+  private modeOfPaymentService = inject(ModeOfPaymentService);
+  private configState = inject(ConfigStateService);
+  private localization = inject(LocalizationService);
+
+  saving = signal(false);
+  openEntries = signal<PosOpeningDto[]>([]);
+  modesOfPayment = signal<ModeOfPaymentDto[]>([]);
+  shiftInvoices = signal<PosClosingInvoiceDto[]>([]);
+
+  form = this.fb.group({
+    companyId: ['', Validators.required],
+    posOpeningEntryId: ['', Validators.required],
+    postingDate: [new Date().toISOString().slice(0, 16)],
+    payments: this.fb.array([]),
+  });
+
+  get paymentsArray() { return this.form.get('payments') as FormArray; }
+
+  totalExpected = signal(0);
+  totalClosing = signal(0);
+  totalDifference = signal(0);
+
+  ngOnInit() {
+    const cid = this.companyContext.currentCompanyId();
+    if (cid) this.form.patchValue({ companyId: cid });
+
+    // Load open POS entries
+    this.posOpeningService.getList({ skipCount: 0, maxResultCount: 50, sorting: '' }).subscribe({
+      next: (res) => {
+        this.openEntries.set(((res.items || []) as PosOpeningDto[]).filter(e => e.status === 'Open'));
+      },
+      error: () => {},
+    });
+
+    this.modeOfPaymentService.getList({ skipCount: 0, maxResultCount: 200, sorting: '' }).subscribe({
+      next: (res) => this.modesOfPayment.set(res.items ?? []),
+      error: () => {},
+    });
+
+    this.addPayment(); // Start with one payment row
+  }
+
+  onOpeningEntryChange() {
+    const openingId = this.form.value.posOpeningEntryId;
+    this.shiftInvoices.set([]);
+    if (!openingId) return;
+
+    const opening = this.openEntries().find(e => e.id === openingId);
+    if (opening?.companyId) this.form.patchValue({ companyId: opening.companyId });
+
+    this.service.getUnconsolidatedInvoices(openingId).subscribe({
+      next: (invoices) => this.shiftInvoices.set(invoices ?? []),
+      error: () => {},
+    });
+
+    this.service.calculateExpectedAmounts(openingId).subscribe({
+      next: (expected) => {
+        this.paymentsArray.clear();
+        for (const e of expected) {
+          this.paymentsArray.push(this.fb.group({
+            modeOfPaymentId: [e.modeOfPaymentId, Validators.required],
+            expectedAmount: [e.expectedAmount],
+            closingAmount: [e.expectedAmount],
+            difference: [0],
+          }));
+        }
+        if (this.paymentsArray.length === 0) this.addPayment();
+        this.recalculateTotals();
+      },
+      error: () => {},
+    });
+  }
+
+  addPayment() {
+    this.paymentsArray.push(this.fb.group({
+      modeOfPaymentId: ['', Validators.required],
+      expectedAmount: [0],
+      closingAmount: [0],
+      difference: [0],
+    }));
+  }
+
+  removePayment(index: number) {
+    this.paymentsArray.removeAt(index);
+    this.recalculateTotals();
+  }
+
+  updateDifference(index: number) {
+    const group = this.paymentsArray.at(index);
+    const expected = group.get('expectedAmount')!.value || 0;
+    let closing = group.get('closingAmount')!.value;
+    // Per ERPNext PR #59426 (commit ec775eb782): default closing amount for payment modes not in POS opening entry
+    if ((closing === null || closing === undefined || closing === 0) && expected > 0) {
+      group.get('closingAmount')!.setValue(expected);
+      closing = expected;
+    }
+    closing = closing || 0;
+    group.get('difference')!.setValue(closing - expected);
+    this.recalculateTotals();
+  }
+
+  recalculateTotals() {
+    let exp = 0, cls = 0;
+    for (let i = 0; i < this.paymentsArray.length; i++) {
+      const g = this.paymentsArray.at(i);
+      exp += g.get('expectedAmount')!.value || 0;
+      cls += g.get('closingAmount')!.value || 0;
+    }
+    this.totalExpected.set(exp);
+    this.totalClosing.set(cls);
+    this.totalDifference.set(cls - exp);
+  }
+
+  save() {
+    if (this.form.invalid || this.saving()) return;
+
+    const raw = this.form.getRawValue();
+    const opening = this.openEntries().find(e => e.id === raw.posOpeningEntryId);
+    if (!opening?.posProfileId) {
+      this.toaster.error(this.l('::PosOpeningEntryMissingProfile'));
+      return;
+    }
+
+    const currentUserId = this.configState.getOne('currentUser')?.id;
+    if (!currentUserId) {
+      this.toaster.error(this.l('::AuthenticationRequired'));
+      return;
+    }
+
+    this.saving.set(true);
+
+    const modeNameById = new Map(this.modesOfPayment().map(m => [m.id, m.name]));
+
+    const dto = {
+      companyId: raw.companyId,
+      posProfileId: opening.posProfileId,
+      posOpeningEntryId: raw.posOpeningEntryId,
+      userId: currentUserId,
+      payments: (raw.payments || []).filter((p: any) => p.modeOfPaymentId).map((p: any) => ({
+        modeOfPaymentId: p.modeOfPaymentId,
+        modeName: modeNameById.get(p.modeOfPaymentId) ?? '',
+        expectedAmount: p.expectedAmount || 0,
+        closingAmount: p.closingAmount || 0,
+      })),
+      invoices: this.shiftInvoices(),
+    };
+
+    this.service.create(dto as any).subscribe({
+      next: (created) => {
+        this.toaster.success(this.l('::SuccessfullyCreated'));
+        this.router.navigate(['/sales/pos-closing', created.id]);
+      },
+      error: () => this.saving.set(false),
+    });
+  }
+
+  goBack() {
+    this.router.navigate(['/sales/pos-closing']);
+  }
+
+  hasUnsavedChanges() { return this.form.dirty; }
+
+  private l(key: string): string { return this.localization.instant(key); }
+}

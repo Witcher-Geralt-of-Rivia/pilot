@@ -1,0 +1,309 @@
+<abp-page [title]="isEditMode ? ('::EditCustomer' | abpLocalization) : ('::NewCustomer' | abpLocalization)">
+  <form [formGroup]="form" (ngSubmit)="save()" (appSaveShortcut)="save()">
+    <div class="card mb-4">
+      <div class="card-header">
+        <h5 class="card-title mb-0"><i class="fa fa-user me-2"></i>{{ '::CustomerInformation' | abpLocalization }}</h5>
+      </div>
+      <div class="card-body">
+        <div class="row">
+          <div class="col-12 mb-3">
+            <label class="form-label" for="name">
+              {{ '::CustomerName' | abpLocalization }} <span class="text-danger">*</span>
+            </label>
+            <input id="name" type="text" class="form-control" formControlName="name"
+              [class.is-invalid]="form.get('name')?.invalid && form.get('name')?.touched" />
+            @if (form.get('name')?.errors?.['required'] && form.get('name')?.touched) {
+              <div class="invalid-feedback">{{ 'AbpValidation::ThisFieldIsRequired.' | abpLocalization }}</div>
+            }
+          </div>
+
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label" for="customerCode">{{ '::CustomerCode' | abpLocalization }}</label>
+            <input id="customerCode" type="text" class="form-control" formControlName="customerCode" />
+          </div>
+
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label" for="companyId">
+              {{ '::Company' | abpLocalization }} <span class="text-danger">*</span>
+            </label>
+            <select id="companyId" class="form-select" formControlName="companyId"
+              [class.is-invalid]="form.get('companyId')?.invalid && form.get('companyId')?.touched">
+              <option value="">{{ '::SelectCompany' | abpLocalization }}</option>
+              @for (c of companies(); track c.id) {
+                <option [value]="c.id">{{ c.name }}</option>
+              }
+            </select>
+            @if (form.get('companyId')?.errors?.['required'] && form.get('companyId')?.touched) {
+              <div class="invalid-feedback">{{ 'AbpValidation::ThisFieldIsRequired.' | abpLocalization }}</div>
+            }
+          </div>
+
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label" for="tin">{{ '::TIN' | abpLocalization }}</label>
+            <input id="tin" type="text" class="form-control" formControlName="tin" [placeholder]="'::Placeholder:TinExample' | abpLocalization" />
+          </div>
+
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label" for="registrationNumber">{{ '::RegistrationNumber' | abpLocalization }}</label>
+            <input id="registrationNumber" type="text" class="form-control" formControlName="registrationNumber" />
+          </div>
+
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label" for="sstRegistrationNumber">{{ '::SSTRegistration' | abpLocalization }}</label>
+            <input id="sstRegistrationNumber" type="text" class="form-control" formControlName="sstRegistrationNumber" />
+          </div>
+
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label" for="idType">{{ '::IDType' | abpLocalization }}</label>
+            <input id="idType" type="text" class="form-control" formControlName="idType" />
+          </div>
+
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label" for="idValue">{{ '::IDValue' | abpLocalization }}</label>
+            <div class="input-group">
+              <input id="idValue" type="text" class="form-control" formControlName="idValue" />
+              <button type="button" class="btn btn-outline-info" (click)="verifyTaxpayer()" [disabled]="searchingTaxpayer() || !form.get('idValue')?.value">
+                @if (searchingTaxpayer()) {
+                  <span class="spinner-border spinner-border-sm me-1"></span>
+                } @else {
+                  <i class="fa fa-search me-1"></i>
+                }
+                {{ '::VerifyTaxpayer' | abpLocalization }}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mb-4">
+      <div class="card-header">
+        <h5 class="card-title mb-0"><i class="fa fa-sitemap me-2"></i>{{ '::Classification' | abpLocalization }}</h5>
+      </div>
+      <div class="card-body">
+        <div class="row">
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label" for="customerGroupId">{{ '::CustomerGroup' | abpLocalization }}</label>
+            <select id="customerGroupId" class="form-select" formControlName="customerGroupId">
+              <option [ngValue]="null">— {{ '::SelectCustomerGroup' | abpLocalization }} —</option>
+              @for (g of customerGroups(); track g.id) {
+                <option [value]="g.id">{{ g.name }}</option>
+              }
+            </select>
+          </div>
+
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label" for="territoryId">{{ '::Territory' | abpLocalization }}</label>
+            <select id="territoryId" class="form-select" formControlName="territoryId">
+              <option [ngValue]="null">— {{ '::SelectTerritory' | abpLocalization }} —</option>
+              @for (t of territories(); track t.id) {
+                <option [value]="t.id">{{ t.name }}</option>
+              }
+            </select>
+          </div>
+
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label" for="representsCompanyId">{{ '::RepresentsCompany' | abpLocalization }}</label>
+            <select id="representsCompanyId" class="form-select" formControlName="representsCompanyId">
+              <option [ngValue]="null">— {{ '::None' | abpLocalization }} —</option>
+              @for (c of companies(); track c.id) {
+                <option [value]="c.id">{{ c.name }}</option>
+              }
+            </select>
+            <small class="text-muted">{{ '::InternalCustomerForInterCompanyInvoicing' | abpLocalization }}</small>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mb-4">
+      <div class="card-header">
+        <h5 class="card-title mb-0"><i class="fa fa-credit-card me-2"></i>{{ '::AccountingAndCreditLimit' | abpLocalization }}</h5>
+      </div>
+      <div class="card-body">
+        <div class="row">
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label" for="creditLimit">{{ '::CreditLimit' | abpLocalization }}</label>
+            <input id="creditLimit" type="number" min="0" step="0.01" class="form-control font-monospace" formControlName="creditLimit" />
+            <small class="text-muted">{{ '::ZeroMeansNoLimit' | abpLocalization }}</small>
+          </div>
+
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label" for="defaultPaymentTermsTemplateId">{{ '::DefaultPaymentTermsTemplate' | abpLocalization }}</label>
+            <select id="defaultPaymentTermsTemplateId" class="form-select" formControlName="defaultPaymentTermsTemplateId">
+              <option [ngValue]="null">— {{ '::SelectPaymentTerms' | abpLocalization }} —</option>
+              @for (pt of paymentTerms(); track pt.id) {
+                <option [value]="pt.id">{{ pt.name }}</option>
+              }
+            </select>
+          </div>
+
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label" for="defaultPriceListId">{{ 'PriceList' | abpLocalization }}</label>
+            <select id="defaultPriceListId" class="form-select" formControlName="defaultPriceListId">
+              <option [ngValue]="null">— {{ '::Default' | abpLocalization }} —</option>
+              @for (pl of priceLists(); track pl.id) {
+                <option [value]="pl.id">{{ pl.name }}</option>
+              }
+            </select>
+          </div>
+
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label" for="defaultReceivableAccountId">{{ '::DefaultReceivableAccount' | abpLocalization }}</label>
+            <select id="defaultReceivableAccountId" class="form-select" formControlName="defaultReceivableAccountId">
+              <option [ngValue]="null">— {{ '::DefaultCompanyAccount' | abpLocalization }} —</option>
+              @for (acc of accounts(); track acc.id) {
+                <option [value]="acc.id">{{ acc.accountCode ? (acc.accountCode + ' - ') : '' }}{{ acc.accountName }}</option>
+              }
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mb-4">
+      <div class="card-header">
+        <h5 class="card-title mb-0"><i class="fa fa-address-book me-2"></i>{{ '::ContactAndAddress' | abpLocalization }}</h5>
+      </div>
+      <div class="card-body">
+        <div class="row">
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label" for="contactPerson">{{ '::ContactPerson' | abpLocalization }}</label>
+            <input id="contactPerson" type="text" class="form-control" formControlName="contactPerson" />
+          </div>
+
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label" for="phone">{{ '::Phone' | abpLocalization }}</label>
+            <input id="phone" type="text" class="form-control" formControlName="phone" />
+          </div>
+
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label" for="email">{{ '::Email' | abpLocalization }}</label>
+            <input id="email" type="email" class="form-control" formControlName="email" />
+          </div>
+
+          <div class="col-12 mb-3">
+            <label class="form-label" for="address">{{ '::Address' | abpLocalization }}</label>
+            <textarea id="address" class="form-control" formControlName="address" rows="2"></textarea>
+          </div>
+
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label" for="city">{{ '::City' | abpLocalization }}</label>
+            <input id="city" type="text" class="form-control" formControlName="city" />
+          </div>
+
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label" for="state">{{ '::State' | abpLocalization }}</label>
+            <input id="state" type="text" class="form-control" formControlName="state" />
+          </div>
+
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label" for="postalCode">{{ '::PostalCode' | abpLocalization }}</label>
+            <input id="postalCode" type="text" class="form-control" formControlName="postalCode" />
+          </div>
+
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label" for="country">{{ '::Country' | abpLocalization }}</label>
+            <input id="country" type="text" class="form-control" formControlName="country" />
+          </div>
+
+          <div class="col-12 col-md-3 mb-3 d-flex align-items-end">
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" id="isActive" formControlName="isActive" />
+              <label class="form-check-label" for="isActive">{{ '::Active' | abpLocalization }}</label>
+            </div>
+          </div>
+
+          <div class="col-12 col-md-3 mb-3 d-flex align-items-end">
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" id="soRequired" formControlName="soRequired" />
+              <label class="form-check-label" for="soRequired">Allow Sales Invoice without Sales Order</label>
+            </div>
+          </div>
+
+          <div class="col-12 col-md-3 mb-3 d-flex align-items-end">
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" id="dnRequired" formControlName="dnRequired" />
+              <label class="form-check-label" for="dnRequired">Allow Sales Invoice without Delivery Note</label>
+            </div>
+          </div>
+
+          <div class="col-12 col-md-3 mb-3 d-flex align-items-end">
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" id="isFrozen" formControlName="isFrozen" />
+              <label class="form-check-label" for="isFrozen">Frozen</label>
+            </div>
+          </div>
+
+          <div class="col-12 col-md-3 mb-3 d-flex align-items-end">
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" id="onHold" formControlName="onHold" />
+              <label class="form-check-label" for="onHold">{{ '::OnHold' | abpLocalization }}</label>
+            </div>
+          </div>
+
+          @if (form.get('onHold')?.value) {
+            <div class="col-12 col-md-3 mb-3">
+              <label class="form-label" for="releaseDate">{{ '::ReleaseDate' | abpLocalization }}</label>
+              <input id="releaseDate" type="date" class="form-control" formControlName="releaseDate" />
+              <div class="form-text small">{{ '::ReleaseDateMustBeFutureHint' | abpLocalization }}</div>
+            </div>
+          }
+
+          <div class="col-12 col-md-3 mb-3 d-flex align-items-end">
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" id="restrictToCompanies" formControlName="restrictToCompanies" />
+              <label class="form-check-label" for="restrictToCompanies">{{ '::RestrictToCompanies' | abpLocalization }}</label>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Form actions -->
+    <div class="d-flex justify-content-end gap-2">
+      <button type="button" class="btn btn-outline-secondary" routerLink="/customers">
+        <i class="fa fa-times me-1"></i>{{ '::Cancel' | abpLocalization }}
+      </button>
+      <button type="submit" class="btn btn-primary" [disabled]="form.invalid">
+        <i class="fa fa-save me-1"></i>{{ '::Save' | abpLocalization }}
+      </button>
+    </div>
+  </form>
+
+  <!-- Outstanding Invoices (edit mode only) -->
+  @if (isEditMode && outstandingInvoices().length > 0) {
+    <div class="card mt-4">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h6 class="card-title mb-0"><i class="fa fa-file-invoice text-warning me-2"></i>{{ '::OutstandingInvoices' | abpLocalization }}</h6>
+        <span class="badge bg-danger fs-6">{{ '::Total' | abpLocalization }}: {{ totalOutstanding() | number:'1.2-2' }}</span>
+      </div>
+      <div class="card-body p-0">
+        <table class="table table-sm mb-0">
+          <thead>
+            <tr>
+              <th class="ps-3">{{ '::InvoiceNumber' | abpLocalization }}</th>
+              <th>{{ '::Date' | abpLocalization }}</th>
+              <th class="text-end">{{ '::GrandTotal' | abpLocalization }}</th>
+              <th class="text-end pe-3">{{ '::Outstanding' | abpLocalization }}</th>
+            </tr>
+          </thead>
+          <tbody>
+            @for (inv of outstandingInvoices(); track inv.documentId) {
+              <tr>
+                <td class="ps-3">{{ inv.documentNumber }}</td>
+                <td>{{ inv.postingDate | date:'dd/MM/yyyy' }}</td>
+                <td class="text-end font-monospace">{{ inv.grandTotal | number:'1.2-2' }}</td>
+                <td class="text-end pe-3 font-monospace text-danger fw-bold">{{ inv.outstandingAmount | number:'1.2-2' }}</td>
+              </tr>
+            }
+          </tbody>
+        </table>
+      </div>
+    </div>
+  }
+
+  @if (isEditMode && entityId) {
+    <app-company-restriction parentType="Customer" [parentId]="entityId" />
+  }
+</abp-page>

@@ -1,0 +1,736 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Sales;
+using MyERP.Sales.Entities;
+using MyERP.Core.Entities;
+using MyERP.Inventory;
+using MyERP.Inventory.Entities;
+using Shouldly;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Modularity;
+using Xunit;
+
+namespace MyERP.Sales;
+
+public abstract class DocumentConversionAppService_Tests<TStartupModule> : MyERPApplicationTestBase<TStartupModule>
+    where TStartupModule : IAbpModule
+{
+    private readonly IDocumentConversionAppService _conversionService;
+    private readonly IQuotationAppService _quotationService;
+    private readonly ISalesOrderAppService _salesOrderService;
+    private readonly IRepository<Company, Guid> _companyRepository;
+    private readonly IRepository<Customer, Guid> _customerRepository;
+    private readonly IRepository<DocumentSeries, Guid> _seriesRepository;
+    private readonly IRepository<Warehouse, Guid> _warehouseRepository;
+    private readonly IRepository<SalesOrder, Guid> _salesOrderRepository;
+
+    protected DocumentConversionAppService_Tests()
+    {
+        _conversionService = GetRequiredService<IDocumentConversionAppService>();
+        _quotationService = GetRequiredService<IQuotationAppService>();
+        _salesOrderService = GetRequiredService<ISalesOrderAppService>();
+        _companyRepository = GetRequiredService<IRepository<Company, Guid>>();
+        _customerRepository = GetRequiredService<IRepository<Customer, Guid>>();
+        _seriesRepository = GetRequiredService<IRepository<DocumentSeries, Guid>>();
+        _warehouseRepository = GetRequiredService<IRepository<Warehouse, Guid>>();
+        _salesOrderRepository = GetRequiredService<IRepository<SalesOrder, Guid>>();
+    }
+
+    private async Task<(Guid companyId, Guid customerId, Guid warehouseId)> SeedDataAsync()
+    {
+        var company = await _companyRepository.InsertAsync(
+            new Company(Guid.NewGuid(), "Conversion Test Co"), autoSave: true);
+
+        var customer = await _customerRepository.InsertAsync(
+            new Customer(Guid.NewGuid(), company.Id, "Test Buyer"), autoSave: true);
+
+        var warehouse = await _warehouseRepository.InsertAsync(
+            new Warehouse(Guid.NewGuid(), company.Id, "Main Warehouse"), autoSave: true);
+
+        await _seriesRepository.InsertAsync(
+            new DocumentSeries(Guid.NewGuid(), company.Id, "QS", "Quotation", "QT-"), autoSave: true);
+        await _seriesRepository.InsertAsync(
+            new DocumentSeries(Guid.NewGuid(), company.Id, "SOS", "SalesOrder", "SO-"), autoSave: true);
+        await _seriesRepository.InsertAsync(
+            new DocumentSeries(Guid.NewGuid(), company.Id, "DNS", "DeliveryNote", "DN-"), autoSave: true);
+        await _seriesRepository.InsertAsync(
+            new DocumentSeries(Guid.NewGuid(), company.Id, "SIS", "SalesInvoice", "SI-"), autoSave: true);
+        await _seriesRepository.InsertAsync(
+            new DocumentSeries(Guid.NewGuid(), company.Id, "POS", "PurchaseOrder", "PO-"), autoSave: true);
+
+        return (company.Id, customer.Id, warehouse.Id);
+    }
+
+    [Fact]
+    public async Task Should_Convert_Quotation_To_SalesOrder()
+    {
+        // Arrange
+        var (companyId, customerId, _) = await SeedDataAsync();
+
+        var quotation = await _quotationService.CreateAsync(new CreateQuotationDto
+        {
+            CompanyId = companyId,
+            CustomerId = customerId,
+            IssueDate = DateTime.Today,
+            Items = new()
+            {
+                new() { ItemId = Guid.NewGuid(), Description = "Widget", Quantity = 5, UnitPrice = 200m, TaxAmount = 60m }
+            }
+        });
+
+        // Must submit before conversion
+        await _quotationService.SubmitAsync(quotation.Id);
+
+        // Act
+        var salesOrder = await _conversionService.ConvertQuotationToSalesOrderAsync(quotation.Id);
+
+        // Assert
+        salesOrder.ShouldNotBeNull();
+        salesOrder.OrderNumber.ShouldStartWith("SO-");
+        salesOrder.CustomerId.ShouldBe(customerId);
+        salesOrder.QuotationId.ShouldBe(quotation.Id);
+        salesOrder.Items.Count.ShouldBe(1);
+        salesOrder.Items[0].Quantity.ShouldBe(5);
+        salesOrder.Items[0].UnitPrice.ShouldBe(200m);
+        salesOrder.NetTotal.ShouldBe(1000m);
+        salesOrder.Status.ShouldBe("Draft");
+    }
+
+    [Fact]
+    public async Task Should_Carry_PriceListId_From_Quotation_To_SalesOrder()
+    {
+        // Regression test: ConvertQuotationToSalesOrderAsync used to drop PriceListId,
+        // unlike every other Sales document clone/amend path (SalesOrderAmendmentAppService,
+        // SalesInvoiceAppService), leaving the new Sales Order on the customer's default
+        // price list instead of the one actually chosen on the quotation.
+        var (companyId, customerId, _) = await SeedDataAsync();
+
+        var priceListRepo = GetRequiredService<IRepository<PriceList, Guid>>();
+        var priceList = await priceListRepo.InsertAsync(
+            new PriceList(Guid.NewGuid(), "Wholesale", "MYR", isSelling: true, isBuying: false), autoSave: true);
+
+        var quotation = await _quotationService.CreateAsync(new CreateQuotationDto
+        {
+            CompanyId = companyId,
+            CustomerId = customerId,
+            IssueDate = DateTime.Today,
+            PriceListId = priceList.Id,
+            Items = new()
+            {
+                new() { ItemId = Guid.NewGuid(), Description = "Widget", Quantity = 5, UnitPrice = 200m, TaxAmount = 60m }
+            }
+        });
+        await _quotationService.SubmitAsync(quotation.Id);
+
+        var salesOrder = await _conversionService.ConvertQuotationToSalesOrderAsync(quotation.Id);
+
+        salesOrder.PriceListId.ShouldBe(priceList.Id);
+    }
+
+    [Fact]
+    public async Task Should_Fail_Converting_Draft_Quotation()
+    {
+        // Arrange
+        var (companyId, customerId, _) = await SeedDataAsync();
+
+        var quotation = await _quotationService.CreateAsync(new CreateQuotationDto
+        {
+            CompanyId = companyId,
+            CustomerId = customerId,
+            IssueDate = DateTime.Today,
+            Items = new()
+            {
+                new() { ItemId = Guid.NewGuid(), Description = "Item", Quantity = 1, UnitPrice = 100m }
+            }
+        });
+
+        // Act & Assert: converting a Draft should fail
+        await Assert.ThrowsAsync<Volo.Abp.BusinessException>(
+            () => _conversionService.ConvertQuotationToSalesOrderAsync(quotation.Id));
+    }
+
+    [Fact]
+    public async Task Should_Convert_SalesOrder_To_SalesInvoice()
+    {
+        // Arrange
+        var (companyId, customerId, _) = await SeedDataAsync();
+
+        var quotation = await _quotationService.CreateAsync(new CreateQuotationDto
+        {
+            CompanyId = companyId,
+            CustomerId = customerId,
+            IssueDate = DateTime.Today,
+            Items = new()
+            {
+                new() { ItemId = Guid.NewGuid(), Description = "Service A", Quantity = 2, UnitPrice = 500m, TaxAmount = 60m },
+                new() { ItemId = Guid.NewGuid(), Description = "Service B", Quantity = 1, UnitPrice = 300m, TaxAmount = 18m },
+            }
+        });
+        await _quotationService.SubmitAsync(quotation.Id);
+
+        var salesOrder = await _conversionService.ConvertQuotationToSalesOrderAsync(quotation.Id);
+        await _salesOrderService.SubmitAsync(salesOrder.Id);
+
+        // Act
+        var invoice = await _conversionService.ConvertSalesOrderToSalesInvoiceAsync(salesOrder.Id);
+
+        // Assert
+        invoice.ShouldNotBeNull();
+        invoice.InvoiceNumber.ShouldStartWith("SI-");
+        invoice.CustomerId.ShouldBe(customerId);
+        invoice.Items.Count.ShouldBe(2);
+        invoice.NetTotal.ShouldBe(1300m); // 2*500 + 1*300
+        invoice.TaxAmount.ShouldBe(78m);  // 60 + 18
+        invoice.GrandTotal.ShouldBe(1378m);
+        invoice.Status.ShouldBe("Draft");
+    }
+
+    [Fact]
+    public async Task Should_Prevent_Double_Conversion_Of_Quotation()
+    {
+        // Arrange
+        var (companyId, customerId, _) = await SeedDataAsync();
+
+        var quotation = await _quotationService.CreateAsync(new CreateQuotationDto
+        {
+            CompanyId = companyId,
+            CustomerId = customerId,
+            IssueDate = DateTime.Today,
+            Items = new()
+            {
+                new() { ItemId = Guid.NewGuid(), Description = "Item", Quantity = 1, UnitPrice = 100m }
+            }
+        });
+        await _quotationService.SubmitAsync(quotation.Id);
+
+        // First conversion succeeds
+        await _conversionService.ConvertQuotationToSalesOrderAsync(quotation.Id);
+
+        // Act & Assert: second conversion should fail
+        await Assert.ThrowsAsync<Volo.Abp.BusinessException>(
+            () => _conversionService.ConvertQuotationToSalesOrderAsync(quotation.Id));
+    }
+
+    [Fact]
+    public async Task Should_Convert_SalesOrder_To_DeliveryNote()
+    {
+        // Arrange
+        var (companyId, customerId, warehouseId) = await SeedDataAsync();
+
+        var salesOrder = await _salesOrderService.CreateAsync(new CreateSalesOrderDto
+        {
+            CompanyId = companyId,
+            CustomerId = customerId,
+            OrderDate = DateTime.Today,
+            Items = new()
+            {
+                new() { ItemId = Guid.NewGuid(), Description = "Product X", Quantity = 10, UnitPrice = 50m, TaxAmount = 30m, WarehouseId = warehouseId }
+            }
+        });
+        await _salesOrderService.SubmitAsync(salesOrder.Id);
+
+        // Act
+        var deliveryNote = await _conversionService.ConvertSalesOrderToDeliveryNoteAsync(salesOrder.Id);
+
+        // Assert
+        deliveryNote.ShouldNotBeNull();
+        deliveryNote.DeliveryNumber.ShouldStartWith("DN-");
+        deliveryNote.CustomerId.ShouldBe(customerId);
+        deliveryNote.SalesOrderId.ShouldBe(salesOrder.Id);
+        deliveryNote.Items.Count.ShouldBe(1);
+        deliveryNote.Items[0].Quantity.ShouldBe(10);
+        deliveryNote.Status.ShouldBe("Draft");
+    }
+
+    [Fact]
+    public async Task Should_Prevent_Over_Delivery_When_Selected_Items_Have_Duplicates()
+    {
+        // Arrange
+        var (companyId, customerId, warehouseId) = await SeedDataAsync();
+
+        var salesOrder = await _salesOrderService.CreateAsync(new CreateSalesOrderDto
+        {
+            CompanyId = companyId,
+            CustomerId = customerId,
+            OrderDate = DateTime.Today,
+            Items = new()
+            {
+                new() { ItemId = Guid.NewGuid(), Description = "Product Y", Quantity = 5, UnitPrice = 50m, WarehouseId = warehouseId }
+            }
+        });
+        await _salesOrderService.SubmitAsync(salesOrder.Id);
+
+        var soItem = salesOrder.Items[0];
+
+        // Act: Pass duplicate selected items each requesting 5 units (total 10 units requested for a 5 unit order)
+        var selected = new System.Collections.Generic.List<PartialDeliveryItemDto>
+        {
+            new() { SalesOrderItemId = soItem.Id, Quantity = 5, WarehouseId = warehouseId },
+            new() { SalesOrderItemId = soItem.Id, Quantity = 5, WarehouseId = warehouseId }
+        };
+
+        var deliveryNote = await _conversionService.ConvertSalesOrderToDeliveryNoteAsync(salesOrder.Id, selected);
+
+        // Assert: only 1 row created, capped at 5 units (cannot map duplicate rows exceeding pending qty)
+        deliveryNote.Items.Count.ShouldBe(1);
+        deliveryNote.Items[0].Quantity.ShouldBe(5);
+    }
+
+    [Fact]
+    public async Task Should_Prevent_Duplicate_Conversion_To_SalesInvoice_When_Draft_Invoice_Covers_Full_Qty()
+    {
+        // Arrange
+        var (companyId, customerId, warehouseId) = await SeedDataAsync();
+
+        var salesOrder = await _salesOrderService.CreateAsync(new CreateSalesOrderDto
+        {
+            CompanyId = companyId,
+            CustomerId = customerId,
+            OrderDate = DateTime.Today,
+            Items = new()
+            {
+                new() { ItemId = Guid.NewGuid(), Description = "Widget Z", Quantity = 10, UnitPrice = 100m, WarehouseId = warehouseId }
+            }
+        });
+        await _salesOrderService.SubmitAsync(salesOrder.Id);
+
+        // First conversion creates a draft invoice covering 10 units
+        var firstInvoice = await _conversionService.ConvertSalesOrderToSalesInvoiceAsync(salesOrder.Id);
+        firstInvoice.Status.ShouldBe("Draft");
+
+        // Act & Assert: second conversion should detect draft invoice and reject duplicate conversion
+        await Assert.ThrowsAsync<Volo.Abp.BusinessException>(
+            () => _conversionService.ConvertSalesOrderToSalesInvoiceAsync(salesOrder.Id));
+    }
+
+    [Fact]
+    public async Task Should_Convert_SalesOrder_To_MaterialRequest_And_Link_SalesOrderItem()
+    {
+        // Arrange
+        var (companyId, customerId, warehouseId) = await SeedDataAsync();
+        await _seriesRepository.InsertAsync(
+            new DocumentSeries(Guid.NewGuid(), companyId, "MRS", "MR", "MR-"), autoSave: true);
+
+        var salesOrder = await _salesOrderService.CreateAsync(new CreateSalesOrderDto
+        {
+            CompanyId = companyId,
+            CustomerId = customerId,
+            OrderDate = DateTime.Today,
+            Items = new()
+            {
+                new() { ItemId = Guid.NewGuid(), Description = "Widget MR", Quantity = 8, UnitPrice = 120m, WarehouseId = warehouseId }
+            }
+        });
+        await _salesOrderService.SubmitAsync(salesOrder.Id);
+
+        // Act: Convert SO to MR
+        var mrId = await _conversionService.ConvertSalesOrderToMaterialRequestAsync(salesOrder.Id);
+
+        // Assert
+        mrId.ShouldNotBe(Guid.Empty);
+        var mrRepo = GetRequiredService<IRepository<Purchasing.Entities.MaterialRequest, Guid>>();
+        var mr = await mrRepo.GetAsync(mrId);
+        mr.Items.Count.ShouldBe(1);
+        mr.Items[0].SalesOrderId.ShouldBe(salesOrder.Id);
+        mr.Items[0].SalesOrderItemId.ShouldBe(salesOrder.Items[0].Id);
+        mr.Items[0].Quantity.ShouldBe(8);
+        mr.Items[0].ConversionFactor.ShouldBe(1m);
+
+        // Submit MR to update SalesOrderItem.RequestedQty
+        var mrAppService = GetRequiredService<Purchasing.IMaterialRequestAppService>();
+        await mrAppService.SubmitAsync(mrId);
+
+        // Second conversion should throw because RequestedQty covers PendingDeliveryQty
+        await Assert.ThrowsAsync<Volo.Abp.BusinessException>(
+            () => _conversionService.ConvertSalesOrderToMaterialRequestAsync(salesOrder.Id));
+    }
+
+    [Fact]
+    public async Task Should_Convert_DeliveryNote_With_Returned_Qty_Correctly()
+    {
+        var (companyId, customerId, warehouseId) = await SeedDataAsync();
+        var dnRepo = GetRequiredService<IRepository<DeliveryNote, Guid>>();
+
+        var dn = new DeliveryNote(Guid.NewGuid(), companyId, customerId, warehouseId, "DN-CONV-001", DateTime.Today);
+        dn.AddItem(Guid.NewGuid(), "Item Return Conv", 10m, 100m, 0m);
+        dn.Submit();
+
+        // 4 units returned
+        dn.Items[0].ReturnedQty = 4m;
+        await dnRepo.InsertAsync(dn, autoSave: true);
+
+        // Act: Convert DN to SI
+        var si = await _conversionService.ConvertDeliveryNoteToSalesInvoiceAsync(dn.Id);
+
+        // Assert: invoice only bills the unreturned 6 units (10 - 4)
+        si.Items.Count.ShouldBe(1);
+        si.Items[0].Quantity.ShouldBe(6m);
+    }
+
+    [Fact]
+    public async Task Should_Reject_Conversion_When_DeliveryNote_Fully_Returned()
+    {
+        var (companyId, customerId, warehouseId) = await SeedDataAsync();
+        var dnRepo = GetRequiredService<IRepository<DeliveryNote, Guid>>();
+
+        var dn = new DeliveryNote(Guid.NewGuid(), companyId, customerId, warehouseId, "DN-CONV-002", DateTime.Today);
+        dn.AddItem(Guid.NewGuid(), "Item Return Conv Full", 5m, 100m, 0m);
+        dn.Submit();
+
+        // All 5 units returned
+        dn.Items[0].ReturnedQty = 5m;
+        await dnRepo.InsertAsync(dn, autoSave: true);
+
+        // Act & Assert: conversion fails because all items returned
+        var ex = await Assert.ThrowsAsync<Volo.Abp.BusinessException>(
+            () => _conversionService.ConvertDeliveryNoteToSalesInvoiceAsync(dn.Id));
+        ex.Code.ShouldBe(MyERPDomainErrorCodes.DocumentAlreadyConverted);
+    }
+
+    private async Task<QuotationDto> CreateSubmittedAlternativeQuotationAsync()
+    {
+        var (companyId, customerId, _) = await SeedDataAsync();
+        var quotation = await _quotationService.CreateAsync(new CreateQuotationDto
+        {
+            CompanyId = companyId,
+            CustomerId = customerId,
+            IssueDate = DateTime.Today,
+            Items = new()
+            {
+                new() { ItemId = Guid.NewGuid(), Description = "Primary", Quantity = 1, UnitPrice = 100m },
+                new() { ItemId = Guid.NewGuid(), Description = "Alternative", Quantity = 1, UnitPrice = 90m, IsAlternative = true },
+            }
+        });
+        await _quotationService.SubmitAsync(quotation.Id);
+        return await _quotationService.GetAsync(quotation.Id);
+    }
+
+    [Fact]
+    public async Task Should_Skip_Alternative_Items_By_Default()
+    {
+        var quotation = await CreateSubmittedAlternativeQuotationAsync();
+        quotation.NetTotal.ShouldBe(100m);
+
+        var salesOrder = await _conversionService.ConvertQuotationToSalesOrderAsync(quotation.Id);
+
+        salesOrder.Items.Count.ShouldBe(1);
+        salesOrder.Items[0].Description.ShouldBe("Primary");
+    }
+
+    [Fact]
+    public async Task Should_Order_Selected_Alternative_Item()
+    {
+        var quotation = await CreateSubmittedAlternativeQuotationAsync();
+        var alternativeId = quotation.Items.Single(i => i.IsAlternative).Id;
+
+        var salesOrder = await _conversionService.ConvertQuotationToSalesOrderAsync(quotation.Id, new List<Guid> { alternativeId });
+
+        salesOrder.Items.Count.ShouldBe(1);
+        salesOrder.Items[0].Description.ShouldBe("Alternative");
+    }
+
+    [Fact]
+    public async Task Should_Reject_Selecting_Two_Items_Of_One_Alternatives_Set()
+    {
+        var quotation = await CreateSubmittedAlternativeQuotationAsync();
+
+        await Should.ThrowAsync<Volo.Abp.BusinessException>(() =>
+            _conversionService.ConvertQuotationToSalesOrderAsync(quotation.Id, quotation.Items.Select(i => i.Id).ToList()));
+    }
+
+    [Fact]
+    public async Task Should_Auto_Fill_Addresses_From_Customer_Master_On_Quotation_Conversion()
+    {
+        // Per ERPNext PR #59336: quotation conversion to sales order auto-populates billing and shipping addresses
+        var (companyId, customerId, _) = await SeedDataAsync();
+        var addressRepo = GetRequiredService<IRepository<Core.Entities.Address, Guid>>();
+        var billing = await addressRepo.InsertAsync(
+            new Core.Entities.Address(Guid.NewGuid(), "Cust Billing", "Customer", customerId, "123 Main St", "Malaysia")
+            {
+                IsPrimaryAddress = true,
+                AddressType = "Billing"
+            }, autoSave: true);
+
+        var quotation = await _quotationService.CreateAsync(new CreateQuotationDto
+        {
+            CompanyId = companyId,
+            CustomerId = customerId,
+            IssueDate = DateTime.Today,
+            Items = new List<CreateQuotationItemDto>
+            {
+                new() { ItemId = Guid.NewGuid(), Description = "Widget", Quantity = 1, UnitPrice = 100m }
+            }
+        });
+        await _quotationService.SubmitAsync(quotation.Id);
+
+        var salesOrderDto = await _conversionService.ConvertQuotationToSalesOrderAsync(quotation.Id);
+
+        var soRepo = GetRequiredService<IRepository<SalesOrder, Guid>>();
+        var so = await soRepo.GetAsync(salesOrderDto.Id);
+        so.BillingAddressId.ShouldBe(billing.Id);
+    }
+
+    [Fact]
+    public async Task Should_Allow_Over_Delivery_When_Sales_Order_Fully_Delivered_And_Allowance_Configured()
+    {
+        // Per ERPNext PR #60140: honour over delivery allowance when Sales Order is fully delivered
+        var (companyId, customerId, warehouseId) = await SeedDataAsync();
+        var company = await _companyRepository.GetAsync(companyId);
+        company.OverDeliveryReceiptAllowance = 50m;
+        await _companyRepository.UpdateAsync(company, autoSave: true);
+
+        var uomRepo = GetRequiredService<IRepository<Uom, Guid>>();
+        await uomRepo.InsertAsync(new Uom(Guid.NewGuid(), "Box") { MustBeWholeNumber = true }, autoSave: true);
+
+        var salesOrder = await _salesOrderService.CreateAsync(new CreateSalesOrderDto
+        {
+            CompanyId = companyId,
+            CustomerId = customerId,
+            OrderDate = DateTime.Today,
+            Items = new()
+            {
+                new() { ItemId = Guid.NewGuid(), Description = "Whole UOM Item", Quantity = 3, Uom = "Box", UnitPrice = 100m, WarehouseId = warehouseId }
+            }
+        });
+        await _salesOrderService.SubmitAsync(salesOrder.Id);
+
+        // Mark SO line as fully delivered (3/3 delivered, PerDelivered = 100%)
+        var so = await _salesOrderRepository.GetAsync(salesOrder.Id);
+        var soItemRepo = GetRequiredService<IRepository<SalesOrderItem, Guid>>();
+        var soItem = so.Items[0];
+        soItem.DeliveredQty = 3;
+        await soItemRepo.UpdateAsync(soItem, autoSave: true);
+
+        // Act: map Delivery Note without explicit selection
+        var deliveryNote = await _conversionService.ConvertSalesOrderToDeliveryNoteAsync(salesOrder.Id);
+
+        // Assert: 3 * 1.5 = 4.5 floored to 4 max allowed, 4 - 3 delivered = 1 deliverable qty
+        deliveryNote.ShouldNotBeNull();
+        deliveryNote.Items.Count.ShouldBe(1);
+        deliveryNote.Items[0].Quantity.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task Should_Allow_Over_Delivery_For_Explicitly_Selected_Fully_Delivered_Row()
+    {
+        // Per ERPNext PR #60140: partially delivered order allows over-delivery for explicitly selected rows
+        var (companyId, customerId, warehouseId) = await SeedDataAsync();
+        var company = await _companyRepository.GetAsync(companyId);
+        company.OverDeliveryReceiptAllowance = 50m;
+        await _companyRepository.UpdateAsync(company, autoSave: true);
+
+        var salesOrder = await _salesOrderService.CreateAsync(new CreateSalesOrderDto
+        {
+            CompanyId = companyId,
+            CustomerId = customerId,
+            OrderDate = DateTime.Today,
+            Items = new()
+            {
+                new() { ItemId = Guid.NewGuid(), Description = "Item A", Quantity = 10, UnitPrice = 50m, WarehouseId = warehouseId },
+                new() { ItemId = Guid.NewGuid(), Description = "Item B", Quantity = 10, UnitPrice = 50m, WarehouseId = warehouseId }
+            }
+        });
+        await _salesOrderService.SubmitAsync(salesOrder.Id);
+
+        // Deliver Row A completely (10/10), Row B untouched (0/10) -> PerDelivered = 50% (< 100%)
+        var so = await _salesOrderRepository.GetAsync(salesOrder.Id);
+        var soItemRepo = GetRequiredService<IRepository<SalesOrderItem, Guid>>();
+        var itemA = so.Items.First(i => i.Description == "Item A");
+        var itemB = so.Items.First(i => i.Description == "Item B");
+        itemA.DeliveredQty = 10;
+        await soItemRepo.UpdateAsync(itemA, autoSave: true);
+
+        var rowAId = itemA.Id;
+        var rowBId = itemB.Id;
+
+        // Default mapping without selection should only map pending Row B (qty 10), omitting Row A
+        var defaultDn = await _conversionService.ConvertSalesOrderToDeliveryNoteAsync(salesOrder.Id);
+        defaultDn.Items.Count.ShouldBe(1);
+        defaultDn.Items[0].Quantity.ShouldBe(10);
+        defaultDn.Items[0].Description.ShouldBe("Item B");
+
+        // Explicitly selected mapping with Row A (requesting 5 within 50% allowance: 15 - 10 = 5) and Row B (requesting 10)
+        var selected = new List<PartialDeliveryItemDto>
+        {
+            new() { SalesOrderItemId = rowAId, Quantity = 5, WarehouseId = warehouseId },
+            new() { SalesOrderItemId = rowBId, Quantity = 10, WarehouseId = warehouseId }
+        };
+
+        var selectedDn = await _conversionService.ConvertSalesOrderToDeliveryNoteAsync(salesOrder.Id, selected);
+        selectedDn.Items.Count.ShouldBe(2);
+        selectedDn.Items.First(i => i.Description == "Item A").Quantity.ShouldBe(5);
+        selectedDn.Items.First(i => i.Description == "Item B").Quantity.ShouldBe(10);
+    }
+
+    [Fact]
+    public async Task Should_Disallow_Over_Delivery_When_Allowance_Is_Zero()
+    {
+        var (companyId, customerId, warehouseId) = await SeedDataAsync();
+        var company = await _companyRepository.GetAsync(companyId);
+        company.OverDeliveryReceiptAllowance = 0m;
+        await _companyRepository.UpdateAsync(company, autoSave: true);
+
+        var salesOrder = await _salesOrderService.CreateAsync(new CreateSalesOrderDto
+        {
+            CompanyId = companyId,
+            CustomerId = customerId,
+            OrderDate = DateTime.Today,
+            Items = new()
+            {
+                new() { ItemId = Guid.NewGuid(), Description = "Product Z", Quantity = 5, UnitPrice = 50m, WarehouseId = warehouseId }
+            }
+        });
+        await _salesOrderService.SubmitAsync(salesOrder.Id);
+
+        var so = await _salesOrderRepository.GetAsync(salesOrder.Id);
+        var soItemRepo = GetRequiredService<IRepository<SalesOrderItem, Guid>>();
+        var soItem = so.Items[0];
+        soItem.DeliveredQty = 5;
+        await soItemRepo.UpdateAsync(soItem, autoSave: true);
+
+        // Attempting to convert fully delivered order with 0% allowance should throw DocumentAlreadyConverted
+        await Should.ThrowAsync<Volo.Abp.BusinessException>(async () =>
+        {
+            await _conversionService.ConvertSalesOrderToDeliveryNoteAsync(salesOrder.Id);
+        });
+    }
+
+    [Fact]
+    public async Task Should_Create_PurchaseOrders_From_SalesOrder_Decomposing_Bundles_By_Supplier()
+    {
+        // Arrange (Per ERPNext PR #61966 / commit a26ae5639f & 901eddb0b9)
+        var (companyId, customerId, warehouseId) = await SeedDataAsync();
+        var supplierRepo = GetRequiredService<IRepository<MyERP.Purchasing.Entities.Supplier, Guid>>();
+        var bundleRepo = GetRequiredService<IRepository<ProductBundle, Guid>>();
+        var poRepo = GetRequiredService<IRepository<MyERP.Purchasing.Entities.PurchaseOrder, Guid>>();
+
+        var supplierA = await supplierRepo.InsertAsync(new MyERP.Purchasing.Entities.Supplier(Guid.NewGuid(), companyId, "Supplier A"), autoSave: true);
+        var supplierB = await supplierRepo.InsertAsync(new MyERP.Purchasing.Entities.Supplier(Guid.NewGuid(), companyId, "Supplier B"), autoSave: true);
+
+        var bundleItemA = Guid.NewGuid();
+        var compA = Guid.NewGuid();
+        var bundleA = new ProductBundle(Guid.NewGuid(), bundleItemA);
+        bundleA.AddItem(compA, 2m, "Component A", "Nos");
+        await bundleRepo.InsertAsync(bundleA, autoSave: true);
+
+        var bundleItemB = Guid.NewGuid();
+        var compB = Guid.NewGuid();
+        var bundleB = new ProductBundle(Guid.NewGuid(), bundleItemB);
+        bundleB.AddItem(compB, 3m, "Component B", "Nos");
+        await bundleRepo.InsertAsync(bundleB, autoSave: true);
+
+        var normalItem = Guid.NewGuid();
+
+        var salesOrder = await _salesOrderService.CreateAsync(new CreateSalesOrderDto
+        {
+            CompanyId = companyId,
+            CustomerId = customerId,
+            OrderDate = DateTime.Today,
+            Items = new()
+            {
+                new() { ItemId = bundleItemA, Description = "Bundle A", Quantity = 2, UnitPrice = 100m, WarehouseId = warehouseId },
+                new() { ItemId = bundleItemB, Description = "Bundle B", Quantity = 1, UnitPrice = 150m, WarehouseId = warehouseId },
+                new() { ItemId = normalItem, Description = "Normal Item", Quantity = 5, UnitPrice = 20m, WarehouseId = warehouseId }
+            }
+        });
+        await _salesOrderService.SubmitAsync(salesOrder.Id);
+
+        var so = await _salesOrderRepository.GetAsync(salesOrder.Id);
+        var soItemBundleA = so.Items.First(i => i.ItemId == bundleItemA);
+        var soItemBundleB = so.Items.First(i => i.ItemId == bundleItemB);
+        var soItemNormal = so.Items.First(i => i.ItemId == normalItem);
+
+        // Act: Map Bundle A and Normal Item to Supplier A; Bundle B to Supplier B
+        var selections = new List<SalesOrderPurchaseItemSelectionDto>
+        {
+            new() { SalesOrderItemId = soItemBundleA.Id, SupplierId = supplierA.Id },
+            new() { SalesOrderItemId = soItemNormal.Id, SupplierId = supplierA.Id },
+            new() { SalesOrderItemId = soItemBundleB.Id, SupplierId = supplierB.Id }
+        };
+
+        var poIds = await _conversionService.ConvertSalesOrderToPurchaseOrdersAsync(salesOrder.Id, selections);
+
+        // Assert: 2 Purchase Orders created (one per supplier)
+        poIds.Count.ShouldBe(2);
+
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var currentPoRepo = GetRequiredService<IRepository<MyERP.Purchasing.Entities.PurchaseOrder, Guid>>();
+            var poQueryable = await currentPoRepo.WithDetailsAsync(p => p.Items);
+            var allPos = poQueryable.Where(p => poIds.Contains(p.Id)).ToList();
+            var poA = allPos.First(p => p.SupplierId == supplierA.Id);
+            var poB = allPos.First(p => p.SupplierId == supplierB.Id);
+
+            // Supplier A: Component A (qty 2 * 2 = 4) and Normal Item (qty 5)
+            poA.Items.Count.ShouldBe(2);
+            var poAComp = poA.Items.First(i => i.ItemId == compA);
+            poAComp.Quantity.ShouldBe(4m);
+            var poANormal = poA.Items.First(i => i.ItemId == normalItem);
+            poANormal.Quantity.ShouldBe(5m);
+
+            // Supplier B: Component B (qty 1 * 3 = 3)
+            poB.Items.Count.ShouldBe(1);
+            var poBComp = poB.Items.First(i => i.ItemId == compB);
+            poBComp.Quantity.ShouldBe(3m);
+        });
+    }
+
+    [Fact]
+    public async Task ConvertQuotationToSalesInvoiceAsync_Valid_Creates_Invoice()
+    {
+        var (companyId, customerId, _) = await SeedDataAsync();
+        var itemRepo = GetRequiredService<IRepository<Item, Guid>>();
+        var item = await itemRepo.InsertAsync(new Item(Guid.NewGuid(), companyId, "Q-SI-ITEM-1", "Quotation SI Item", ItemType.Goods) { MaintainStock = false }, autoSave: true);
+
+        var qtn = await _quotationService.CreateAsync(new CreateQuotationDto
+        {
+            CompanyId = companyId,
+            CustomerId = customerId,
+            IssueDate = DateTime.UtcNow.Date,
+            Items = new List<CreateQuotationItemDto>
+            {
+                new() { ItemId = item.Id, Description = "Item 1", Quantity = 5m, UnitPrice = 120m, Uom = "Unit" }
+            }
+        });
+        await _quotationService.SubmitAsync(qtn.Id);
+
+        var invoiceDto = await _conversionService.ConvertQuotationToSalesInvoiceAsync(qtn.Id);
+        invoiceDto.ShouldNotBeNull();
+        invoiceDto.CustomerId.ShouldBe(customerId);
+        invoiceDto.CompanyId.ShouldBe(companyId);
+        invoiceDto.Items.Count.ShouldBe(1);
+        invoiceDto.Items[0].Quantity.ShouldBe(5m);
+        invoiceDto.Items[0].UnitPrice.ShouldBe(120m);
+    }
+
+    [Fact]
+    public async Task ConvertQuotationToSalesInvoiceAsync_LostOrExpired_Throws()
+    {
+        var (companyId, customerId, _) = await SeedDataAsync();
+        var itemRepo = GetRequiredService<IRepository<Item, Guid>>();
+        var item = await itemRepo.InsertAsync(new Item(Guid.NewGuid(), companyId, "Q-SI-ITEM-2", "Quotation SI Item 2", ItemType.Goods) { MaintainStock = false }, autoSave: true);
+
+        var qtn = await _quotationService.CreateAsync(new CreateQuotationDto
+        {
+            CompanyId = companyId,
+            CustomerId = customerId,
+            IssueDate = DateTime.UtcNow.Date,
+            Items = new List<CreateQuotationItemDto>
+            {
+                new() { ItemId = item.Id, Description = "Item 2", Quantity = 2m, UnitPrice = 50m, Uom = "Unit" }
+            }
+        });
+        await _quotationService.SubmitAsync(qtn.Id);
+
+        // Mark lost with valid reason
+        var reasonRepo = GetRequiredService<IRepository<QuotationLostReason, Guid>>();
+        var reason = await reasonRepo.InsertAsync(new QuotationLostReason(Guid.NewGuid(), "Price too high"), autoSave: true);
+        await _quotationService.MarkLostAsync(qtn.Id, new MarkQuotationLostDto { LostReasonIds = new List<Guid> { reason.Id } });
+
+        var ex = await Should.ThrowAsync<Volo.Abp.BusinessException>(() =>
+            _conversionService.ConvertQuotationToSalesInvoiceAsync(qtn.Id));
+        (ex.Data["detail"]?.ToString() ?? string.Empty).ShouldContain("Lost");
+    }
+}

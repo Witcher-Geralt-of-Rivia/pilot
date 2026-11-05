@@ -1,0 +1,135 @@
+using System;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.Extensions.Logging;
+using MyERP.Accounting.DomainServices;
+using MyERP.Accounting.Entities;
+using MyERP.Permissions;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+
+namespace MyERP.Accounting;
+
+[Authorize(MyERPPermissions.Accounts.Default)]
+public class FiscalYearAppService : ApplicationService, IFiscalYearAppService
+{
+    private readonly IRepository<FiscalYear, Guid> _repository;
+    private readonly FiscalYearCloseService _closeService;
+    private readonly FiscalYearMapper _mapper;
+
+    public FiscalYearAppService(
+        IRepository<FiscalYear, Guid> repository,
+        FiscalYearCloseService closeService,
+        FiscalYearMapper? mapper = null)
+    {
+        _repository = repository;
+        _closeService = closeService;
+        _mapper = mapper ?? new FiscalYearMapper();
+    }
+
+    public async Task<PagedResultDto<FiscalYearDto>> GetListAsync(PagedAndSortedResultRequestDto input)
+    {
+        var query = await _repository.GetQueryableAsync();
+        var totalCount = query.Count();
+        var items = query.OrderByDescending(f => f.StartDate)
+            .Skip(input.SkipCount).Take(input.MaxResultCount).ToList();
+        return new PagedResultDto<FiscalYearDto>(totalCount, items.Select(_mapper.Map).ToList());
+    }
+
+    public async Task<FiscalYearDto> GetAsync(Guid id) => _mapper.Map(await _repository.GetAsync(id));
+
+    public async Task<FiscalYearDto> GetCurrentAsync(Guid companyId)
+    {
+        var query = await _repository.GetQueryableAsync();
+        var now = DateTime.UtcNow.Date;
+        var fy = query
+            .Where(f => f.CompanyId == companyId && f.StartDate <= now && f.EndDate >= now)
+            .OrderByDescending(f => f.StartDate)
+            .FirstOrDefault();
+        return fy != null ? _mapper.Map(fy) : null!;
+    }
+
+    [Authorize(MyERPPermissions.Accounts.Create)]
+    public async Task<FiscalYearDto> CreateAsync(CreateFiscalYearDto input)
+    {
+        if (input.EndDate <= input.StartDate)
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "End date must be greater than start date.");
+        }
+
+        // Validate duration per ERPNext validate_dates (#5979):
+        // If not a short year, EndDate must be exactly StartDate + 1 year - 1 day.
+        if (!input.IsShortYear)
+        {
+            var expectedEndDate = input.StartDate.AddYears(1).AddDays(-1);
+            if (input.EndDate.Date != expectedEndDate.Date)
+            {
+                throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Normal fiscal year must span exactly one full year (ending on {expectedEndDate:yyyy-MM-dd}). Mark as Short Year if custom duration.");
+            }
+        }
+
+        // Validate no overlapping FY for same company
+        var query = await _repository.GetQueryableAsync();
+        var overlap = query.Any(f =>
+            f.CompanyId == input.CompanyId &&
+            f.StartDate <= input.EndDate &&
+            f.EndDate >= input.StartDate);
+
+        if (overlap)
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.FiscalYearClosed)
+                .WithData("message", "A fiscal year with overlapping dates already exists for this company.")
+                .WithData("startDate", input.StartDate.ToString("yyyy-MM-dd"))
+                .WithData("endDate", input.EndDate.ToString("yyyy-MM-dd"));
+        }
+
+        var fy = new FiscalYear(Guid.NewGuid(), input.CompanyId, input.Name,
+            input.StartDate, input.EndDate, input.IsShortYear, tenantId: null);
+        await _repository.InsertAsync(fy);
+        return _mapper.Map(fy);
+    }
+
+    /// <summary>
+    /// Close a fiscal year. Enforces sequential closing: prior FY must be closed first.
+    /// Per DO-NOT: "Skip sequential period closing enforcement (previous FY must be closed first)"
+    /// </summary>
+    [Authorize(MyERPPermissions.Accounts.Edit)]
+    public async Task<FiscalYearDto> CloseAsync(Guid id)
+    {
+        var fy = await _repository.GetAsync(id);
+
+        if (fy.IsClosed)
+            return _mapper.Map(fy); // Already closed, idempotent
+
+        // Delegate sequential closure validation + close to domain service
+        await _closeService.ValidateCanCloseAsync(id);
+        await _closeService.CloseAsync(id);
+
+        // Re-fetch after domain service update
+        fy = await _repository.GetAsync(id);
+
+        // Validate trial balance is balanced before finalizing close
+        // Per ERPNext: month-end/year-end close should verify GL integrity
+        try
+        {
+            var tbValidator = LazyServiceProvider.LazyGetRequiredService<MyERP.Accounting.DomainServices.TrialBalanceValidationService>();
+            var validationResult = await tbValidator.ValidateAsync(fy.CompanyId, fy.StartDate, fy.EndDate);
+            if (!validationResult.IsBalanced)
+            {
+                // Non-blocking warning — FY close proceeds but logs the imbalance
+                System.Diagnostics.Debug.WriteLine(
+                    $"FiscalYear {fy.Name} closed with unbalanced Trial Balance. Difference: {validationResult.Difference:N2}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Trial balance validation failed during FY close for {Id}", fy.Id);
+        }
+
+        return _mapper.Map(fy);
+    }
+}

@@ -1,0 +1,527 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using MyERP.Accounting.DomainServices;
+using MyERP.Core;
+using Volo.Abp;
+using Volo.Abp.Domain.Entities.Auditing;
+using Volo.Abp.MultiTenancy;
+
+namespace MyERP.Sales.Entities;
+
+/// <summary>
+/// Sales Invoice — core transactional document.
+/// Maps to ERPNext accounts/doctype/sales_invoice.
+/// Implements IAccountableDocument for automatic GL posting via AccountingRuleEngine.
+/// </summary>
+public class SalesInvoice : FullAuditedAggregateRoot<Guid>, IMultiTenant, IAccountableDocument, IAmendable
+{
+    public Guid? TenantId { get; set; }
+    public Guid CompanyId { get; set; }
+    public Guid? BranchId { get; set; }
+
+    public string InvoiceNumber { get; set; } = null!;
+    public DateTime IssueDate { get; set; }
+    public DateTime? DueDate { get; set; }
+
+    /// <summary>Customer's PO reference number.</summary>
+    public string? CustomerPoNumber { get; set; }
+
+    /// <summary>Billing period start date (for recurring billing / service periods).</summary>
+    public DateTime? FromDate { get; set; }
+
+    /// <summary>Billing period end date (for recurring billing / service periods).</summary>
+    public DateTime? ToDate { get; set; }
+
+    // Customer
+    public Guid CustomerId { get; set; }
+
+    /// <summary>Supplier TIN (company's TIN) — for LHDN e-Invoice.</summary>
+    public string? SupplierTin { get; set; }
+
+    /// <summary>Buyer TIN (customer's TIN) — for LHDN e-Invoice.</summary>
+    public string? BuyerTin { get; set; }
+
+    // Amounts
+    public string CurrencyCode { get; set; } = "MYR";
+    public decimal ExchangeRate { get; set; } = 1m;
+
+    /// <summary>Selling Price List — defaults from Customer.DefaultPriceListId, overridable per invoice.</summary>
+    public Guid? PriceListId { get; set; }
+
+    public decimal NetTotal { get; set; }
+    public decimal TaxAmount { get; set; }
+    public decimal GrandTotal { get; set; }
+    public decimal AmountPaid { get; set; }
+    /// <summary>
+    /// Outstanding amount = GrandTotal - AmountPaid - WriteOffAmount - TotalAdvance.
+    /// Per ERPNext: outstanding_amount considers advances and write-offs.
+    /// </summary>
+    public decimal OutstandingAmount => GrandTotal - AmountPaid - WriteOffAmount - TotalAdvance;
+
+    // Discount on grand total
+    /// <summary>Additional discount percentage applied on net total.</summary>
+    public decimal AdditionalDiscountPercentage { get; set; }
+    /// <summary>Fixed discount amount (mutually exclusive with percentage).</summary>
+    public decimal DiscountAmount { get; set; }
+
+    // Base (company) currency amounts
+    public decimal BaseNetTotal { get; set; }
+    public decimal BaseTaxAmount { get; set; }
+    public decimal BaseGrandTotal { get; set; }
+    public decimal BaseOutstandingAmount => BaseGrandTotal - (AmountPaid * ExchangeRate);
+
+    /// <summary>If true, this is an opening balance entry (for go-live migration). Bypasses payment terms.</summary>
+    public bool IsOpening { get; set; }
+
+    /// <summary>Receivable account (debit_to). Must match original on credit notes.</summary>
+    public Guid DebitToAccountId { get; set; }
+
+    /// <summary>Payment terms template for auto-generating due dates.</summary>
+    public Guid? PaymentTermsTemplateId { get; set; }
+
+    /// <summary>Source Subscription ID when generated from recurring subscription billing.</summary>
+    public Guid? SubscriptionId { get; set; }
+
+    /// <summary>Billing address (auto-resolved from Customer on create).</summary>
+    public Guid? BillingAddressId { get; set; }
+
+    /// <summary>Shipping address (auto-resolved from Customer on create).</summary>
+    public Guid? ShippingAddressId { get; set; }
+
+    /// <summary>Billing contact person (Contact ID).</summary>
+    public Guid? ContactPersonId { get; set; }
+
+    /// <summary>Shipping contact person (Contact ID) per ERPNext PR #58159.</summary>
+    public Guid? ShippingContactPersonId { get; set; }
+
+    /// <summary>Sales partner linked to this invoice for commission tracking.</summary>
+    public Guid? SalesPartnerId { get; set; }
+
+    /// <summary>Commission rate percentage for the sales partner.</summary>
+    public decimal CommissionRate { get; set; }
+
+    /// <summary>Total commission amount for the sales partner.</summary>
+    public decimal TotalCommission { get; set; }
+
+    /// <summary>If true, this is a return (credit note).</summary>
+    public bool IsReturn { get; set; }
+
+    /// <summary>
+    /// If true, this is a debit note (increases customer balance, supplementary billing/penalty).
+    /// Per ERPNext: cannot update stock (financial-only), mutually exclusive with IsReturn.
+    /// </summary>
+    public bool IsDebitNote { get; set; }
+
+    /// <summary>
+    /// If true and IsReturn=true, this is a return refund (LHDN Document Type Code 04 : Refund Note).
+    /// Per MyInvois PR #37d716d / original.py.
+    /// </summary>
+    public bool IsReturnRefund { get; set; }
+
+    /// <summary>If true, stock movements are created on submit (direct sales without DN).</summary>
+    public bool UpdateStock { get; set; }
+
+    /// <summary>Warehouse for stock deduction when UpdateStock=true.</summary>
+    public Guid? WarehouseId { get; set; }
+
+    /// <summary>Original invoice this return is against.</summary>
+    public Guid? ReturnAgainstId { get; set; }
+
+    /// <summary>
+    /// Reciprocal of PurchaseInvoice.InterCompanyInvoiceId — the Purchase Invoice auto-created
+    /// in the target company from this Sales Invoice (or vice versa). Enables the cancellation
+    /// cascade: cancelling either side cancels the other.
+    /// </summary>
+    public Guid? InterCompanyPurchaseInvoiceId { get; set; }
+
+    /// <summary>Link to the Delivery Note that triggered this credit note (return flow).</summary>
+    public Guid? DeliveryNoteId { get; set; }
+
+    /// <summary>
+    /// When IsReturn=true, whether this return invoice updates the billed amount and quantity
+    /// in the linked Sales Order. Defaults to true. Maps to ERPNext update_billed_amount_in_sales_order.
+    /// (PR #59947 / commit c706da2899)
+    /// </summary>
+    public bool UpdateBilledAmountInSalesOrder { get; set; } = true;
+
+    // Amendment (cancel-and-amend workflow)
+    /// <summary>Reference to the cancelled invoice this was amended from.</summary>
+    public Guid? AmendedFromId { get; set; }
+    /// <summary>Amendment index (0 = original, 1+ = amendments).</summary>
+    public int AmendmentIndex { get; set; }
+
+    // Workflow
+    public DocumentStatus Status { get; private set; } = DocumentStatus.Draft;
+
+    // LHDN e-Invoice fields
+    public EInvoiceDocumentType? EInvoiceDocType { get; set; }
+    public EInvoiceStatus EInvoiceStatus { get; set; } = EInvoiceStatus.NotSubmitted;
+    public string? LhdnUuid { get; set; }
+    public string? LhdnLongId { get; set; }
+    public DateTime? LhdnValidationDate { get; set; }
+    public string? QrCodeUrl { get; set; }
+    public Guid? LhdnSubmissionId { get; set; }
+    public DateTime? LhdnSubmittedAt { get; set; }
+    /// <summary>
+    /// Whether this invoice should be submitted to LHDN e-Invoice.
+    /// Maps to MyInvois custom_is_submit_to_lhdn. Default: true.
+    /// </summary>
+    public bool IsSubmitToLhdn { get; set; } = true;
+
+    public Guid? TermsAndConditionsId { get; set; }
+    public string? Terms { get; set; }
+    public string? Notes { get; set; }
+    /// <summary>Coupon code applied at creation — persisted so cancellation can reverse the usage count.</summary>
+    public string? CouponCode { get; set; }
+
+    /// <summary>Link to project for timesheet-based billing.</summary>
+    public Guid? ProjectId { get; set; }
+
+    /// <summary>
+    /// If this is a POS invoice, the consolidated Sales Invoice it was merged into.
+    /// Set during POS Closing to prevent re-consolidation.
+    /// </summary>
+    public Guid? ConsolidatedSalesInvoiceId { get; set; }
+
+    /// <summary>If true, this is a POS invoice created during a POS session.</summary>
+    public bool IsPos { get; set; }
+
+    /// <summary>
+    /// If true, this invoice is a consolidated summary generated by POS Closing / merge log.
+    /// Returns cannot be created directly against consolidated invoices (ERPNext PR #47251 / commit 483c4a3271).
+    /// </summary>
+    public bool IsConsolidated { get; set; }
+
+    /// <summary>Linked POS Profile for POS invoices. Per ERPNext PR #46907 / commit 3de1b22480.</summary>
+    public Guid? PosProfileId { get; set; }
+
+    // Loyalty Points Redemption
+    /// <summary>Loyalty points redeemed on this invoice (reduces grand total).</summary>
+    public int LoyaltyPointsRedeemed { get; set; }
+
+    /// <summary>Monetary value of redeemed loyalty points.</summary>
+    public decimal LoyaltyRedemptionAmount { get; set; }
+
+    /// <summary>
+    /// Loyalty points earned from this invoice (calculated on submit).
+    /// Per gotcha #333: eligible_amount = (grand_total - loyalty_amount) - returned_amount
+    /// </summary>
+    public int LoyaltyPointsEarned { get; set; }
+
+    /// <summary>Linked loyalty program for this invoice's customer.</summary>
+    public Guid? LoyaltyProgramId { get; set; }
+
+    /// <summary>
+    /// Cost center for GL posting. Per PR #57615: auto-filled from subscription plan or item defaults.
+    /// Used by IAccountableDocument for AccountingRuleEngine GL entry assignment.
+    /// </summary>
+    public Guid? CostCenterId { get; set; }
+
+    // Advance payment tracking — per ERPNext set_advances()
+    /// <summary>Total advance payments allocated against this invoice.</summary>
+    public decimal TotalAdvance { get; set; }
+
+    /// <summary>Write-off amount (bad debt or rounding tolerance). Reduces outstanding without payment.</summary>
+    public decimal WriteOffAmount { get; set; }
+
+    /// <summary>Write-off GL account (expense account for bad debt posting).</summary>
+    public Guid? WriteOffAccountId { get; set; }
+
+    /// <summary>Write-off cost center for GL posting.</summary>
+    public Guid? WriteOffCostCenterId { get; set; }
+
+    // Rounded total — per ERPNext round_floats_in_doc()
+    /// <summary>Grand total rounded to nearest whole number (configurable via Global Defaults).</summary>
+    public decimal RoundedTotal { get; set; }
+
+    /// <summary>Rounding adjustment = RoundedTotal - GrandTotal. Can be positive or negative.</summary>
+    public decimal RoundingAdjustment { get; set; }
+
+    /// <summary>
+    /// Whether the invoice is overdue (past due date with outstanding balance).
+    /// Per ERPNext: overdue detection is AMOUNT-based for payment schedules.
+    /// </summary>
+    public bool IsOverdue => Status == DocumentStatus.Posted
+        && !IsReturn
+        && OutstandingAmount > 0.01m
+        && DueDate.HasValue
+        && DueDate.Value.Date < DateTime.UtcNow.Date;
+
+    /// <summary>Base currency rounded total.</summary>
+    public decimal BaseRoundedTotal { get; set; }
+
+    /// <summary>Base currency rounding adjustment.</summary>
+    public decimal BaseRoundingAdjustment { get; set; }
+
+    /// <summary>Whether rounding is disabled for this invoice (per company/global setting).</summary>
+    public bool DisableRoundedTotal { get; set; }
+
+    // Line items
+    private readonly List<SalesInvoiceItem> _items = new();
+    /// <summary>Rows in document order (Idx), since the database gives no ordering guarantee.</summary>
+    public IReadOnlyList<SalesInvoiceItem> Items => _items.OrderBy(i => i.Idx).ThenBy(i => i.CreationTime).ToList();
+
+    // IAccountableDocument implementation
+    string IAccountableDocument.DocumentType => "SalesInvoice";
+    Guid? IAccountableDocument.CustomerId => CustomerId;
+    Guid? IAccountableDocument.SupplierId => null;
+    DateTime IAccountableDocument.PostingDate => IssueDate;
+    Guid? IAccountableDocument.CostCenterId => CostCenterId;
+
+    protected SalesInvoice() { }
+
+    public SalesInvoice(Guid id, Guid companyId, Guid customerId, string invoiceNumber, DateTime issueDate, Guid? tenantId = null)
+        : base(id)
+    {
+        CompanyId = Check.NotDefaultOrNull<Guid>(companyId, nameof(companyId));
+        CustomerId = Check.NotDefaultOrNull<Guid>(customerId, nameof(customerId));
+        InvoiceNumber = Check.NotNullOrWhiteSpace(invoiceNumber, nameof(invoiceNumber), SalesInvoiceConsts.MaxInvoiceNumberLength);
+        IssueDate = issueDate;
+        TenantId = tenantId;
+    }
+
+    public void AddItem(Guid itemId, string description, decimal quantity, decimal unitPrice, decimal taxAmount, string uom = "Unit")
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Check.NotDefaultOrNull<Guid>(itemId, nameof(itemId));
+
+        // Normal invoices: qty must be positive. Returns (IsReturn=true): qty must be negative.
+        if (!IsReturn && quantity <= 0)
+            throw new ArgumentException("Quantity must be positive for non-return invoices.", nameof(quantity));
+        if (IsReturn && quantity >= 0)
+            throw new ArgumentException("Quantity must be negative for return invoices (credit notes).", nameof(quantity));
+
+        var newItem = new SalesInvoiceItem(
+            Guid.NewGuid(), Id, itemId, description, quantity, unitPrice, taxAmount, uom);
+        newItem.Idx = _items.Count;
+        _items.Add(newItem);
+
+        RecalculateTotals();
+    }
+
+    public void Submit()
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        if (!_items.Any())
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        // Per ERPNext: To Date cannot be before From Date
+        if (FromDate.HasValue && ToDate.HasValue && FromDate.Value.Date > ToDate.Value.Date)
+            throw new BusinessException(MyERPDomainErrorCodes.DateRangeInvalid);
+
+        // Per DO-NOT: opening invoices with update_stock=true are blocked (accounting-only)
+        if (IsOpening && UpdateStock)
+            throw new BusinessException(MyERPDomainErrorCodes.OpeningInvoiceCannotUpdateStock)
+                .WithData("documentType", "Sales Invoice");
+
+        // Per DO-NOT / gotcha #3826: update_stock cannot be enabled when items reference Delivery Notes (prevents double SLE)
+        if (UpdateStock && _items.Any(i => i.DeliveryNoteItemId.HasValue))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Cannot enable Update Stock when invoice contains items linked to Delivery Notes.");
+        }
+
+        // Clear stale deferred revenue fields on non-deferred items (ERPNext PR #57140)
+        foreach (var item in _items.Where(i => !i.EnableDeferredRevenue))
+        {
+            item.ServiceStartDate = null;
+            item.ServiceEndDate = null;
+            item.ServiceStopDate = null;
+            item.DeferredRevenueAccountId = null;
+        }
+
+        // Validate deferred revenue service dates (per ERPNext accounts/deferred_revenue.py, gotcha #1624)
+        foreach (var item in _items.Where(i => i.EnableDeferredRevenue))
+        {
+            if (!item.ServiceStartDate.HasValue || !item.ServiceEndDate.HasValue)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", "Service Start Date and Service End Date are mandatory for deferred revenue items.");
+            }
+            if (item.ServiceStartDate.Value > item.ServiceEndDate.Value)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", "Service Start Date cannot be after Service End Date.");
+            }
+            if (IssueDate.Date > item.ServiceEndDate.Value.Date)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", "Service End Date cannot be before Invoice Posting Date.");
+            }
+            if (item.ServiceStopDate.HasValue)
+            {
+                if (item.ServiceStopDate.Value < item.ServiceStartDate.Value)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                        .WithData("detail", "Service Stop Date cannot be before Service Start Date.");
+                }
+                if (item.ServiceStopDate.Value > item.ServiceEndDate.Value)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                        .WithData("detail", "Service Stop Date cannot be after Service End Date.");
+                }
+            }
+        }
+
+        // Auto-correct conversion factor when UOM equals StockUOM (gotcha #6171)
+        foreach (var item in _items)
+        {
+            if (!string.IsNullOrEmpty(item.Uom) && !string.IsNullOrEmpty(item.StockUom)
+                && string.Equals(item.Uom, item.StockUom, StringComparison.OrdinalIgnoreCase)
+                && item.ConversionFactor != 1.0m)
+            {
+                item.ConversionFactor = 1.0m;
+            }
+        }
+
+        if (IsReturn && !_items.Any(i => i.Quantity < 0))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "At least one item must be entered with negative quantity in a return document.");
+        }
+
+        ValidateDebitNote();
+        ValidateEInvoiceDocumentType();
+
+        Status = DocumentStatus.Submitted;
+        AddLocalEvent(new SalesInvoiceSubmittedEvent(this));
+    }
+
+    /// <summary>
+    /// Validates Debit Note constraints per ERPNext and MyInvois rules:
+    /// - Cannot update stock (debit note is financial only)
+    /// - Mutually exclusive with IsReturn
+    /// </summary>
+    public void ValidateDebitNote()
+    {
+        if (IsDebitNote && IsReturn)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed,
+                "A document cannot be both a Return and a Debit Note.")
+                .WithData("detail", "Sales Invoice cannot be both a Return and a Debit Note.");
+        }
+
+        if (IsDebitNote && UpdateStock)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed,
+                "You cannot update stock for a Debit Note. A Debit Note is a financial document that should not affect inventory. Please disable 'Update Stock'.")
+                .WithData("detail", "You cannot update stock for a Debit Note. A Debit Note is a financial document that should not affect inventory. Please disable 'Update Stock'.");
+        }
+    }
+
+    /// <summary>
+    /// Validates consistency between EInvoiceDocType and transaction flags (IsReturn, IsReturnRefund, IsDebitNote)
+    /// per LHDN MyInvois regulations (commit 37d716d).
+    /// </summary>
+    public void ValidateEInvoiceDocumentType()
+    {
+        if (!EInvoiceDocType.HasValue) return;
+
+        if (IsDebitNote && EInvoiceDocType != EInvoiceDocumentType.DebitNote)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "As per LHDN Regulation, choose the invoice type code as '03 : Debit Note'.");
+        }
+
+        if (IsReturn && !IsReturnRefund && EInvoiceDocType != EInvoiceDocumentType.CreditNote)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "As per LHDN Regulation, choose the invoice type code as '02 : Credit Note'.");
+        }
+
+        if (IsReturn && IsReturnRefund && EInvoiceDocType != EInvoiceDocumentType.RefundNote)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "As per LHDN Regulation, choose the invoice type code as '04 : Refund Note'.");
+        }
+
+        if (!IsReturn && !IsDebitNote && EInvoiceDocType is EInvoiceDocumentType.CreditNote or EInvoiceDocumentType.DebitNote or EInvoiceDocumentType.RefundNote)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Standard Sales Invoice cannot use Credit Note, Debit Note, or Refund Note e-Invoice document type.");
+        }
+    }
+
+    public void Post()
+    {
+        if (Status != DocumentStatus.Submitted)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        Status = DocumentStatus.Posted;
+        AddLocalEvent(new SalesInvoicePostedEvent(this));
+    }
+
+    public void Cancel()
+    {
+        if (Status != DocumentStatus.Posted)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        Status = DocumentStatus.Cancelled;
+        AddLocalEvent(new SalesInvoiceCancelledEvent(this));
+    }
+
+    /// <summary>
+    /// Apply rounding to GrandTotal. Call after tax cascade.
+    /// Per ERPNext: round_off_totals() uses Math.Round(GrandTotal, 0) when enabled.
+    /// </summary>
+    public void ApplyRounding()
+    {
+        if (DisableRoundedTotal)
+        {
+            RoundedTotal = GrandTotal;
+            RoundingAdjustment = 0;
+            BaseRoundedTotal = BaseGrandTotal;
+            BaseRoundingAdjustment = 0;
+            return;
+        }
+
+        RoundedTotal = Math.Round(GrandTotal, 0, MidpointRounding.AwayFromZero);
+        RoundingAdjustment = RoundedTotal - GrandTotal;
+        BaseRoundedTotal = Math.Round(BaseGrandTotal, 0, MidpointRounding.AwayFromZero);
+        BaseRoundingAdjustment = BaseRoundedTotal - BaseGrandTotal;
+    }
+
+    /// <summary>
+    /// Record write-off amount against this invoice.
+    /// Per ERPNext: write-off reduces outstanding without requiring payment.
+    /// </summary>
+    public void SetWriteOff(decimal amount, Guid? writeOffAccountId = null, Guid? writeOffCostCenterId = null)
+    {
+        if (amount < 0) throw new ArgumentException("Write-off amount cannot be negative.", nameof(amount));
+        if (amount > OutstandingAmount + WriteOffAmount) // can increase existing write-off
+            throw new ArgumentException("Write-off amount exceeds outstanding.", nameof(amount));
+
+        WriteOffAmount = amount;
+        WriteOffAccountId = writeOffAccountId;
+        WriteOffCostCenterId = writeOffCostCenterId;
+    }
+
+    /// <summary>
+    /// Record advance payment allocation against this invoice.
+    /// Per ERPNext: set_advances() links unreconciled advances.
+    /// </summary>
+    public void SetTotalAdvance(decimal amount)
+    {
+        if (amount < 0) throw new ArgumentException("Advance amount cannot be negative.", nameof(amount));
+        TotalAdvance = amount;
+    }
+
+    private void RecalculateTotals()
+    {
+        NetTotal = _items.Sum(i => i.LineTotal);
+        TaxAmount = _items.Sum(i => i.TaxAmount);
+        GrandTotal = NetTotal + TaxAmount;
+        BaseNetTotal = NetTotal * ExchangeRate;
+        BaseTaxAmount = TaxAmount * ExchangeRate;
+        BaseGrandTotal = GrandTotal * ExchangeRate;
+    }
+}
+
+// Domain Events
+public record SalesInvoiceSubmittedEvent(SalesInvoice Invoice);
+public record SalesInvoicePostedEvent(SalesInvoice Invoice);
+public record SalesInvoiceCancelledEvent(SalesInvoice Invoice);

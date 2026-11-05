@@ -1,0 +1,2828 @@
+//-----------------------------------------------------------------------
+// <copyright file="FinancialService.cs" company="AccountGo">
+// Copyright (c) 2015-2026 Marvin Perez and AccountGo contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+// <author>Marvin Perez</author>
+// <date>1/11/2015 9:48:38 AM</date>
+// </copyright>
+//-----------------------------------------------------------------------
+
+using Core.Data;
+using Core.Domain;
+using Core.Domain.Financials;
+using Core.Domain.Items;
+using Core.Domain.Purchases;
+using Core.Domain.Sales;
+using Core.Domain.TaxSystem;
+using Services.Inventory;
+using Services.TaxSystem;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+namespace Services.Financial
+{
+    public partial class FinancialService : BaseService, IFinancialService
+    {
+        private readonly Core.Entitlements.IEntitlementService _entitlements;
+        private readonly IInventoryService _inventoryService;
+        private readonly ITaxService _taxService;
+
+        private readonly IRepository<GeneralLedgerHeader> _generalLedgerRepository;
+        private readonly IRepository<Account> _accountRepo;
+        private readonly IRepository<AccountClass> _accountClassRepo;
+        private readonly IRepository<Tax> _taxRepo;
+        private readonly IRepository<JournalEntryHeader> _journalEntryRepo;
+        private readonly IRepository<JournalEntryLine> _journalEntryLineRepo;
+        private readonly IRepository<GeneralLedgerLine> _generalLedgerLineRepository;
+        private readonly IRepository<FinancialYear> _fiscalYearRepo;
+        private readonly IRepository<TaxGroup> _taxGroupRepo;
+        private readonly IRepository<ItemTaxGroup> _itemTaxGroupRepo;
+        private readonly IRepository<PaymentTerm> _paymentTermRepo;
+        private readonly IRepository<Bank> _bankRepo;
+        private readonly IRepository<Item> _itemRepo;
+        private readonly IRepository<GeneralLedgerSetting> _glSettingRepo;
+        private readonly IRepository<MainContraAccount> _maincontraAccount;
+        private readonly IRepository<Customer> _customerRepo;
+        private readonly IRepository<Vendor> _vendorRepo;
+        private readonly IRepository<GeneralLedgerSetting> _generalLedgerSettingRepo;
+        private readonly IRepository<SalesInvoiceHeader> _salesInvoiceRepo;
+        private readonly IRepository<SalesReceiptHeader> _salesReceiptRepo;
+        private readonly IRepository<CustomerAllocation> _customerAllocationRepo;
+        private readonly IRepository<PurchaseInvoiceHeader> _purchaseInvoiceRepo;
+        private readonly IRepository<VendorPayment> _vendorPaymentRepo;
+        private readonly IRepository<CompanySetting> _companySettingRepo;
+        private readonly IRepository<BankTransaction> _bankTransactionRepo;
+        private readonly IRepository<BankReconciliation> _bankReconciliationRepo;
+        private readonly IRepository<BankStatementLine> _bankStatementLineRepo;
+        private readonly IRepository<LinkedEntryPair> _linkedEntryPairRepo;
+        private readonly Services.Banking.IReconciledPeriodGuard _reconciledPeriodGuard;
+        private readonly IBooksLockGuard _booksLockGuard;
+        private readonly Core.Authorization.IAccessAuthorizationService _auth;
+        private readonly Core.Authorization.IWorkspaceApprovalPolicyResolver _approvalPolicyResolver;
+        private readonly Core.Authorization.IWorkspacePolicyTransaction _policyTransaction;
+        private readonly IRepository<Core.Domain.Auditing.AuditLog> _auditLogRepo;
+        private readonly Microsoft.AspNetCore.Http.IHttpContextAccessor _httpContextAccessor;
+
+        public const string JournalPostingAuthorizationAuditTable = "__JournalPostingAuthorization";
+
+        private static readonly System.Threading.AsyncLocal<int> AllowClosingEntriesDepth = new();
+        private static readonly System.Threading.AsyncLocal<int> AllowLinkedEntryReversalDepth = new();
+        private static readonly System.Threading.AsyncLocal<int> AllowLinkedEntryMirrorPostingDepth = new();
+        private static readonly System.Threading.AsyncLocal<int> AllowLinkedEntrySourcePostingDepth = new();
+
+        public FinancialService(IInventoryService inventoryService,
+            ITaxService taxService,
+            IRepository<GeneralLedgerHeader> generalLedgerRepository,
+            IRepository<GeneralLedgerLine> generalLedgerLineRepository,
+            IRepository<Account> accountRepo,
+            IRepository<AccountClass> accountClassRepo,
+            IRepository<Tax> taxRepo,
+            IRepository<JournalEntryHeader> journalEntryRepo,
+            IRepository<JournalEntryLine> journalEntryLineRepo,
+            IRepository<FinancialYear> fiscalYearRepo,
+            IRepository<TaxGroup> taxGroupRepo,
+            IRepository<ItemTaxGroup> itemTaxGroupRepo,
+            IRepository<PaymentTerm> paymentTermRepo,
+            IRepository<Bank> bankRepo,
+            IRepository<Item> itemRepo,
+            IRepository<GeneralLedgerSetting> glSettingRepo,
+            IRepository<CompanySetting> companySettingRepo,
+            IRepository<MainContraAccount> maincontraAccount = null,
+            IRepository<Customer> customerRepo = null,
+            IRepository<Vendor> vendorRepo = null,
+            IRepository<GeneralLedgerSetting> generalLedgerSettingRepo = null,
+            IRepository<SalesInvoiceHeader> salesInvoiceRepo = null,
+            IRepository<SalesReceiptHeader> salesReceiptRepo = null,
+            IRepository<CustomerAllocation> customerAllocationRepo = null,
+            IRepository<PurchaseInvoiceHeader> purchaseInvoiceRepo = null,
+            IRepository<VendorPayment> vendorPaymentRepo = null,
+            Core.Entitlements.IEntitlementService entitlements = null,
+            IRepository<BankTransaction> bankTransactionRepo = null,
+            IRepository<BankReconciliation> bankReconciliationRepo = null,
+            IRepository<BankStatementLine> bankStatementLineRepo = null,
+            Services.Banking.IReconciledPeriodGuard reconciledPeriodGuard = null,
+            IBooksLockGuard booksLockGuard = null,
+            Core.Authorization.IAccessAuthorizationService auth = null,
+            IRepository<Core.Domain.Auditing.AuditLog> auditLogRepo = null,
+            Microsoft.AspNetCore.Http.IHttpContextAccessor httpContextAccessor = null,
+            Core.Authorization.IWorkspaceApprovalPolicyResolver approvalPolicyResolver = null,
+            Core.Authorization.IWorkspacePolicyTransaction policyTransaction = null,
+            IRepository<LinkedEntryPair> linkedEntryPairRepo = null
+            )
+            : base(null, null, paymentTermRepo, bankRepo)
+        {
+            _auth = auth;
+            _approvalPolicyResolver = approvalPolicyResolver;
+            _policyTransaction = policyTransaction;
+            _auditLogRepo = auditLogRepo;
+            _httpContextAccessor = httpContextAccessor;
+            _entitlements = entitlements;
+            _booksLockGuard = booksLockGuard;
+            _inventoryService = inventoryService;
+            _taxService = taxService;
+            _companySettingRepo = companySettingRepo ?? throw new ArgumentNullException(nameof(companySettingRepo));
+            _generalLedgerRepository = generalLedgerRepository;
+            _accountRepo = accountRepo;
+            _accountClassRepo = accountClassRepo;
+            _taxRepo = taxRepo;
+            _journalEntryRepo = journalEntryRepo;
+            _journalEntryLineRepo = journalEntryLineRepo;
+            _generalLedgerLineRepository = generalLedgerLineRepository;
+            _fiscalYearRepo = fiscalYearRepo;
+            _taxGroupRepo = taxGroupRepo;
+            _itemTaxGroupRepo = itemTaxGroupRepo;
+            _paymentTermRepo = paymentTermRepo;
+            _bankRepo = bankRepo;
+            _itemRepo = itemRepo;
+            _glSettingRepo = glSettingRepo;
+            _maincontraAccount = maincontraAccount;
+            _customerRepo = customerRepo;
+            _vendorRepo = vendorRepo;
+            _generalLedgerSettingRepo = generalLedgerSettingRepo;
+            _salesInvoiceRepo = salesInvoiceRepo;
+            _salesReceiptRepo = salesReceiptRepo;
+            _customerAllocationRepo = customerAllocationRepo;
+            _purchaseInvoiceRepo = purchaseInvoiceRepo;
+            _vendorPaymentRepo = vendorPaymentRepo;
+            _bankTransactionRepo = bankTransactionRepo;
+            _bankReconciliationRepo = bankReconciliationRepo;
+            _bankStatementLineRepo = bankStatementLineRepo;
+            _linkedEntryPairRepo = linkedEntryPairRepo;
+            _reconciledPeriodGuard = reconciledPeriodGuard;
+        }
+
+        public const int GeneralLedgerDefaultPageSize = 100;
+        public const int GeneralLedgerMaxPageSize = 500;
+
+        /// <inheritdoc />
+        public Dto.Financial.GeneralLedgerTransactionPage GetGeneralLedgerTransactions(
+            DateTime? from = null, DateTime? to = null, string accountCode = null,
+            int? transactionNo = null, DocumentTypes? documentType = null, int skip = 0, int take = GeneralLedgerDefaultPageSize)
+        {
+            if (_auth == null)
+                return new Dto.Financial.GeneralLedgerTransactionPage { Items = new List<Dto.Financial.GeneralLedgerTransaction>(), TotalCount = 0 };
+
+            var decision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsJournalView);
+            if (!decision.Allowed)
+                return new Dto.Financial.GeneralLedgerTransactionPage { Items = new List<Dto.Financial.GeneralLedgerTransaction>(), TotalCount = 0 };
+
+            if (skip < 0) throw new ArgumentOutOfRangeException(nameof(skip), "Skip must be zero or greater.");
+            if (take < 1 || take > GeneralLedgerMaxPageSize)
+                throw new ArgumentOutOfRangeException(nameof(take), $"Take must be between 1 and {GeneralLedgerMaxPageSize}.");
+
+            // Date-only / midnight "to" values mean the whole calendar day (same idea as the SPA's T23:59:59.9999999).
+            var fromBound = from.HasValue ? DateTime.SpecifyKind(from.Value, DateTimeKind.Unspecified) : (DateTime?)null;
+            var toBound = to.HasValue ? InclusiveLedgerEnd(DateTime.SpecifyKind(to.Value, DateTimeKind.Unspecified)) : (DateTime?)null;
+            if (fromBound.HasValue && toBound.HasValue && fromBound.Value > toBound.Value)
+                throw new ArgumentException("The start date must not be after the end date.");
+
+            var query = _generalLedgerRepository.Table;
+            if (fromBound.HasValue) query = query.Where(h => h.Date >= fromBound.Value);
+            if (toBound.HasValue) query = query.Where(h => h.Date <= toBound.Value);
+            if (!string.IsNullOrWhiteSpace(accountCode))
+                query = query.Where(h => h.GeneralLedgerLines.Any(l => l.Account.AccountCode == accountCode));
+            if (transactionNo.HasValue) query = query.Where(h => h.Id == transactionNo.Value);
+            if (documentType.HasValue) query = query.Where(h => h.DocumentType == documentType.Value);
+
+            var totalCount = query.Count();
+            var transactions = query.OrderByDescending(h => h.Date).ThenByDescending(h => h.Id)
+                .Skip(skip).Take(take)
+                .Select(h => new Dto.Financial.GeneralLedgerTransaction
+                {
+                    Id = h.Id, Date = h.Date, DocumentType = h.DocumentType.ToString(),
+                    Description = h.Description, SourceDocumentId = h.SourceDocumentId,
+                    ReversedGeneralLedgerHeaderId = h.ReversedGeneralLedgerHeaderId,
+                    Lines = h.GeneralLedgerLines.OrderBy(l => l.Id).Select(l => new Dto.Financial.GeneralLedgerTransactionLine
+                    {
+                        Id = l.Id, AccountId = l.AccountId,
+                        AccountCode = l.Account.AccountCode, AccountName = l.Account.AccountName,
+                        Debit = l.DrCr == DrOrCrSide.Dr ? l.Amount : 0,
+                        Credit = l.DrCr == DrOrCrSide.Cr ? l.Amount : 0
+                    }).ToList()
+                }).ToList();
+
+            foreach (var transaction in transactions)
+            {
+                transaction.DocumentTypeLabel = System.Text.RegularExpressions.Regex.Replace(transaction.DocumentType, "([a-z])([A-Z])", "$1 $2");
+                transaction.TotalDebit = transaction.Lines.Sum(l => l.Debit);
+                transaction.TotalCredit = transaction.Lines.Sum(l => l.Credit);
+                if (!transaction.SourceDocumentId.HasValue) continue;
+                var id = transaction.SourceDocumentId.Value;
+                switch (transaction.DocumentType)
+                {
+                    case nameof(DocumentTypes.SalesInvoice): transaction.SourcePath = "/sales/" + id; break;
+                    case nameof(DocumentTypes.PurchaseInvoice):
+                    // PayBill records the bill ID, not the vendor payment ID, as its source.
+                    case nameof(DocumentTypes.PurchaseInvoicePayment):
+                        transaction.SourcePath = "/purchases/" + id; break;
+                    case nameof(DocumentTypes.JournalEntry): transaction.SourcePath = "/financials/journals?id=" + id; break;
+                    case nameof(DocumentTypes.InventoryAdjustment): transaction.SourcePath = "/items/inventory"; break;
+                    case nameof(DocumentTypes.BankTransaction):
+                        // SourceDocumentId is the BankTransaction id; path goes to the bank register.
+                        var bankId = _bankTransactionRepo?.GetById(id)?.BankId
+                            ?? _bankRepo?.GetById(id)?.Id;
+                        if (bankId.HasValue)
+                            transaction.SourcePath = "/banking/" + bankId.Value;
+                        break;
+                }
+            }
+
+            return new Dto.Financial.GeneralLedgerTransactionPage
+            {
+                Items = transactions,
+                TotalCount = totalCount,
+                Skip = skip,
+                Take = take
+            };
+        }
+
+        /// <summary>Keeps an explicit end-of-day timestamp; expands midnight/date-only bounds to the last tick of that day.</summary>
+        private static DateTime InclusiveLedgerEnd(DateTime to) =>
+            to.TimeOfDay == TimeSpan.Zero ? to.Date.AddDays(1).AddTicks(-1) : to;
+
+        public FinancialYear CurrentFiscalYear()
+        {
+            var today = DateTime.UtcNow.Date;
+            var setting = _companySettingRepo.Table.FirstOrDefault();
+            if (setting == null)
+                return null;
+            if (today < setting.BooksStartDate.Date)
+                return null;
+
+            var stored = _fiscalYearRepo.Table
+                .FirstOrDefault(fy => fy.IsActive
+                    && today >= fy.StartDate.Date
+                    && today <= fy.EndDate.Date);
+            if (stored != null)
+                return stored;
+
+            var computed = FiscalYearCalculator.Containing(
+                today, setting.FiscalYearPattern, setting.FiscalYearStartMonth);
+            return new FinancialYear
+            {
+                CompanyId = setting.CompanyId,
+                FiscalYearCode = computed.Code,
+                FiscalYearName = computed.Code,
+                StartDate = computed.Start,
+                EndDate = computed.End,
+                IsActive = true
+            };
+        }
+
+        /// <inheritdoc />
+        public void EnsureFiscalYearsThrough(DateTime date)
+        {
+            var setting = _companySettingRepo.Table.FirstOrDefault();
+            if (setting == null)
+                return;
+
+            var booksStart = setting.BooksStartDate.Date;
+            if (date.Date < booksStart)
+                return;
+
+            var pattern = setting.FiscalYearPattern;
+            var startMonth = setting.FiscalYearStartMonth;
+            var requested = FiscalYearCalculator.Containing(date, pattern, startMonth);
+            var max = FiscalYearCalculator.Containing(DateTime.UtcNow.Date.AddYears(1), pattern, startMonth);
+            // Horizon is next fiscal year from today; later dates create nothing.
+            if (requested.Start > max.Start)
+                return;
+
+            var cursor = FiscalYearCalculator.Containing(booksStart, pattern, startMonth);
+            while (cursor.Start <= requested.Start)
+            {
+                if (!_fiscalYearRepo.Table.Any(fy => fy.FiscalYearCode == cursor.Code))
+                {
+                    _fiscalYearRepo.Insert(new FinancialYear
+                    {
+                        CompanyId = setting.CompanyId,
+                        FiscalYearCode = cursor.Code,
+                        FiscalYearName = cursor.Code,
+                        StartDate = cursor.Start,
+                        EndDate = cursor.End,
+                        IsActive = true
+                    });
+                }
+
+                cursor = FiscalYearCalculator.Containing(cursor.Start.AddYears(1), pattern, startMonth);
+            }
+        }
+
+        /// <summary>Rejects postings dated before the company's books start date (resolved in the current tenant scope).</summary>
+        private void EnsureOnOrAfterBooksStart(DateTime date)
+        {
+            var booksStart = _companySettingRepo.Table.Select(s => (DateTime?)s.BooksStartDate).FirstOrDefault();
+            if (booksStart.HasValue && date.Date < booksStart.Value.Date)
+                throw new BooksStartViolationException(date, booksStart.Value);
+        }
+
+        public GeneralLedgerHeader CreateGeneralLedgerHeader(DocumentTypes documentType, DateTime date, string description, int? sourceDocumentId = null, int? reversedGeneralLedgerHeaderId = null)
+        {
+            EnsureOnOrAfterBooksStart(date);
+            var entry = new GeneralLedgerHeader()
+            {
+                DocumentType = documentType,
+                Date = date,
+                Description = description,
+                SourceDocumentId = sourceDocumentId > 0 ? sourceDocumentId : null,
+                ReversedGeneralLedgerHeaderId = reversedGeneralLedgerHeaderId > 0 ? reversedGeneralLedgerHeaderId : null,
+            };
+            return entry;
+        }
+
+        public GeneralLedgerLine CreateGeneralLedgerLine(DrOrCrSide DrCr, int accountId, decimal amount)
+        {
+            var line = new GeneralLedgerLine()
+            {
+                DrCr = DrCr,
+                AccountId = accountId,
+                Amount = amount,
+            };
+            return line;
+        }
+
+        public IEnumerable<Account> GetAccounts()
+        {
+            if (_auth == null)
+                return Enumerable.Empty<Account>();
+
+            var decision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsAccountsView);
+            if (!decision.Allowed)
+                return Enumerable.Empty<Account>();
+
+            var accounts = _accountRepo.GetAllIncluding(c => c.Company,
+                a => a.AccountClass,
+                c => c.ChildAccounts,
+                g => g.GeneralLedgerLines,
+                p => p.ParentAccount)
+                .AsEnumerable();
+
+            return accounts;
+        }
+
+        public Account GetAccount(int id)
+        {
+            if (_auth == null)
+                return null;
+
+            var decision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsAccountsView);
+            if (!decision.Allowed)
+                return null;
+
+            var account = _accountRepo.GetAllIncluding(a => a.GeneralLedgerLines,
+                a => a.AccountClass,
+                a => a.ChildAccounts,
+                a => a.ParentAccount,
+                a => a.Company)
+                .Where(a => a.Id == id)
+                .FirstOrDefault();
+
+            return account;
+        }
+
+        public Account GetAccountByAccountCode(string accountcode)
+        {
+            if (_auth == null)
+                return null;
+
+            var decision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsAccountsView);
+            if (!decision.Allowed)
+                return null;
+            var account = _accountRepo.GetAllIncluding(a => a.GeneralLedgerLines,
+                a => a.AccountClass,
+                a => a.ChildAccounts,
+                a => a.ParentAccount,
+                a => a.Company)
+                .Where(a => a.AccountCode == accountcode)
+                //.OrderByDescending(a => a.Id)
+                .FirstOrDefault();
+
+            return account;
+        }
+
+        public IEnumerable<Tax> GetTaxes()
+        {
+            var query = from f in _taxRepo.Table
+                        select f;
+            return query.AsEnumerable();
+        }
+
+        public IEnumerable<ItemTaxGroup> GetItemTaxGroups()
+        {
+            var query = from f in _itemTaxGroupRepo.Table
+                        select f;
+            return query;
+        }
+
+        public IEnumerable<TaxGroup> GetTaxGroups()
+        {
+            var query = from f in _taxGroupRepo.Table
+                        select f;
+            return query;
+        }
+
+        public void SaveGeneralLedgerEntry(GeneralLedgerHeader entry)
+        {
+            if (_auth == null)
+                throw new InvalidOperationException("Authorization service is required to save general ledger entries.");
+
+            var requiredOp = entry?.DocumentType switch
+            {
+                DocumentTypes.SalesInvoice or DocumentTypes.SalesCreditMemo or DocumentTypes.SalesDebitMemo
+                    => Core.Authorization.AccessOperationCatalog.SalesInvoicesCreate,
+                DocumentTypes.SalesReceipt or DocumentTypes.CustomerAllocation
+                    => Core.Authorization.AccessOperationCatalog.SalesReceiptsCreate,
+                DocumentTypes.PurchaseInvoice or DocumentTypes.PurchaseCreditMemo or DocumentTypes.PurchaseDebitMemo
+                    => Core.Authorization.AccessOperationCatalog.PurchasesBillsCreate,
+                DocumentTypes.PurchaseInvoicePayment
+                    => Core.Authorization.AccessOperationCatalog.PurchasesPaymentsCreate,
+                DocumentTypes.BankTransaction
+                    => Core.Authorization.AccessOperationCatalog.BankingTransactionsCreate,
+                _ => Core.Authorization.AccessOperationCatalog.FinancialsJournalPost
+            };
+
+            var decision = _auth.Authorize(requiredOp);
+            if (entry?.DocumentType == DocumentTypes.JournalEntry)
+            {
+                var isClosingReversal = AllowClosingEntriesDepth.Value > 0
+                    && entry.ReversedGeneralLedgerHeaderId.HasValue
+                    && _generalLedgerRepository.Table.Any(gl => gl.Id == entry.ReversedGeneralLedgerHeaderId.Value && gl.CompanyId == entry.CompanyId)
+                    && _journalEntryRepo.Table.Any(j => j.GeneralLedgerHeaderId == entry.ReversedGeneralLedgerHeaderId.Value
+                        && j.CompanyId == entry.CompanyId && j.VoucherType == JournalVoucherTypes.ClosingEntries && j.Posted == true)
+                    && !_generalLedgerRepository.Table.Any(gl => gl.ReversedGeneralLedgerHeaderId == entry.ReversedGeneralLedgerHeaderId.Value
+                        && gl.Id != entry.Id && gl.CompanyId == entry.CompanyId)
+                    && _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsPeriodsClose).Allowed;
+
+                var reversedJournalId = entry.ReversedGeneralLedgerHeaderId;
+                var isLinkedEntryReversal = AllowLinkedEntryReversalDepth.Value > 0
+                    && reversedJournalId.HasValue
+                    && _generalLedgerRepository.Table.Any(gl => gl.Id == reversedJournalId.Value && gl.CompanyId == entry.CompanyId)
+                    && _journalEntryRepo.Table.Any(j => j.GeneralLedgerHeaderId == reversedJournalId.Value
+                        && j.CompanyId == entry.CompanyId && j.Posted == true)
+                    && _linkedEntryPairRepo != null
+                    && _linkedEntryPairRepo.Table.Any(p => p.State == "Posted"
+                        && ((p.SourceCompanyId == entry.CompanyId && _journalEntryRepo.Table.Any(j => j.Id == p.SourceJournalId
+                            && j.CompanyId == entry.CompanyId && j.GeneralLedgerHeaderId == reversedJournalId.Value && j.Posted == true))
+                            || (p.MirrorCompanyId == entry.CompanyId && _journalEntryRepo.Table.Any(j => j.Id == p.MirrorJournalId
+                            && j.CompanyId == entry.CompanyId && j.GeneralLedgerHeaderId == reversedJournalId.Value && j.Posted == true))))
+                    && !_generalLedgerRepository.Table.Any(gl => gl.ReversedGeneralLedgerHeaderId == reversedJournalId.Value
+                        && gl.Id != entry.Id && gl.CompanyId == entry.CompanyId);
+
+                var originalJournal = reversedJournalId.HasValue
+                    ? _journalEntryRepo.Table.FirstOrDefault(j => j.CompanyId == entry.CompanyId
+                        && j.GeneralLedgerHeaderId == reversedJournalId.Value && j.Posted == true)
+                    : null;
+                var isLinkedOriginal = originalJournal != null && IsLinkedEntryJournal(entry.CompanyId, originalJournal.Id);
+                if (isLinkedOriginal && AllowLinkedEntryReversalDepth.Value <= 0)
+                    throw new LinkedEntryOperationException("linked_entry_use_pair_reversal", "Linked journals can only be reversed through the linked entry pair.");
+
+                if (!isClosingReversal && !isLinkedEntryReversal)
+                {
+                    throw new InvalidOperationException("Ordinary journal entries cannot be directly posted through general ledger save. Use UpdateJournalEntry.");
+                }
+                if (isClosingReversal)
+                    decision = Core.Authorization.AccessDecision.Allow(Core.Authorization.AccessOperationCatalog.FinancialsPeriodsClose, "POL-CLOSE", "1.0");
+                else if (isLinkedEntryReversal)
+                {
+                    var authorizedOriginalJournal = _journalEntryRepo.Table.First(j => j.CompanyId == entry.CompanyId
+                        && j.GeneralLedgerHeaderId == reversedJournalId!.Value && j.Posted == true);
+                    var actorId = _auth.ResolveActorContext()?.UserId;
+                    var preparerId = _auditLogRepo?.Table
+                        .Where(a => a.CompanyId == entry.CompanyId && a.TableName == "__JournalEntryPreparer"
+                            && a.RecordId == authorizedOriginalJournal.Id.ToString(System.Globalization.CultureInfo.InvariantCulture))
+                        .OrderByDescending(a => a.Id).Select(a => a.NewValue).FirstOrDefault()
+                        ?? actorId;
+                    decision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsJournalPost,
+                        new Core.Authorization.AccessResourceContext
+                        {
+                            WorkspaceCompanyId = entry.CompanyId,
+                            ResourceCompanyId = entry.CompanyId,
+                            ResourceType = "JournalEntry",
+                            ResourceId = authorizedOriginalJournal.Id.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                            WorkflowState = "Draft",
+                            IsPeriodLockedOrClosed = false,
+                            PreparedByUserId = preparerId
+                        });
+                    if (!decision.Allowed && decision.ReasonCode == Core.Authorization.AccessReasonCode.IndependentApprovalRequired)
+                        throw new LinkedEntryOperationException("linked_entry_reversal_requires_review", "The reversal requires an independent reviewer.");
+                    if (!decision.Allowed)
+                        throw new LinkedEntryOperationException("linked_entry_permission_required", decision.SafeMessage ?? "Financial journal-post permission is required.");
+                }
+            }
+            if (!decision.Allowed && entry?.DocumentType == DocumentTypes.BankTransaction)
+            {
+                decision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.BankingAccountsManage);
+            }
+            if (!decision.Allowed && (entry?.DocumentType == DocumentTypes.SalesReceipt || entry?.DocumentType == DocumentTypes.CustomerAllocation))
+            {
+                decision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsJournalPost);
+            }
+            if (!decision.Allowed && entry?.DocumentType == DocumentTypes.PurchaseInvoicePayment)
+            {
+                decision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsJournalPost);
+            }
+            if (!decision.Allowed)
+            {
+                throw new InvalidOperationException(decision.SafeMessage
+                    ?? $"Permission '{decision.MissingPermission ?? "financials.journal.post"}' is required for this action.");
+            }
+
+            if (ValidateGeneralLedgerEntry(entry))
+            {
+                _generalLedgerRepository.Insert(entry);
+            }
+        }
+
+        public void UpdateGeneralLedgerHeader(GeneralLedgerHeader entry)
+        {
+            if (_auth == null)
+                throw new InvalidOperationException("Authorization service is required to update general ledger headers.");
+
+            var requiredOp = entry?.DocumentType switch
+            {
+                DocumentTypes.SalesInvoice or DocumentTypes.SalesCreditMemo or DocumentTypes.SalesDebitMemo
+                    => Core.Authorization.AccessOperationCatalog.SalesInvoicesCreate,
+                DocumentTypes.SalesReceipt or DocumentTypes.CustomerAllocation
+                    => Core.Authorization.AccessOperationCatalog.SalesReceiptsCreate,
+                DocumentTypes.PurchaseInvoice or DocumentTypes.PurchaseCreditMemo or DocumentTypes.PurchaseDebitMemo
+                    => Core.Authorization.AccessOperationCatalog.PurchasesBillsCreate,
+                DocumentTypes.PurchaseInvoicePayment
+                    => Core.Authorization.AccessOperationCatalog.PurchasesPaymentsCreate,
+                DocumentTypes.BankTransaction
+                    => Core.Authorization.AccessOperationCatalog.BankingTransactionsCreate,
+                _ => Core.Authorization.AccessOperationCatalog.FinancialsJournalPost
+            };
+
+            var decision = _auth.Authorize(requiredOp);
+            if (!decision.Allowed && entry?.DocumentType == DocumentTypes.BankTransaction)
+            {
+                decision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.BankingAccountsManage);
+            }
+            if (!decision.Allowed && (entry?.DocumentType == DocumentTypes.SalesReceipt || entry?.DocumentType == DocumentTypes.CustomerAllocation))
+            {
+                decision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsJournalPost);
+            }
+            if (!decision.Allowed && entry?.DocumentType == DocumentTypes.PurchaseInvoicePayment)
+            {
+                decision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsJournalPost);
+            }
+            if (!decision.Allowed)
+            {
+                throw new InvalidOperationException($"Permission '{decision.MissingPermission ?? "financials.journal.post"}' is required for this action.");
+            }
+
+            _generalLedgerRepository.Update(entry);
+        }
+
+        public bool ValidateGeneralLedgerEntry(GeneralLedgerHeader glEntry)
+        {
+            if (!FinancialHelper.DrCrEqualityValidated(glEntry))
+                throw new InvalidOperationException("Debit/Credit are not equal.");
+
+            if (!FinancialHelper.NoLineAmountIsEqualToZero(glEntry))
+                throw new InvalidOperationException("One or more line(s) amount is zero.");
+
+            _reconciledPeriodGuard?.EnsurePostingAllowed(glEntry);
+            _booksLockGuard?.EnsureDateAllowed(glEntry.Date);
+
+            EnsureFiscalYearsThrough(glEntry.Date);
+
+            var activeFiscalYear = _fiscalYearRepo.Table
+                .FirstOrDefault(fy => fy.IsActive && glEntry.Date >= fy.StartDate && glEntry.Date <= fy.EndDate);
+
+            if (activeFiscalYear == null)
+                throw new InvalidOperationException($"Posting date {glEntry.Date:yyyy-MM-dd} is out of range. No active financial year covers this period.");
+
+            foreach (var line in glEntry.GeneralLedgerLines)
+            {
+                var account = _accountRepo.GetAllIncluding(a => a.ChildAccounts)
+                    .Where(a => a.Id == line.AccountId)
+                    .FirstOrDefault();
+
+                if (account == null)
+                    throw new InvalidOperationException($"Account ID {line.AccountId} does not exist.");
+
+                if (!account.CanPost())
+                    throw new InvalidOperationException($"Account '{account.AccountName}' ({account.AccountCode}) is a summary/parent account and cannot be posted to directly.");
+            }
+
+            return true;
+        }
+
+        public IEnumerable<JournalEntryLine> GetJournalEntryLines()
+        {
+            if (_auth == null || !_auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsJournalView).Allowed)
+                return Enumerable.Empty<JournalEntryLine>();
+
+            var query = _journalEntryLineRepo.GetAllIncluding(j => j.JournalEntryHeader, a => a.Account, h => h.JournalEntryHeader.GeneralLedgerHeader);
+            return query.AsEnumerable();
+        }
+
+        public IEnumerable<JournalEntryHeader> GetJournalEntries()
+        {
+            if (_auth == null)
+                return Enumerable.Empty<JournalEntryHeader>();
+
+            var decision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsJournalView);
+            if (!decision.Allowed)
+                return Enumerable.Empty<JournalEntryHeader>();
+
+            var journalEntries = _journalEntryRepo.GetAllIncluding(je => je.JournalEntryLines,
+                je => je.Party,
+                je => je.GeneralLedgerHeader,
+                je => je.AdjustsFiscalYear);
+
+            return journalEntries;
+        }
+
+        public IDisposable AllowClosingEntries()
+        {
+            AllowClosingEntriesDepth.Value = AllowClosingEntriesDepth.Value + 1;
+            return new ClosingEntriesScope(() =>
+                AllowClosingEntriesDepth.Value = Math.Max(0, AllowClosingEntriesDepth.Value - 1));
+        }
+
+        public IDisposable AllowLinkedEntryReversal()
+        {
+            AllowLinkedEntryReversalDepth.Value++;
+            return new ClosingEntriesScope(() => AllowLinkedEntryReversalDepth.Value = Math.Max(0, AllowLinkedEntryReversalDepth.Value - 1));
+        }
+
+        public IDisposable AllowLinkedEntryMirrorPosting()
+        {
+            AllowLinkedEntryMirrorPostingDepth.Value++;
+            return new ClosingEntriesScope(() => AllowLinkedEntryMirrorPostingDepth.Value = Math.Max(0, AllowLinkedEntryMirrorPostingDepth.Value - 1));
+        }
+
+        public IDisposable AllowLinkedEntrySourcePosting()
+        {
+            AllowLinkedEntrySourcePostingDepth.Value++;
+            return new ClosingEntriesScope(() => AllowLinkedEntrySourcePostingDepth.Value = Math.Max(0, AllowLinkedEntrySourcePostingDepth.Value - 1));
+        }
+
+        private sealed class ClosingEntriesScope : IDisposable
+        {
+            private readonly Action _release;
+            private bool _disposed;
+            public ClosingEntriesScope(Action release) => _release = release;
+            public void Dispose()
+            {
+                if (_disposed) return;
+                _disposed = true;
+                _release();
+            }
+        }
+
+        public void AddJournalEntry(JournalEntryHeader journalEntry)
+        {
+            if (_auth == null)
+                throw new InvalidOperationException("Authorization service dependency is required.");
+
+            if (journalEntry?.VoucherType == JournalVoucherTypes.ClosingEntries && AllowClosingEntriesDepth.Value > 0)
+            {
+                var closeDecision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsPeriodsClose);
+                if (!closeDecision.Allowed)
+                    throw new InvalidOperationException(closeDecision.SafeMessage ?? "Unauthorized to close fiscal period.");
+            }
+            else
+            {
+                var decision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsJournalCreate);
+                if (!decision.Allowed)
+                    throw new InvalidOperationException(decision.SafeMessage ?? "Unauthorized to create journal entry.");
+            }
+
+            ValidateJournalVoucherRules(journalEntry);
+            journalEntry.Posted = false;
+
+            _journalEntryRepo.Insert(journalEntry);
+        }
+
+        /// <summary>
+        /// ClosingEntries are system-only; PriorPeriodAdjustment has IAS 8 / IFRS for SMEs s.10 rules.
+        /// </summary>
+        private void ValidateJournalVoucherRules(JournalEntryHeader journalEntry)
+        {
+            if (journalEntry == null)
+                throw new ArgumentNullException(nameof(journalEntry));
+
+            if (journalEntry.VoucherType == JournalVoucherTypes.ClosingEntries
+                && AllowClosingEntriesDepth.Value <= 0)
+            {
+                throw new InvalidOperationException("Closing entries are created by the year-end close.");
+            }
+
+            if (journalEntry.VoucherType != JournalVoucherTypes.PriorPeriodAdjustment)
+            {
+                journalEntry.AdjustsFiscalYearId = null;
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(journalEntry.Memo))
+                throw new InvalidOperationException(
+                    "A prior-period adjustment requires a memo explaining the reason for the correction.");
+
+            if (!journalEntry.AdjustsFiscalYearId.HasValue || journalEntry.AdjustsFiscalYearId.Value <= 0)
+                throw new InvalidOperationException(
+                    "A prior-period adjustment must correct a closed fiscal year.");
+
+            var adjustedYear = _fiscalYearRepo.GetById(journalEntry.AdjustsFiscalYearId.Value)
+                ?? _fiscalYearRepo.Table.FirstOrDefault(fy => fy.Id == journalEntry.AdjustsFiscalYearId.Value);
+            if (adjustedYear == null)
+                throw new InvalidOperationException(
+                    "A prior-period adjustment must correct a closed fiscal year.");
+
+            if (adjustedYear.ClosedAt == null)
+                throw new InvalidOperationException(
+                    "A prior-period adjustment must correct a closed fiscal year. The selected year is still open.");
+
+            if (adjustedYear.EndDate.Date >= journalEntry.Date.Date)
+                throw new InvalidOperationException(
+                    "A prior-period adjustment must correct a fiscal year that ended before the journal date.");
+
+            var lines = journalEntry.JournalEntryLines?.ToList() ?? new List<JournalEntryLine>();
+            if (lines.Count == 0)
+                throw new InvalidOperationException(
+                    "A prior-period adjustment must include at least one line on account 30820 (Prior Period Adjustments).");
+
+            var accountIds = lines.Select(l => l.AccountId).Distinct().ToList();
+            var accounts = _accountRepo.Table.Where(a => accountIds.Contains(a.Id)).ToList();
+            var byId = accounts.ToDictionary(a => a.Id);
+
+            if (lines.Any(l =>
+                    byId.TryGetValue(l.AccountId, out var account)
+                    && (account.AccountClassId == 4 || account.AccountClassId == 5)))
+            {
+                throw new InvalidOperationException(
+                    "A prior-period adjustment can't post to income or expense accounts. Use account 30820 against the balance-sheet accounts being corrected.");
+            }
+
+            if (!lines.Any(l =>
+                    byId.TryGetValue(l.AccountId, out var account)
+                    && account.AccountCode == "30820"))
+            {
+                throw new InvalidOperationException(
+                    "A prior-period adjustment must include at least one line on account 30820 (Prior Period Adjustments).");
+            }
+        }
+
+        public ICollection<TrialBalance> TrialBalance(DateTime? from = default(DateTime?), DateTime? to = default(DateTime?), AccountingBasis basis = AccountingBasis.Accrual)
+        {
+            if (_auth == null || !_auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsReportsView).Allowed)
+                return new List<TrialBalance>();
+
+            return TrialBalanceCore(from, to, basis, excludeClosingEntries: false);
+        }
+
+        /// <summary>
+        /// Trial balance used by P&amp;L views: ClosingEntries journals (and their reopen tags) are omitted
+        /// so a closed year's income statement still shows operating activity.
+        /// </summary>
+        private ICollection<TrialBalance> TrialBalanceExcludingClosingEntries(DateTime? from, DateTime? to, AccountingBasis basis) =>
+            TrialBalanceCore(from, to, basis, excludeClosingEntries: true);
+
+        private ICollection<TrialBalance> TrialBalanceCore(DateTime? from, DateTime? to, AccountingBasis basis, bool excludeClosingEntries)
+        {
+            if (from.HasValue && to.HasValue && from.Value > to.Value)
+                throw new ArgumentException("The start date must not be after the end date.");
+
+            if (basis == AccountingBasis.Cash)
+                return CashBasisTrialBalance(from, to, excludeClosingEntries);
+
+            var closingIds = excludeClosingEntries ? ClosingGeneralLedgerHeaderIds() : null;
+            var lines = _generalLedgerLineRepository.Table;
+            if (from.HasValue)
+                lines = lines.Where(l => l.GeneralLedgerHeader.Date >= from.Value);
+            if (to.HasValue)
+                lines = lines.Where(l => l.GeneralLedgerHeader.Date <= to.Value);
+            if (closingIds != null && closingIds.Count > 0)
+                lines = lines.Where(l => !closingIds.Contains(l.GeneralLedgerHeaderId));
+
+            return lines
+                .GroupBy(l => new { l.AccountId, l.Account.AccountCode, l.Account.AccountName })
+                .Select(g => new TrialBalance
+                {
+                    AccountId = g.Key.AccountId,
+                    AccountCode = g.Key.AccountCode,
+                    AccountName = g.Key.AccountName,
+                    Debit = g.Sum(l => l.DrCr == DrOrCrSide.Dr ? l.Amount : 0m),
+                    Credit = g.Sum(l => l.DrCr == DrOrCrSide.Cr ? l.Amount : 0m)
+                })
+                .OrderBy(a => a.AccountCode)
+                .ToList();
+        }
+
+        private HashSet<int> ClosingGeneralLedgerHeaderIds()
+        {
+            if (_journalEntryRepo?.Table == null)
+                return new HashSet<int>();
+            return _journalEntryRepo.Table
+                .Where(j => j.VoucherType == JournalVoucherTypes.ClosingEntries && j.GeneralLedgerHeaderId != null)
+                .Select(j => j.GeneralLedgerHeaderId!.Value)
+                .ToHashSet();
+        }
+
+        private ICollection<TrialBalance> CashBasisTrialBalance(DateTime? from, DateTime? to, bool excludeClosingEntries = false)
+        {
+            var accounts = _accountRepo.Table
+                .Select(a => new { a.Id, a.AccountClassId, a.AccountCode, a.AccountName })
+                .ToDictionary(a => a.Id);
+
+            var purchasingTaxAccountIds = _taxRepo?.Table
+                .Where(t => t.PurchasingAccountId.HasValue)
+                .Select(t => t.PurchasingAccountId.Value)
+                .ToHashSet()
+                ?? new HashSet<int>();
+
+            bool IsCapitalizedAssetAccount(int accountId) =>
+                accounts.TryGetValue(accountId, out var acc)
+                && acc.AccountClassId == (int)AccountClasses.Assets
+                && acc.AccountCode != "10160"
+                && !purchasingTaxAccountIds.Contains(accountId);
+
+            var closingIds = excludeClosingEntries ? ClosingGeneralLedgerHeaderIds() : null;
+            var allGlLines = _generalLedgerLineRepository.Table
+                .Where(l => closingIds == null || closingIds.Count == 0 || !closingIds.Contains(l.GeneralLedgerHeaderId))
+                .Select(l => new
+                {
+                    l.Id,
+                    l.GeneralLedgerHeaderId,
+                    HeaderDate = l.GeneralLedgerHeader.Date,
+                    DocumentType = l.GeneralLedgerHeader.DocumentType,
+                    l.AccountId,
+                    l.DrCr,
+                    l.Amount
+                })
+                .ToList();
+
+            var linesByHeader = allGlLines
+                .GroupBy(l => l.GeneralLedgerHeaderId)
+                .ToDictionary(g => g.Key, g => g.OrderBy(l => l.Id).ToList());
+
+            var suppressedLineAmounts = new Dictionary<int, decimal>();
+            var totals = new Dictionary<int, (decimal Debit, decimal Credit)>();
+
+            // Accrual customer-allocation journals reclassify Customer Advances to A/R; cash basis recognizes revenue directly against the receipt credit.
+            foreach (var allocLine in allGlLines.Where(l => l.DocumentType == DocumentTypes.CustomerAllocation))
+                suppressedLineAmounts[allocLine.Id] = allocLine.Amount;
+
+            void AddPosting(int accountId, DrOrCrSide drCr, decimal amount, DateTime date)
+            {
+                if (amount == 0m)
+                    return;
+                if (from.HasValue && date < from.Value)
+                    return;
+                if (to.HasValue && date > to.Value)
+                    return;
+                if (amount < 0m)
+                {
+                    drCr = drCr == DrOrCrSide.Dr ? DrOrCrSide.Cr : DrOrCrSide.Dr;
+                    amount = -amount;
+                }
+                var current = totals.GetValueOrDefault(accountId);
+                if (drCr == DrOrCrSide.Dr)
+                    totals[accountId] = (current.Debit + amount, current.Credit);
+                else if (drCr == DrOrCrSide.Cr)
+                    totals[accountId] = (current.Debit, current.Credit + amount);
+            }
+
+            if (_salesInvoiceRepo != null)
+            {
+                var customerArAccounts = _customerRepo?.Table
+                    .Select(c => new { c.Id, c.AccountsReceivableAccountId })
+                    .ToDictionary(c => c.Id, c => c.AccountsReceivableAccountId)
+                    ?? new Dictionary<int, int?>();
+
+                var receiptGlMap = _salesReceiptRepo?.Table
+                    .Where(r => r.GeneralLedgerHeaderId.HasValue)
+                    .Select(r => new { r.Id, GlHeaderId = r.GeneralLedgerHeaderId.Value })
+                    .ToDictionary(r => r.Id, r => r.GlHeaderId)
+                    ?? new Dictionary<int, int>();
+
+                var allocationsByInvoice = (_customerAllocationRepo?.Table
+                        .Select(a => new { a.Id, a.SalesInvoiceHeaderId, a.SalesReceiptHeaderId, a.GeneralLedgerHeaderId, a.Date, a.Amount })
+                        .ToList() ?? new())
+                    .GroupBy(a => a.SalesInvoiceHeaderId)
+                    .ToDictionary(g => g.Key, g => g.OrderBy(a => a.Date).ThenBy(a => a.Id).ToList());
+
+                var invoices = _salesInvoiceRepo.Table
+                    .Where(i => i.GeneralLedgerHeaderId.HasValue)
+                    .Select(i => new
+                    {
+                        i.Id,
+                        i.CustomerId,
+                        i.Status,
+                        GlHeaderId = i.GeneralLedgerHeaderId.Value,
+                        i.VoidGeneralLedgerHeaderId
+                    })
+                    .ToList();
+
+                foreach (var invoice in invoices)
+                {
+                    if (!linesByHeader.TryGetValue(invoice.GlHeaderId, out var invLines) || invLines.Count == 0)
+                        continue;
+
+                    // Stock-issue pairs (Dr COGS, Cr Inventory) stay on the invoice date; only A/R and its revenue/tax/discount/shipping offsets wait for cash.
+                    var stockLineIds = new HashSet<int>();
+                    foreach (var invCredit in invLines.Where(l => l.DrCr == DrOrCrSide.Cr && accounts.TryGetValue(l.AccountId, out var acc) && acc.AccountClassId == (int)AccountClasses.Assets))
+                    {
+                        var matchingCogs = invLines.FirstOrDefault(l =>
+                            !stockLineIds.Contains(l.Id)
+                            && l.DrCr == DrOrCrSide.Dr
+                            && l.Amount == invCredit.Amount
+                            && accounts.TryGetValue(l.AccountId, out var cogsAcc)
+                            && cogsAcc.AccountClassId == (int)AccountClasses.Expense);
+                        if (matchingCogs != null)
+                        {
+                            stockLineIds.Add(invCredit.Id);
+                            stockLineIds.Add(matchingCogs.Id);
+                        }
+                    }
+
+                    var nonStockLines = invLines.Where(l => !stockLineIds.Contains(l.Id)).ToList();
+                    var expectedArAccountId = customerArAccounts.GetValueOrDefault(invoice.CustomerId);
+                    var arLine = nonStockLines.FirstOrDefault(l => l.DrCr == DrOrCrSide.Dr && expectedArAccountId.HasValue && l.AccountId == expectedArAccountId.Value)
+                        ?? nonStockLines.FirstOrDefault(l => l.DrCr == DrOrCrSide.Dr && accounts.TryGetValue(l.AccountId, out var acc) && acc.AccountClassId == (int)AccountClasses.Assets)
+                        ?? nonStockLines.FirstOrDefault(l => l.DrCr == DrOrCrSide.Dr);
+
+                    if (arLine == null || arLine.Amount <= 0m)
+                        continue;
+
+                    var offsetLines = nonStockLines.Where(l => l.Id != arLine.Id).ToList();
+                    foreach (var line in nonStockLines)
+                        suppressedLineAmounts[line.Id] = line.Amount;
+
+                    if (invoice.VoidGeneralLedgerHeaderId.HasValue && linesByHeader.TryGetValue(invoice.VoidGeneralLedgerHeaderId.Value, out var voidLines))
+                    {
+                        var voidStockIds = new HashSet<int>();
+                        foreach (var invDebit in voidLines.Where(l => l.DrCr == DrOrCrSide.Dr && accounts.TryGetValue(l.AccountId, out var acc) && acc.AccountClassId == (int)AccountClasses.Assets))
+                        {
+                            var matchingCogs = voidLines.FirstOrDefault(l =>
+                                !voidStockIds.Contains(l.Id)
+                                && l.DrCr == DrOrCrSide.Cr
+                                && l.Amount == invDebit.Amount
+                                && accounts.TryGetValue(l.AccountId, out var cogsAcc)
+                                && cogsAcc.AccountClassId == (int)AccountClasses.Expense);
+                            if (matchingCogs != null)
+                            {
+                                voidStockIds.Add(invDebit.Id);
+                                voidStockIds.Add(matchingCogs.Id);
+                            }
+                        }
+                        foreach (var line in voidLines.Where(l => !voidStockIds.Contains(l.Id)))
+                            suppressedLineAmounts[line.Id] = line.Amount;
+                        continue;
+                    }
+
+                    if (invoice.Status == SalesInvoiceStatus.Void || offsetLines.Count == 0)
+                        continue;
+
+                    if (!allocationsByInvoice.TryGetValue(invoice.Id, out var allocations) || allocations.Count == 0)
+                        continue;
+
+                    var invoiceTotal = arLine.Amount;
+                    var signedOffsets = offsetLines
+                        .Select(l => (l.AccountId, SignedAmount: l.DrCr == DrOrCrSide.Cr ? l.Amount : -l.Amount))
+                        .ToList();
+                    var prevCumulativeByLine = new decimal[signedOffsets.Count];
+                    var cumulativePaid = 0m;
+
+                    foreach (var allocation in allocations)
+                    {
+                        if (allocation.GeneralLedgerHeaderId.HasValue
+                            && linesByHeader.TryGetValue(allocation.GeneralLedgerHeaderId.Value, out var allocGlLines))
+                        {
+                            foreach (var allocGlLine in allocGlLines)
+                                suppressedLineAmounts[allocGlLine.Id] = allocGlLine.Amount;
+                        }
+
+                        if (allocation.Amount <= 0m || cumulativePaid >= invoiceTotal)
+                            continue;
+
+                        var desiredSettle = Math.Min(allocation.Amount, invoiceTotal - cumulativePaid);
+                        if (desiredSettle <= 0m)
+                            continue;
+
+                        var settledAmount = desiredSettle;
+                        var recognitionDate = allocation.Date;
+                        if (receiptGlMap.TryGetValue(allocation.SalesReceiptHeaderId, out var receiptGlId)
+                            && linesByHeader.TryGetValue(receiptGlId, out var receiptLines))
+                        {
+                            var receiptCreditLines = receiptLines
+                                .Where(l => l.DrCr == DrOrCrSide.Cr)
+                                .OrderByDescending(l => l.AccountId == arLine.AccountId)
+                                .ThenBy(l => l.Id)
+                                .ToList();
+                            var availableReceiptCredit = receiptCreditLines.Sum(l =>
+                                Math.Max(0m, l.Amount - suppressedLineAmounts.GetValueOrDefault(l.Id)));
+                            settledAmount = Math.Min(desiredSettle, availableReceiptCredit);
+                            if (settledAmount <= 0m)
+                                continue;
+
+                            var toSuppress = settledAmount;
+                            foreach (var creditLine in receiptCreditLines)
+                            {
+                                if (toSuppress <= 0m)
+                                    break;
+                                var lineAvailable = Math.Max(0m, creditLine.Amount - suppressedLineAmounts.GetValueOrDefault(creditLine.Id));
+                                if (lineAvailable <= 0m)
+                                    continue;
+                                var take = Math.Min(toSuppress, lineAvailable);
+                                suppressedLineAmounts[creditLine.Id] = suppressedLineAmounts.GetValueOrDefault(creditLine.Id) + take;
+                                toSuppress -= take;
+                                recognitionDate = creditLine.HeaderDate;
+                            }
+                        }
+
+                        var nextCumulativePaid = cumulativePaid + settledAmount;
+                        var allocatedSumBeforeLast = 0m;
+                        for (var i = 0; i < signedOffsets.Count; i++)
+                        {
+                            decimal delta;
+                            if (i < signedOffsets.Count - 1)
+                            {
+                                var targetCumulative = Math.Round(signedOffsets[i].SignedAmount * nextCumulativePaid / invoiceTotal, 2, MidpointRounding.AwayFromZero);
+                                delta = targetCumulative - prevCumulativeByLine[i];
+                                prevCumulativeByLine[i] = targetCumulative;
+                                allocatedSumBeforeLast += delta;
+                            }
+                            else
+                            {
+                                delta = settledAmount - allocatedSumBeforeLast;
+                                prevCumulativeByLine[i] += delta;
+                            }
+
+                            if (delta > 0m)
+                                AddPosting(signedOffsets[i].AccountId, DrOrCrSide.Cr, delta, recognitionDate);
+                            else if (delta < 0m)
+                                AddPosting(signedOffsets[i].AccountId, DrOrCrSide.Dr, -delta, recognitionDate);
+                        }
+
+                        cumulativePaid = nextCumulativePaid;
+                    }
+                }
+            }
+
+            if (_purchaseInvoiceRepo != null)
+            {
+                var vendorApAccounts = _vendorRepo?.Table
+                    .Select(v => new { v.Id, v.AccountsPayableAccountId })
+                    .ToDictionary(v => v.Id, v => v.AccountsPayableAccountId)
+                    ?? new Dictionary<int, int?>();
+
+                var paymentsByBill = (_vendorPaymentRepo?.Table
+                        .Where(p => p.PurchaseInvoiceHeaderId.HasValue && !p.VoidedAt.HasValue)
+                        .Select(p => new
+                        {
+                            p.Id,
+                            BillId = p.PurchaseInvoiceHeaderId.Value,
+                            p.GeneralLedgerHeaderId,
+                            p.Date,
+                            p.Amount
+                        })
+                        .ToList() ?? new())
+                    .GroupBy(p => p.BillId)
+                    .ToDictionary(g => g.Key, g => g.OrderBy(p => p.Date).ThenBy(p => p.Id).ToList());
+
+                var bills = _purchaseInvoiceRepo.Table
+                    .Where(b => b.GeneralLedgerHeaderId.HasValue)
+                    .Select(b => new
+                    {
+                        b.Id,
+                        b.VendorId,
+                        b.Status,
+                        GlHeaderId = b.GeneralLedgerHeaderId.Value,
+                        b.VoidGeneralLedgerHeaderId
+                    })
+                    .ToList();
+
+                foreach (var bill in bills)
+                {
+                    if (!linesByHeader.TryGetValue(bill.GlHeaderId, out var billLines) || billLines.Count == 0)
+                        continue;
+
+                    var expectedApAccountId = bill.VendorId.HasValue ? vendorApAccounts.GetValueOrDefault(bill.VendorId.Value) : null;
+                    var apLine = billLines.LastOrDefault(l => l.DrCr == DrOrCrSide.Cr && expectedApAccountId.HasValue && l.AccountId == expectedApAccountId.Value)
+                        ?? billLines.Where(l => l.DrCr == DrOrCrSide.Cr && accounts.TryGetValue(l.AccountId, out var acc) && acc.AccountClassId == (int)AccountClasses.Liabilities)
+                            .OrderByDescending(l => l.Amount).FirstOrDefault()
+                        ?? billLines.Where(l => l.DrCr == DrOrCrSide.Cr).OrderByDescending(l => l.Amount).FirstOrDefault();
+
+                    if (apLine == null || apLine.Amount <= 0m)
+                        continue;
+
+                    var offsetLines = billLines.Where(l => l.Id != apLine.Id).ToList();
+                    // Keep balance-sheet asset capitalization (e.g., inventory, fixed assets) on the bill date; defer only P&L and tax lines until payment.
+                    var deferredLines = offsetLines.Where(l => !IsCapitalizedAssetAccount(l.AccountId)).ToList();
+                    var deferredNet = deferredLines.Sum(l => l.DrCr == DrOrCrSide.Dr ? l.Amount : -l.Amount);
+                    foreach (var line in deferredLines)
+                        suppressedLineAmounts[line.Id] = line.Amount;
+                    suppressedLineAmounts[apLine.Id] = Math.Clamp(deferredNet, 0m, apLine.Amount);
+
+                    if (bill.VoidGeneralLedgerHeaderId.HasValue && linesByHeader.TryGetValue(bill.VoidGeneralLedgerHeaderId.Value, out var voidLines))
+                    {
+                        var voidApLine = voidLines.LastOrDefault(l => l.DrCr == DrOrCrSide.Dr && l.AccountId == apLine.AccountId)
+                            ?? voidLines.Where(l => l.DrCr == DrOrCrSide.Dr).OrderByDescending(l => l.Amount).FirstOrDefault();
+                        foreach (var line in voidLines.Where(l => (voidApLine == null || l.Id != voidApLine.Id) && !IsCapitalizedAssetAccount(l.AccountId)))
+                            suppressedLineAmounts[line.Id] = line.Amount;
+                        if (voidApLine != null)
+                            suppressedLineAmounts[voidApLine.Id] = Math.Clamp(deferredNet, 0m, voidApLine.Amount);
+                        continue;
+                    }
+
+                    if (bill.Status == PurchaseInvoiceStatus.Void || deferredLines.Count == 0)
+                        continue;
+
+                    if (!paymentsByBill.TryGetValue(bill.Id, out var payments) || payments.Count == 0)
+                        continue;
+
+                    var billTotal = apLine.Amount;
+                    var signedOffsets = offsetLines
+                        .Select(l => (
+                            l.AccountId,
+                            SignedAmount: l.DrCr == DrOrCrSide.Dr ? l.Amount : -l.Amount,
+                            IsCapitalized: IsCapitalizedAssetAccount(l.AccountId)))
+                        .ToList();
+                    var prevCumulativeByLine = new decimal[signedOffsets.Count];
+                    var cumulativePaid = 0m;
+
+                    foreach (var payment in payments)
+                    {
+                        if (payment.Amount <= 0m || cumulativePaid >= billTotal)
+                            continue;
+
+                        var desiredSettle = Math.Min(payment.Amount, billTotal - cumulativePaid);
+                        if (desiredSettle <= 0m)
+                            continue;
+
+                        var settledAmount = desiredSettle;
+                        var recognitionDate = payment.Date;
+                        int? paymentDrLineId = null;
+                        decimal availablePaymentDebit = 0m;
+                        if (payment.GeneralLedgerHeaderId.HasValue
+                            && linesByHeader.TryGetValue(payment.GeneralLedgerHeaderId.Value, out var paymentLines))
+                        {
+                            var paymentDrLine = paymentLines.FirstOrDefault(l => l.DrCr == DrOrCrSide.Dr && l.AccountId == apLine.AccountId)
+                                ?? paymentLines.FirstOrDefault(l => l.DrCr == DrOrCrSide.Dr);
+                            if (paymentDrLine != null)
+                            {
+                                availablePaymentDebit = Math.Max(0m, paymentDrLine.Amount - suppressedLineAmounts.GetValueOrDefault(paymentDrLine.Id));
+                                settledAmount = Math.Min(desiredSettle, availablePaymentDebit);
+                                if (settledAmount <= 0m)
+                                    continue;
+                                paymentDrLineId = paymentDrLine.Id;
+                                recognitionDate = paymentDrLine.HeaderDate;
+                            }
+                        }
+
+                        var nextCumulativePaid = cumulativePaid + settledAmount;
+                        var allocatedSumBeforeLast = 0m;
+                        var deferredDeltaSum = 0m;
+                        for (var i = 0; i < signedOffsets.Count; i++)
+                        {
+                            decimal delta;
+                            if (i < signedOffsets.Count - 1)
+                            {
+                                var targetCumulative = Math.Round(signedOffsets[i].SignedAmount * nextCumulativePaid / billTotal, 2, MidpointRounding.AwayFromZero);
+                                delta = targetCumulative - prevCumulativeByLine[i];
+                                prevCumulativeByLine[i] = targetCumulative;
+                                allocatedSumBeforeLast += delta;
+                            }
+                            else
+                            {
+                                delta = settledAmount - allocatedSumBeforeLast;
+                                prevCumulativeByLine[i] += delta;
+                            }
+
+                            if (!signedOffsets[i].IsCapitalized)
+                            {
+                                deferredDeltaSum += delta;
+                                if (delta > 0m)
+                                    AddPosting(signedOffsets[i].AccountId, DrOrCrSide.Dr, delta, recognitionDate);
+                                else if (delta < 0m)
+                                    AddPosting(signedOffsets[i].AccountId, DrOrCrSide.Cr, -delta, recognitionDate);
+                            }
+                        }
+
+                        if (paymentDrLineId.HasValue)
+                        {
+                            var suppressDebit = Math.Clamp(deferredDeltaSum, 0m, availablePaymentDebit);
+                            suppressedLineAmounts[paymentDrLineId.Value] = suppressedLineAmounts.GetValueOrDefault(paymentDrLineId.Value) + suppressDebit;
+                        }
+
+                        cumulativePaid = nextCumulativePaid;
+                    }
+                }
+            }
+
+            foreach (var line in allGlLines)
+            {
+                var remaining = line.Amount - suppressedLineAmounts.GetValueOrDefault(line.Id);
+                if (remaining > 0m)
+                    AddPosting(line.AccountId, line.DrCr, remaining, line.HeaderDate);
+            }
+
+            return totals
+                .Where(kvp => (kvp.Value.Debit != 0m || kvp.Value.Credit != 0m) && accounts.ContainsKey(kvp.Key))
+                .Select(kvp =>
+                {
+                    var account = accounts[kvp.Key];
+                    return new TrialBalance
+                    {
+                        AccountId = account.Id,
+                        AccountCode = account.AccountCode,
+                        AccountName = account.AccountName,
+                        Debit = kvp.Value.Debit,
+                        Credit = kvp.Value.Credit
+                    };
+                })
+                .OrderBy(a => a.AccountCode)
+                .ToList();
+        }
+
+        public ICollection<BalanceSheet> BalanceSheet(DateTime? from = default(DateTime?), DateTime? to = default(DateTime?), AccountingBasis basis = AccountingBasis.Accrual)
+        {
+            if (from.HasValue && to.HasValue && from.Value > to.Value)
+                throw new ArgumentException("The start date must not be after the end date.");
+
+            // A position statement includes opening balances, not just movement since 'from'.
+            var balances = TrialBalance(null, to, basis).ToDictionary(a => a.AccountId);
+            var accounts = _accountRepo.Table.Where(a => a.AccountClassId >= 1 && a.AccountClassId <= 5)
+                .Select(a => new { a.Id, a.AccountClassId, a.AccountCode, a.AccountName }).ToList();
+            var balanceSheet = accounts.Where(a => a.AccountClassId <= 3)
+                .Select(a =>
+                {
+                    TrialBalance balance;
+                    var net = balances.TryGetValue(a.Id, out balance) ? balance.Debit - balance.Credit : 0m;
+                    // 30820 is equity (class 3) from the books; keep it out of the computed RE split below
+                    // (that split only sums class 4/5) and surface a stable statement label.
+                    var name = a.AccountCode == "30820" ? "Prior period adjustments" : a.AccountName;
+                    return new BalanceSheet
+                    {
+                        AccountId = a.Id,
+                        AccountClassId = a.AccountClassId,
+                        AccountCode = a.AccountCode,
+                        AccountName = name,
+                        Amount = a.AccountClassId == 1 ? net : -net
+                    };
+                }).ToList();
+
+            // Split unclosed P&L into opening retained earnings (prior years) and profit for the year
+            // containing `to`. Totals match the former single unclosed-net-income line.
+            // Keep the full `to` timestamp (not .Date) so same-day entries after midnight are included.
+            // One extra TrialBalance for the year; opening = cumulative income/expense net minus that.
+            var asOf = to ?? DateTime.UtcNow;
+            var fyStart = ResolveFiscalYearStartContaining(asOf.Date);
+            var incomeExpenseIds = accounts.Where(a => a.AccountClassId == 4 || a.AccountClassId == 5)
+                .Select(a => a.Id)
+                .ToHashSet();
+
+            decimal SumIncomeExpenseNet(IDictionary<int, TrialBalance> tb) =>
+                incomeExpenseIds.Sum(id => tb.ContainsKey(id) ? tb[id].Credit - tb[id].Debit : 0m);
+
+            var profitForTheYear = SumIncomeExpenseNet(
+                TrialBalance(fyStart, asOf, basis).ToDictionary(a => a.AccountId));
+            var openingRetainedEarnings = SumIncomeExpenseNet(balances) - profitForTheYear;
+
+            if (openingRetainedEarnings != 0m)
+                balanceSheet.Add(new BalanceSheet
+                {
+                    AccountId = 0,
+                    AccountClassId = 3,
+                    AccountCode = "",
+                    AccountName = "Retained earnings (opening)",
+                    Amount = openingRetainedEarnings
+                });
+            if (profitForTheYear != 0m)
+                balanceSheet.Add(new BalanceSheet
+                {
+                    AccountId = 0,
+                    AccountClassId = 3,
+                    AccountCode = "",
+                    AccountName = "Profit for the year",
+                    Amount = profitForTheYear
+                });
+            return balanceSheet;
+        }
+
+        private DateTime ResolveFiscalYearStartContaining(DateTime asOf)
+        {
+            var stored = _fiscalYearRepo.Table
+                .FirstOrDefault(fy => fy.IsActive
+                    && asOf >= fy.StartDate.Date
+                    && asOf <= fy.EndDate.Date);
+            if (stored != null)
+                return stored.StartDate.Date;
+
+            var setting = _companySettingRepo.Table.FirstOrDefault();
+            if (setting != null)
+                return FiscalYearCalculator.Containing(asOf, setting.FiscalYearPattern, setting.FiscalYearStartMonth).Start;
+
+            return new DateTime(asOf.Year, 1, 1);
+        }
+
+        public ICollection<IncomeStatement> IncomeStatement(DateTime? from = default(DateTime?), DateTime? to = default(DateTime?), AccountingBasis basis = AccountingBasis.Accrual)
+        {
+            // Exclude ClosingEntries so closed-year P&L still shows operating activity.
+            var balances = TrialBalanceExcludingClosingEntries(from, to, basis).ToDictionary(a => a.AccountId);
+            return _accountRepo.Table.Where(a => a.AccountClassId == 4 || a.AccountClassId == 5)
+                .Select(a => new { a.Id, a.AccountClassId, a.AccountCode, a.AccountName })
+                .ToList()
+                .Select(a =>
+                {
+                    TrialBalance balance;
+                    var net = balances.TryGetValue(a.Id, out balance) ? balance.Debit - balance.Credit : 0m;
+                    return new IncomeStatement
+                    {
+                        AccountId = a.Id,
+                        AccountCode = a.AccountCode,
+                        AccountName = a.AccountName,
+                        IsExpense = a.AccountClassId == 5,
+                        Amount = a.AccountClassId == 5 ? net : -net
+                    };
+                }).OrderBy(a => a.AccountCode).ToList();
+        }
+
+        public CashFlowStatement CashFlow(DateTime? from = default(DateTime?), DateTime? to = default(DateTime?), AccountingBasis basis = AccountingBasis.Accrual)
+        {
+            if (from.HasValue && to.HasValue && from.Value > to.Value)
+                throw new ArgumentException("The start date must not be after the end date.");
+
+            var accounts = _accountRepo.Table
+                .Where(a => a.AccountClassId >= 1 && a.AccountClassId <= 5)
+                .ToList();
+
+            var accountLookup = accounts.ToDictionary(a => a.Id);
+
+            bool IsCashAccount(Account a) =>
+                a.IsCash || (a.ParentAccountId.HasValue && accountLookup.TryGetValue(a.ParentAccountId.Value, out var parent) && parent.IsCash);
+
+            // Closing balances as of 'to' (position statement valuation rules)
+            var closingBalances = TrialBalance(null, to, basis).ToDictionary(a => a.AccountId);
+
+            // Opening cash = closing cash as of day before 'from' (or zero if no prior activity / no 'from')
+            var openingBalances = from.HasValue
+                ? TrialBalance(null, from.Value.AddTicks(-1), basis).ToDictionary(a => a.AccountId)
+                : new Dictionary<int, TrialBalance>();
+
+            var startingCash = accounts
+                .Where(IsCashAccount)
+                .Sum(a => openingBalances.TryGetValue(a.Id, out var b) ? b.Debit - b.Credit : 0m);
+
+            var endingCash = accounts
+                .Where(IsCashAccount)
+                .Sum(a => closingBalances.TryGetValue(a.Id, out var b) ? b.Debit - b.Credit : 0m);
+
+            var netChangeInCash = endingCash - startingCash;
+
+            var result = new CashFlowStatement
+            {
+                FromDate = from,
+                ToDate = to,
+                AccountingBasis = basis,
+                StartingCash = startingCash,
+                EndingCash = endingCash,
+                NetChangeInCash = netChangeInCash
+            };
+
+            if (basis == AccountingBasis.Cash)
+            {
+                result.Message = "Statement of Cash Flows is designed for Accrual basis to reconcile accrual net income to cash flows. Under Cash basis, operating activities already mirror cash collections and disbursements.";
+                return result;
+            }
+
+            // Period activity between 'from' and 'to'
+            var periodBalances = TrialBalance(from, to, basis).ToDictionary(a => a.AccountId);
+
+            // 1. Period Net Income (same basis rules as IncomeStatement)
+            var incomeItems = IncomeStatement(from, to, basis);
+            var totalRevenue = incomeItems.Where(i => !i.IsExpense).Sum(i => i.Amount);
+            var totalExpense = incomeItems.Where(i => i.IsExpense).Sum(i => i.Amount);
+            var netIncome = totalRevenue - totalExpense;
+            result.NetIncome = netIncome;
+
+            var glSetting = GetGeneralLedgerSetting();
+
+            // Classify non-cash balance sheet accounts (RE and accum. depreciation are journal-split below)
+            foreach (var account in accounts.Where(a => a.AccountClassId <= 3 && !IsCashAccount(a)).OrderBy(a => a.AccountCode))
+            {
+                if (IsRetainedEarningsOrSummaryAccount(account, glSetting)
+                    || IsAccumulatedDepreciationOrAmortizationAccount(account, accountLookup))
+                    continue;
+
+                if (!periodBalances.TryGetValue(account.Id, out var pBal))
+                    continue;
+
+                // In double-entry accounting, non-cash balance sheet cash contribution is Credit - Debit.
+                var cashContribution = pBal.Credit - pBal.Debit;
+                if (cashContribution == 0m)
+                    continue;
+
+                var (category, lineType) = ClassifyCashFlowAccount(account, accountLookup, glSetting);
+                var line = new CashFlowLine
+                {
+                    AccountId = account.Id,
+                    AccountCode = account.AccountCode,
+                    AccountName = account.AccountName,
+                    LineType = lineType,
+                    Amount = cashContribution
+                };
+
+                switch (category)
+                {
+                    case CashFlowCategory.OperatingNonCash:
+                    case CashFlowCategory.OperatingWorkingCapital:
+                    case CashFlowCategory.OperatingRetainedEarnings:
+                        result.OperatingActivities.Add(line);
+                        break;
+                    case CashFlowCategory.Investing:
+                        result.InvestingActivities.Add(line);
+                        break;
+                    case CashFlowCategory.Financing:
+                        result.FinancingActivities.Add(line);
+                        break;
+                }
+            }
+
+            AddRetainedEarningsClosingAndDistributionLines(result, accounts, glSetting, from, to);
+            AddAccumulatedDepreciationCashFlowLines(result, accounts, accountLookup, from, to);
+            ReclassifyDisposalGainsAndLosses(result, incomeItems);
+
+            result.OperatingCashFlow = netIncome + result.OperatingActivities.Sum(a => a.Amount);
+            result.InvestingCashFlow = result.InvestingActivities.Sum(a => a.Amount);
+            result.FinancingCashFlow = result.FinancingActivities.Sum(a => a.Amount);
+
+            return result;
+        }
+
+        private enum CashFlowCategory
+        {
+            OperatingNonCash,
+            OperatingWorkingCapital,
+            OperatingRetainedEarnings,
+            Investing,
+            Financing
+        }
+
+        private static bool IsDescendantOf(Account a, string ancestorCode, IReadOnlyDictionary<int, Account> lookup)
+        {
+            var current = a;
+            while (current.ParentAccountId.HasValue && lookup.TryGetValue(current.ParentAccountId.Value, out var parent))
+            {
+                if (string.Equals(parent.AccountCode, ancestorCode, StringComparison.OrdinalIgnoreCase))
+                    return true;
+                current = parent;
+            }
+            return false;
+        }
+
+        private static bool HasAncestorMatching(Account a, Func<Account, bool> predicate, IReadOnlyDictionary<int, Account> lookup)
+        {
+            var current = a;
+            while (current.ParentAccountId.HasValue && lookup.TryGetValue(current.ParentAccountId.Value, out var parent))
+            {
+                if (predicate(parent))
+                    return true;
+                current = parent;
+            }
+            return false;
+        }
+
+        private static (CashFlowCategory Category, string LineType) ClassifyCashFlowAccount(
+            Account account,
+            IReadOnlyDictionary<int, Account> accountLookup,
+            GeneralLedgerSetting glSetting)
+        {
+            var code = account.AccountCode ?? string.Empty;
+            var name = account.AccountName?.ToLowerInvariant() ?? string.Empty;
+
+            // 1. Contra-assets / Non-cash depreciation & amortization adjustments
+            if (account.IsContraAccount
+                || HasAncestorMatching(account, p => p.IsContraAccount || p.AccountCode == "14000", accountLookup)
+                || code.StartsWith("14")
+                || name.Contains("depreciation")
+                || name.Contains("amortization")
+                || name.Contains("allowance for doubtful")
+                || name.Contains("allowance for bad"))
+            {
+                return (CashFlowCategory.OperatingNonCash, CashFlowLineTypes.NonCashAdjustment);
+            }
+
+            // 2. Assets (AccountClassId == 1)
+            if (account.AccountClassId == 1)
+            {
+                // Current assets (10100 parent or working capital) are operating
+                bool isUnderCurrentAssets = IsDescendantOf(account, "10100", accountLookup);
+
+                // Investing assets: Noncurrent / Fixed assets (10200 / 10300) or explicit capital assets
+                bool isUnderFixedOrNoncurrent = IsDescendantOf(account, "10300", accountLookup)
+                    || IsDescendantOf(account, "10200", accountLookup)
+                    || HasAncestorMatching(account, p =>
+                    {
+                        var pName = p.AccountName?.ToLowerInvariant() ?? string.Empty;
+                        return pName.Contains("fixed asset") || pName.Contains("noncurrent") || pName.Contains("non-current");
+                    }, accountLookup);
+
+                if (!isUnderCurrentAssets && (isUnderFixedOrNoncurrent
+                    || code.StartsWith("13")
+                    || code.StartsWith("103")
+                    || name.Contains("fixed asset")
+                    || name.Contains("plant")
+                    || name.Contains("equipment")
+                    || name.Contains("machinery")
+                    || name.Contains("furniture")
+                    || name.Contains("vehicle")
+                    || name.Contains("building")
+                    || name.Contains("land")
+                    || name.Contains("property")
+                    || name.Contains("long-term investment")
+                    || name.Contains("non-current investment")
+                    || name.Contains("intangible asset")
+                    || name.Contains("patent")
+                    || name.Contains("trademark")))
+                {
+                    return (CashFlowCategory.Investing, CashFlowLineTypes.Investing);
+                }
+
+                // Working capital assets (receivables, inventory, prepaid, advances, clearing, 15000 other assets, etc.)
+                return (CashFlowCategory.OperatingWorkingCapital, CashFlowLineTypes.WorkingCapital);
+            }
+
+            // 3. Liabilities (AccountClassId == 2)
+            if (account.AccountClassId == 2)
+            {
+                // Current liabilities (20100 parent, trade payables, accrued expenses, taxes, etc.) are working capital
+                bool isUnderCurrentLiabilities = IsDescendantOf(account, "20100", accountLookup);
+
+                // Financing liabilities: Non-current liabilities (20500, 20600) or explicit long-term borrowings
+                bool isUnderLongTerm = IsDescendantOf(account, "20500", accountLookup)
+                    || IsDescendantOf(account, "20600", accountLookup)
+                    || HasAncestorMatching(account, p =>
+                    {
+                        var pName = p.AccountName?.ToLowerInvariant() ?? string.Empty;
+                        return pName.Contains("non-current") || pName.Contains("noncurrent") || pName.Contains("long-term") || pName.Contains("long term");
+                    }, accountLookup);
+
+                if (!isUnderCurrentLiabilities && (isUnderLongTerm
+                    || code.StartsWith("205")
+                    || code.StartsWith("206")
+                    || name.Contains("long-term")
+                    || name.Contains("long term")
+                    || name.Contains("bonds payable")
+                    || name.Contains("mortgage")
+                    || name.Contains("term loan")
+                    || name.Contains("debenture")))
+                {
+                    return (CashFlowCategory.Financing, CashFlowLineTypes.Financing);
+                }
+
+                // Working capital liabilities: payables, accruals, customer advances, sales tax, other current liabilities
+                return (CashFlowCategory.OperatingWorkingCapital, CashFlowLineTypes.WorkingCapital);
+            }
+
+            // 4. Equity (AccountClassId == 3)
+            // Retained-earnings family is handled in AddRetainedEarningsClosingAndDistributionLines
+            // (closing → operating; dividends/distributions → financing). Fallback if reached:
+            if (IsRetainedEarningsOrSummaryAccount(account, glSetting))
+                return (CashFlowCategory.OperatingRetainedEarnings, CashFlowLineTypes.Operating);
+
+            // Financing equity: Member capital, capital surplus, share capital, owner draws, capital contributions
+            return (CashFlowCategory.Financing, CashFlowLineTypes.Financing);
+        }
+
+        private static bool IsRetainedEarningsOrSummaryAccount(Account account, GeneralLedgerSetting glSetting)
+        {
+            var code = account.AccountCode ?? string.Empty;
+            var name = account.AccountName?.ToLowerInvariant() ?? string.Empty;
+            return (glSetting != null && glSetting.PermanentAccountId.HasValue && account.Id == glSetting.PermanentAccountId.Value)
+                || (glSetting != null && glSetting.IncomeSummaryAccountId.HasValue && account.Id == glSetting.IncomeSummaryAccountId.Value)
+                || code == "30300"
+                || code == "30400"
+                || code == "30500"
+                || code == "30820"
+                || code == "99999"
+                || name.Contains("retained surplus")
+                || name.Contains("retained earnings")
+                || name.Contains("accumulated profit")
+                || name.Contains("accumulated loss")
+                || name.Contains("income summary")
+                || name.Contains("prior period adjustment");
+        }
+
+        private static bool IsAccumulatedDepreciationOrAmortizationAccount(
+            Account account,
+            IReadOnlyDictionary<int, Account> accountLookup)
+        {
+            var code = account.AccountCode ?? string.Empty;
+            var name = account.AccountName?.ToLowerInvariant() ?? string.Empty;
+            return account.IsContraAccount
+                && (code.StartsWith("14")
+                    || HasAncestorMatching(account, p => p.AccountCode == "14000", accountLookup)
+                    || name.Contains("accumulated depreciation")
+                    || name.Contains("accum depreciation")
+                    || name.Contains("accumulated amortisation")
+                    || name.Contains("accumulated amortization"));
+        }
+
+        /// <summary>
+        /// True for gains/losses on disposal of long-lived / investing assets (ASC 230 / IAS 7).
+        /// Excludes inventory and trading gains that belong in operating cash flows.
+        /// </summary>
+        private static bool IsDisposalGainOrLossAccount(string accountName, bool isExpense)
+        {
+            var name = accountName?.ToLowerInvariant() ?? string.Empty;
+            if (name.Contains("inventory") || name.Contains("merchandise") || name.Contains("trading"))
+                return false;
+
+            var stem = isExpense ? "loss on" : "gain on";
+            if (!name.Contains(stem))
+                return false;
+
+            return name.Contains("disposal")
+                || name.Contains("fixed asset")
+                || name.Contains("equipment")
+                || name.Contains("vehicle")
+                || name.Contains("building")
+                || name.Contains("land")
+                || name.Contains("plant")
+                || name.Contains("ppe")
+                || name.Contains("property")
+                || name.Contains("investment")
+                || name.Contains("asset");
+        }
+
+        /// <summary>
+        /// IAS 7 / ASC 230: period-close of earnings into RE is operating; cash dividends and
+        /// other distributions that debit permanent equity without touching P&amp;L are financing.
+        /// Closing journals are detected when the same GL header also posts to revenue, expense,
+        /// or income summary (or the journal voucher type is ClosingEntries).
+        /// </summary>
+        private void AddRetainedEarningsClosingAndDistributionLines(
+            CashFlowStatement result,
+            IList<Account> accounts,
+            GeneralLedgerSetting glSetting,
+            DateTime? from,
+            DateTime? to)
+        {
+            var retainedAccounts = accounts
+                .Where(a => IsRetainedEarningsOrSummaryAccount(a, glSetting))
+                .OrderBy(a => a.AccountCode)
+                .ToList();
+            if (retainedAccounts.Count == 0)
+                return;
+
+            var retainedIds = retainedAccounts.Select(a => a.Id).ToHashSet();
+            var incomeSummaryId = glSetting?.IncomeSummaryAccountId;
+
+            var closingGlHeaderIds = (_journalEntryRepo?.Table ?? Enumerable.Empty<JournalEntryHeader>().AsQueryable())
+                .Where(j => j.VoucherType == JournalVoucherTypes.ClosingEntries && j.GeneralLedgerHeaderId.HasValue)
+                .Select(j => j.GeneralLedgerHeaderId.Value)
+                .ToHashSet();
+
+            var lines = _generalLedgerLineRepository.Table.AsQueryable();
+            if (from.HasValue)
+                lines = lines.Where(l => l.GeneralLedgerHeader.Date >= from.Value);
+            if (to.HasValue)
+                lines = lines.Where(l => l.GeneralLedgerHeader.Date <= to.Value);
+
+            var periodLines = lines
+                .Where(l => retainedIds.Contains(l.AccountId)
+                    || l.Account.AccountClassId == (int)AccountClasses.Revenue
+                    || l.Account.AccountClassId == (int)AccountClasses.Expense
+                    || (incomeSummaryId.HasValue && l.AccountId == incomeSummaryId.Value))
+                .Select(l => new
+                {
+                    l.GeneralLedgerHeaderId,
+                    l.AccountId,
+                    l.DrCr,
+                    l.Amount,
+                    AccountClassId = l.Account.AccountClassId
+                })
+                .ToList();
+
+            var linesByHeader = periodLines.GroupBy(l => l.GeneralLedgerHeaderId)
+                .ToDictionary(g => g.Key, g => g.ToList());
+
+            foreach (var account in retainedAccounts)
+            {
+                decimal closingContribution = 0m;
+                decimal distributionContribution = 0m;
+
+                foreach (var headerGroup in linesByHeader)
+                {
+                    var headerLines = headerGroup.Value;
+                    var reLines = headerLines.Where(l => l.AccountId == account.Id).ToList();
+                    if (reLines.Count == 0)
+                        continue;
+
+                    var contribution = reLines.Sum(l => l.DrCr == DrOrCrSide.Cr ? l.Amount : -l.Amount);
+                    if (contribution == 0m)
+                        continue;
+
+                    var isClosing = closingGlHeaderIds.Contains(headerGroup.Key)
+                        || headerLines.Any(l =>
+                            l.AccountClassId == (int)AccountClasses.Revenue
+                            || l.AccountClassId == (int)AccountClasses.Expense
+                            || (incomeSummaryId.HasValue && l.AccountId == incomeSummaryId.Value));
+
+                    if (isClosing)
+                        closingContribution += contribution;
+                    else
+                        distributionContribution += contribution;
+                }
+
+                if (closingContribution != 0m)
+                {
+                    result.OperatingActivities.Add(new CashFlowLine
+                    {
+                        AccountId = account.Id,
+                        AccountCode = account.AccountCode,
+                        AccountName = account.AccountName,
+                        LineType = CashFlowLineTypes.Operating,
+                        Amount = closingContribution
+                    });
+                }
+
+                if (distributionContribution != 0m)
+                {
+                    result.FinancingActivities.Add(new CashFlowLine
+                    {
+                        AccountId = account.Id,
+                        AccountCode = account.AccountCode,
+                        AccountName = account.AccountName,
+                        LineType = CashFlowLineTypes.Financing,
+                        Amount = distributionContribution
+                    });
+                }
+            }
+        }
+
+        /// <summary>
+        /// Accumulated depreciation/amortization: credits from periodic depreciation (paired with
+        /// expense) are operating add-backs; debits/credits on disposal journals (no expense line)
+        /// belong in investing so net investing equals cash proceeds (ASC 230 / IAS 7).
+        /// </summary>
+        private void AddAccumulatedDepreciationCashFlowLines(
+            CashFlowStatement result,
+            IList<Account> accounts,
+            IReadOnlyDictionary<int, Account> accountLookup,
+            DateTime? from,
+            DateTime? to)
+        {
+            var accumAccounts = accounts
+                .Where(a => IsAccumulatedDepreciationOrAmortizationAccount(a, accountLookup))
+                .OrderBy(a => a.AccountCode)
+                .ToList();
+            if (accumAccounts.Count == 0)
+                return;
+
+            var accumIds = accumAccounts.Select(a => a.Id).ToHashSet();
+
+            var lines = _generalLedgerLineRepository.Table.AsQueryable();
+            if (from.HasValue)
+                lines = lines.Where(l => l.GeneralLedgerHeader.Date >= from.Value);
+            if (to.HasValue)
+                lines = lines.Where(l => l.GeneralLedgerHeader.Date <= to.Value);
+
+            var periodLines = lines
+                .Where(l => accumIds.Contains(l.AccountId)
+                    || l.Account.AccountClassId == (int)AccountClasses.Expense
+                    || l.Account.AccountClassId == (int)AccountClasses.Revenue
+                    || l.Account.AccountClassId == (int)AccountClasses.Assets)
+                .Select(l => new
+                {
+                    l.GeneralLedgerHeaderId,
+                    l.AccountId,
+                    l.DrCr,
+                    l.Amount,
+                    AccountClassId = l.Account.AccountClassId
+                })
+                .ToList();
+
+            var linesByHeader = periodLines.GroupBy(l => l.GeneralLedgerHeaderId)
+                .ToDictionary(g => g.Key, g => g.ToList());
+
+            foreach (var account in accumAccounts)
+            {
+                decimal operatingContribution = 0m;
+                decimal investingContribution = 0m;
+
+                foreach (var headerGroup in linesByHeader)
+                {
+                    var headerLines = headerGroup.Value;
+                    var accumLines = headerLines.Where(l => l.AccountId == account.Id).ToList();
+                    if (accumLines.Count == 0)
+                        continue;
+
+                    var contribution = accumLines.Sum(l => l.DrCr == DrOrCrSide.Cr ? l.Amount : -l.Amount);
+                    if (contribution == 0m)
+                        continue;
+
+                    // Depreciation/amortization entry pairs accum. credit with an expense debit.
+                    var isPeriodicDepreciation = headerLines.Any(l =>
+                        l.AccountClassId == (int)AccountClasses.Expense && l.AccountId != account.Id);
+
+                    if (isPeriodicDepreciation)
+                        operatingContribution += contribution;
+                    else
+                        investingContribution += contribution;
+                }
+
+                if (operatingContribution != 0m)
+                {
+                    result.OperatingActivities.Add(new CashFlowLine
+                    {
+                        AccountId = account.Id,
+                        AccountCode = account.AccountCode,
+                        AccountName = account.AccountName,
+                        LineType = CashFlowLineTypes.NonCashAdjustment,
+                        Amount = operatingContribution
+                    });
+                }
+
+                if (investingContribution != 0m)
+                {
+                    result.InvestingActivities.Add(new CashFlowLine
+                    {
+                        AccountId = account.Id,
+                        AccountCode = account.AccountCode,
+                        AccountName = account.AccountName,
+                        LineType = CashFlowLineTypes.Investing,
+                        Amount = investingContribution
+                    });
+                }
+            }
+        }
+
+        /// <summary>
+        /// Indirect method: remove gains (add back losses) on long-lived asset disposal from operating
+        /// and shift them into investing so investing reflects cash proceeds.
+        /// </summary>
+        private static void ReclassifyDisposalGainsAndLosses(
+            CashFlowStatement result,
+            ICollection<IncomeStatement> incomeItems)
+        {
+            foreach (var item in incomeItems)
+            {
+                if (item.Amount == 0m || !IsDisposalGainOrLossAccount(item.AccountName, item.IsExpense))
+                    continue;
+
+                if (!item.IsExpense)
+                {
+                    result.OperatingActivities.Add(new CashFlowLine
+                    {
+                        AccountId = item.AccountId,
+                        AccountCode = item.AccountCode,
+                        AccountName = item.AccountName,
+                        LineType = CashFlowLineTypes.NonCashAdjustment,
+                        Amount = -item.Amount
+                    });
+                    result.InvestingActivities.Add(new CashFlowLine
+                    {
+                        AccountId = item.AccountId,
+                        AccountCode = item.AccountCode,
+                        AccountName = item.AccountName,
+                        LineType = CashFlowLineTypes.Investing,
+                        Amount = item.Amount
+                    });
+                }
+                else
+                {
+                    result.OperatingActivities.Add(new CashFlowLine
+                    {
+                        AccountId = item.AccountId,
+                        AccountCode = item.AccountCode,
+                        AccountName = item.AccountName,
+                        LineType = CashFlowLineTypes.NonCashAdjustment,
+                        Amount = item.Amount
+                    });
+                    result.InvestingActivities.Add(new CashFlowLine
+                    {
+                        AccountId = item.AccountId,
+                        AccountCode = item.AccountCode,
+                        AccountName = item.AccountName,
+                        LineType = CashFlowLineTypes.Investing,
+                        Amount = -item.Amount
+                    });
+                }
+            }
+        }
+
+        public ICollection<MasterGeneralLedger> MasterGeneralLedger(DateTime? from = default(DateTime?),
+            DateTime? to = default(DateTime?),
+            string accountCode = null,
+            int? transactionNo = null)
+        {
+            if (_auth == null || !_auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsJournalView).Allowed)
+                return new List<MasterGeneralLedger>();
+
+            var allDr = (from dr in _generalLedgerLineRepository.GetAllIncluding(l => l.GeneralLedgerHeader, a => a.Account).AsEnumerable()
+                         where dr.DrCr == DrOrCrSide.Dr
+                         //&& GeneralLedgerHelper.IsBetween(dr.GLHeader.Date, (DateTime)fromDate, (DateTime)toDate) == true
+                         select new MasterGeneralLedger
+                         {
+                             Id = dr.Id,
+                             TransactionNo = dr.GeneralLedgerHeader.Id,
+                             AccountId = dr.AccountId,
+                             AccountCode = dr.Account.AccountCode,
+                             AccountName = dr.Account.AccountName,
+                             Date = dr.GeneralLedgerHeader.Date,
+                             Debit = dr.Amount,
+                             Credit = (decimal)0,
+                             //CurrencyId = dr.CurrencyId,
+                             DocumentType = Enum.GetName(typeof(DocumentTypes), dr.GeneralLedgerHeader.DocumentType)
+                         });
+
+            var allCr = (from cr in _generalLedgerLineRepository.GetAllIncluding(l => l.GeneralLedgerHeader, a => a.Account).AsEnumerable()
+                         where cr.DrCr == DrOrCrSide.Cr
+                         //&& GeneralLedgerHelper.IsBetween(cr.GLHeader.Date, (DateTime)fromDate, (DateTime)toDate) == true
+                         select new MasterGeneralLedger
+                         {
+                             Id = cr.Id,
+                             TransactionNo = cr.GeneralLedgerHeader.Id,
+                             AccountId = cr.AccountId,
+                             AccountCode = cr.Account.AccountCode,
+                             AccountName = cr.Account.AccountName,
+                             Date = cr.GeneralLedgerHeader.Date,
+                             Debit = (decimal)0,
+                             Credit = cr.Amount,
+                             //CurrencyId = cr.CurrencyId,
+                             DocumentType = Enum.GetName(typeof(DocumentTypes), cr.GeneralLedgerHeader.DocumentType)
+                         });
+
+            var allDrcr = (from x in allDr
+                           select new MasterGeneralLedger
+                           {
+                               Id = x.Id,
+                               TransactionNo = x.TransactionNo,
+                               AccountId = x.AccountId,
+                               AccountCode = x.AccountCode,
+                               AccountName = x.AccountName,
+                               Date = x.Date,
+                               Debit = x.Debit,
+                               Credit = (decimal)0,
+                               CurrencyId = x.CurrencyId,
+                               DocumentType = x.DocumentType
+                           }
+                          ).Concat(from y in allCr
+                                   select new MasterGeneralLedger
+                                   {
+                                       Id = y.Id,
+                                       TransactionNo = y.TransactionNo,
+                                       AccountId = y.AccountId,
+                                       AccountCode = y.AccountCode,
+                                       AccountName = y.AccountName,
+                                       Date = y.Date,
+                                       Debit = (decimal)0,
+                                       Credit = y.Credit,
+                                       CurrencyId = y.CurrencyId,
+                                       DocumentType = y.DocumentType
+                                   });
+
+            if (!string.IsNullOrEmpty(accountCode))
+                allDrcr = allDrcr.Where(a => a.AccountCode == accountCode);
+            if (transactionNo != null)
+                allDrcr = allDrcr.Where(a => a.TransactionNo == transactionNo);
+
+            var sortedList = allDrcr.OrderBy(gl => gl.Id).ToList().Reverse<MasterGeneralLedger>();
+
+            return sortedList.ToList();
+        }
+
+        public new IEnumerable<Bank> GetCashAndBanks()
+        {
+            var query = from b in _bankRepo.Table
+                        select b;
+            return query;
+        }
+
+        /// <summary>
+        /// Calculates input tax charged on purchases.
+        /// </summary>
+        /// <param name="itemId"></param>
+        /// <param name="quantity"></param>
+        /// <param name="amount"></param>
+        /// <returns></returns>
+        public List<KeyValuePair<int, decimal>> ComputeInputTax(int vendorId, int itemId, decimal quantity, decimal amount, decimal discount)
+        {
+            decimal taxAmount, amountXquantity, discountAmount = 0, subTotalAmount;
+
+            var taxes = new List<KeyValuePair<int, decimal>>();
+
+            amountXquantity = amount * quantity;
+
+            if (discount > 0)
+                discountAmount = (discount / 100) * amountXquantity;
+
+            subTotalAmount = amountXquantity - discountAmount;
+
+            var intersectionTaxes = _taxService.GetIntersectionTaxes(itemId, vendorId, PartyTypes.Vendor);
+
+            foreach (var tax in intersectionTaxes)
+            {
+                taxAmount = Math.Round(subTotalAmount - (subTotalAmount / (1 + (tax.Rate / 100))), 2, MidpointRounding.AwayFromZero);
+                taxes.Add(new KeyValuePair<int, decimal>(tax.Id, taxAmount));
+            }
+
+            return taxes;
+        }
+
+        /// <summary>
+        /// Calculates output tax charged on sales of goods and services.
+        /// </summary>
+        /// <param name="itemId"></param>
+        /// <param name="quantity"></param>
+        /// <param name="amount"></param>
+        /// <returns></returns>
+        public List<KeyValuePair<int, decimal>> ComputeOutputTax(int customerId, int itemId, decimal quantity, decimal amount, decimal discount)
+        {
+            decimal taxAmount, amountXquantity, discountAmount = 0, subTotalAmount;
+
+            var taxes = new List<KeyValuePair<int, decimal>>();
+
+            amountXquantity = amount * quantity;
+
+            if (discount > 0)
+                discountAmount = (discount / 100) * amountXquantity;
+
+            subTotalAmount = amountXquantity - discountAmount;
+
+            var intersectionTaxes = _taxService.GetIntersectionTaxes(itemId, customerId, PartyTypes.Customer);
+
+            foreach (var tax in intersectionTaxes)
+            {
+                taxAmount = Math.Round(subTotalAmount - (subTotalAmount / (1 + (tax.Rate / 100))), 2, MidpointRounding.AwayFromZero);
+                taxes.Add(new KeyValuePair<int, decimal>(tax.Id, taxAmount));
+            }
+
+            return taxes;
+        }
+
+        public GeneralLedgerSetting GetGeneralLedgerSetting()
+        {
+            return _glSettingRepo.Table.FirstOrDefault();
+        }
+
+        public void SaveGeneralLedgerSetting(GeneralLedgerSetting setting)
+        {
+            if (setting.Id == 0)
+                _glSettingRepo.Insert(setting);
+            else
+                _glSettingRepo.Update(setting);
+        }
+
+        public void AddMainContraAccountSetting(int mainAccountId, int contraAccountId)
+        {
+            var contraAccount = _accountRepo.GetById(contraAccountId);
+            var mainAccount = _accountRepo.GetById(mainAccountId);
+
+            if (mainAccountId == contraAccountId)
+                throw new Exception("Main account is same as contra account.");
+            if (!contraAccount.IsContraAccount)
+                throw new Exception("Account is not a contra account.");
+            if (_maincontraAccount.Table.Any(a => a.MainAccountId == mainAccountId))
+                throw new Exception("Main account already has contra account set.");
+
+            _maincontraAccount.Insert(new MainContraAccount() { MainAccountId = mainAccountId, RelatedContraAccountId = contraAccountId });
+        }
+
+        public void UpdateAccount(Account account)
+        {
+            if (_auth == null)
+                throw new InvalidOperationException("Authorization service dependency is required.");
+
+            var decision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsAccountsManage);
+            if (!decision.Allowed)
+                throw new InvalidOperationException(decision.SafeMessage ?? "Unauthorized to update account.");
+
+            if (account.IsContraAccount && account.ContraAccounts.Count > 0)
+                throw new Exception("An account cannot have contra account if the account is already contra account.");
+
+            if (GetAccounts().Any(a => a.AccountCode == account.AccountCode && a.Id != account.Id))
+                throw new Exception("Account code already exist.");
+
+            if (account.ParentAccountId.HasValue && account.ParentAccountId.Value != -1)
+            {
+                var parent = GetAccount(account.ParentAccountId.Value);
+                if (parent != null && account.Id == parent.ParentAccountId)
+                    throw new Exception("Cyclic parent/child account.");
+            }
+
+            _accountRepo.Update(account);
+        }
+
+        public void AddAccount(Account account)
+        {
+            if (_auth == null)
+                throw new InvalidOperationException("Authorization service dependency is required.");
+
+            var decision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsAccountsManage);
+            if (!decision.Allowed)
+                throw new InvalidOperationException(decision.SafeMessage ?? "Unauthorized to add account.");
+
+            if (account.IsContraAccount && account.ContraAccounts.Count > 0)
+                throw new Exception("An account cannot have contra account if the account is already contra account.");
+
+            if (GetAccounts().Any(a => a.AccountCode == account.AccountCode && a.Id != account.Id))
+                throw new Exception("Account code already exist.");
+
+            if (account.ParentAccountId.HasValue)
+            {
+                var parent = GetAccount(account.ParentAccountId.Value);
+                if (parent != null && account.Id == parent.ParentAccountId)
+                    throw new Exception("Cyclic parent/child account.");
+            }
+
+            _accountRepo.Insert(account);
+        }
+
+        public JournalEntryHeader GetJournalEntry(int id, bool fromGL = false)
+        {
+            if (_auth == null)
+                return null;
+
+            var decision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsJournalView);
+            if (!decision.Allowed)
+                return null;
+
+            if (fromGL)
+            {
+                var je = _journalEntryRepo.GetAllIncluding(j => j.GeneralLedgerHeader,
+                    j => j.JournalEntryLines,
+                    j => j.Party,
+                    j => j.AdjustsFiscalYear)
+                    .Where(j => j.GeneralLedgerHeaderId == id)
+                    .FirstOrDefault();
+                return je;
+            }
+            else
+            {
+                var je = _journalEntryRepo.GetAllIncluding(j => j.GeneralLedgerHeader,
+                    j => j.JournalEntryLines,
+                    j => j.Party,
+                    j => j.AdjustsFiscalYear)
+                    .Where(j => j.Id == id)
+                    .FirstOrDefault();
+                return je;
+            }
+        }
+
+        public void UpdateJournalEntry(JournalEntryHeader journalEntry, bool posted = false)
+        {
+            if (journalEntry == null)
+                throw new ArgumentNullException(nameof(journalEntry));
+            if (posted && journalEntry.Id > 0 && IsLinkedEntryMirrorJournal(journalEntry.CompanyId, journalEntry.Id)
+                && AllowLinkedEntryMirrorPostingDepth.Value <= 0)
+                throw new LinkedEntryOperationException("linked_entry_use_pair_reversal", "A linked mirror journal can only be posted through the linked entry service.");
+            if (!posted && journalEntry.Id > 0 && IsLinkedEntryJournal(journalEntry.CompanyId, journalEntry.Id))
+                throw new LinkedEntryOperationException("linked_entry_use_pair_reversal", "Linked journals must be corrected through the linked entry pair.");
+            if (journalEntry.Posted == true || journalEntry.GeneralLedgerHeaderId.HasValue)
+                throw new InvalidOperationException("Posted journal entries cannot be edited or posted again.");
+
+            if (_auth == null)
+                throw new InvalidOperationException("Authorization service dependency is required.");
+
+            string aprHeader = null;
+            string approverHeader = null;
+            string entryFingerprint = null;
+            string persistedPreparer = null;
+            string effectivePreparer = null;
+            Core.Authorization.AccessResourceContext postResource = null;
+            if (posted)
+            {
+                if (journalEntry.VoucherType == JournalVoucherTypes.ClosingEntries && AllowClosingEntriesDepth.Value > 0)
+                {
+                    var closeDecision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsPeriodsClose);
+                    if (!closeDecision.Allowed)
+                        throw new InvalidOperationException(closeDecision.SafeMessage ?? "Unauthorized to close fiscal period.");
+                }
+                else
+                {
+                    if (_auditLogRepo != null && journalEntry.Id > 0)
+                    {
+                        var idStr = journalEntry.Id.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                        persistedPreparer = _auditLogRepo.Table
+                            .Where(a => a.TableName == "__JournalEntryPreparer" && a.RecordId == idStr)
+                            .OrderByDescending(a => a.Id)
+                            .Select(a => a.NewValue)
+                            .FirstOrDefault();
+                    }
+
+                    var actor = _auth.ResolveActorContext();
+                    effectivePreparer = persistedPreparer ?? actor?.UserId ?? "system:draft-preparer";
+
+                    var req = _httpContextAccessor?.HttpContext?.Request;
+                    aprHeader = AllowLinkedEntryMirrorPostingDepth.Value > 0 ? null : req?.Headers["X-Approval-Request-Id"].FirstOrDefault();
+                    approverHeader = AllowLinkedEntryMirrorPostingDepth.Value > 0 ? null : req?.Headers["X-Approved-By-User-Id"].FirstOrDefault();
+
+                    entryFingerprint = Core.Authorization.AccessJournalFingerprint.Compute(
+                        journalEntry.Date,
+                        journalEntry.Memo,
+                        (int)(journalEntry.VoucherType ?? 0),
+                        journalEntry.JournalEntryLines.Select(l => (l.AccountId, l.DrCr, l.Amount, l.Memo)));
+
+                    if (_journalEntryRepo != null && journalEntry.Id > 0)
+                    {
+                        var storedDraft = _journalEntryRepo.GetById(journalEntry.Id);
+                        if (storedDraft != null)
+                        {
+                            var storedFingerprint = Core.Authorization.AccessJournalFingerprint.Compute(
+                                storedDraft.Date,
+                                storedDraft.Memo,
+                                (int)(storedDraft.VoucherType ?? 0),
+                                storedDraft.JournalEntryLines.Select(l => (l.AccountId, l.DrCr, l.Amount, l.Memo)));
+                            if (!string.Equals(entryFingerprint, storedFingerprint, StringComparison.Ordinal))
+                            {
+                                throw new InvalidOperationException("The in-memory journal entry content differs from the approved stored draft. Any changes must be saved as a draft and re-approved before posting.");
+                            }
+                        }
+                    }
+
+                    var isAlreadyPosted = journalEntry.Posted == true || journalEntry.GeneralLedgerHeaderId.HasValue;
+                    postResource = new Core.Authorization.AccessResourceContext
+                    {
+                        WorkspaceCompanyId = journalEntry.CompanyId > 0 ? journalEntry.CompanyId : null,
+                        ResourceCompanyId = journalEntry.CompanyId > 0 ? journalEntry.CompanyId : null,
+                        ResourceType = "JournalEntry",
+                        ResourceId = journalEntry.Id > 0 ? journalEntry.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) : null,
+                        ResourceFingerprint = entryFingerprint,
+                        WorkflowState = isAlreadyPosted ? "Posted" : "Draft",
+                        IsPeriodLockedOrClosed = false,
+                        PreparedByUserId = effectivePreparer,
+                        IndependentApproverUserId = approverHeader,
+                        ApprovalRequestId = aprHeader
+                    };
+
+                    var decision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsJournalPost, postResource);
+                    if (!decision.Allowed)
+                        throw new InvalidOperationException(decision.SafeMessage ?? "Unauthorized to post journal entry.");
+                }
+            }
+            else
+            {
+                if (journalEntry.VoucherType == JournalVoucherTypes.ClosingEntries && AllowClosingEntriesDepth.Value > 0)
+                {
+                    var closeDecision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsPeriodsClose);
+                    if (!closeDecision.Allowed)
+                        throw new InvalidOperationException(closeDecision.SafeMessage ?? "Unauthorized to close fiscal period.");
+                }
+                else
+                {
+                    var editResource = new Core.Authorization.AccessResourceContext
+                    {
+                        WorkspaceCompanyId = journalEntry.CompanyId > 0 ? journalEntry.CompanyId : null,
+                        ResourceCompanyId = journalEntry.CompanyId > 0 ? journalEntry.CompanyId : null,
+                        ResourceType = "JournalEntry",
+                        ResourceId = journalEntry.Id > 0 ? journalEntry.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) : null,
+                        WorkflowState = "Draft"
+                    };
+                    var decision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsJournalCreate, editResource);
+                    if (!decision.Allowed)
+                        throw new InvalidOperationException(decision.SafeMessage ?? "Unauthorized to update journal entry.");
+
+                    if (_auditLogRepo != null && journalEntry.Id > 0)
+                    {
+                        var idStr = journalEntry.Id.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                        var pendingApprovals = _auditLogRepo.Table
+                            .Where(a => a.TableName == "__AccessDelegationApproval" &&
+                                        a.OriginalValue == "Approved")
+                            .ToList();
+
+                        foreach (var row in pendingApprovals)
+                        {
+                            if (string.IsNullOrWhiteSpace(row.NewValue)) continue;
+                            try
+                            {
+                                var p = System.Text.Json.JsonSerializer.Deserialize<Core.Authorization.PersistedAccessApprovalPayload>(row.NewValue);
+                                if (p != null &&
+                                    string.Equals(p.OperationKey, Core.Authorization.AccessOperationCatalog.FinancialsJournalPost, StringComparison.Ordinal) &&
+                                    string.Equals(p.ResourceId, idStr, StringComparison.Ordinal))
+                                {
+                                    row.OriginalValue = "Revoked";
+                                    p.Status = "Revoked";
+                                    row.NewValue = System.Text.Json.JsonSerializer.Serialize(p);
+                                    _auditLogRepo.Update(row);
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+                }
+            }
+
+            ValidateJournalVoucherRules(journalEntry);
+
+            if (posted)
+            {
+                if (journalEntry.JournalEntryLines.Count < 2
+                    || journalEntry.JournalEntryLines.Any(l => l.Amount <= 0
+                        || (l.DrCr != DrOrCrSide.Dr && l.DrCr != DrOrCrSide.Cr)))
+                    throw new InvalidOperationException("Posting requires at least two positive debit or credit lines.");
+
+                var isClosingEntry = journalEntry.VoucherType == JournalVoucherTypes.ClosingEntries && AllowClosingEntriesDepth.Value > 0;
+
+                Action executePosting = () =>
+                {
+                    // Reload fresh state from DB under the coordination guard to prevent concurrent duplicate posts or stale content.
+                    if (journalEntry.Id > 0 && _journalEntryRepo != null)
+                    {
+                        var fresh = _journalEntryRepo.TableNoTracking
+                            .FirstOrDefault(j => j.Id == journalEntry.Id);
+                        if (fresh == null)
+                            throw new InvalidOperationException("Journal entry not found.");
+                        if (fresh.Posted == true || fresh.GeneralLedgerHeaderId.HasValue)
+                            throw new InvalidOperationException("Posted journal entries cannot be edited or posted again.");
+
+                        var freshLines = _journalEntryLineRepo != null
+                            ? _journalEntryLineRepo.TableNoTracking.Where(l => l.JournalEntryHeaderId == journalEntry.Id).ToList()
+                            : new List<JournalEntryLine>();
+                        if (freshLines.Count == 0 && fresh.JournalEntryLines != null && fresh.JournalEntryLines.Count > 0)
+                        {
+                            freshLines = fresh.JournalEntryLines.ToList();
+                        }
+
+                        var freshFingerprint = Core.Authorization.AccessJournalFingerprint.Compute(
+                            fresh.Date,
+                            fresh.Memo,
+                            (int)(fresh.VoucherType ?? 0),
+                            freshLines.Select(l => (l.AccountId, l.DrCr, l.Amount, l.Memo)));
+
+                        var memoryFingerprint = Core.Authorization.AccessJournalFingerprint.Compute(
+                            journalEntry.Date,
+                            journalEntry.Memo,
+                            (int)(journalEntry.VoucherType ?? 0),
+                            journalEntry.JournalEntryLines.Select(l => (l.AccountId, l.DrCr, l.Amount, l.Memo)));
+
+                        if (!string.Equals(memoryFingerprint, freshFingerprint, StringComparison.Ordinal))
+                        {
+                            throw new InvalidOperationException("The in-memory journal entry content differs from the stored draft. Please reload and try again.");
+                        }
+                    }
+                    if (journalEntry.Id > 0 && _generalLedgerRepository != null)
+                    {
+                        if (_generalLedgerRepository.Table.Any(h => h.CompanyId == journalEntry.CompanyId && h.DocumentType == DocumentTypes.JournalEntry && h.SourceDocumentId == journalEntry.Id))
+                            throw new InvalidOperationException("A general ledger header already exists for this journal entry.");
+                    }
+
+                    // Reload latest persisted preparer under the guard to guard against concurrent edits changing preparer.
+                    if (_auditLogRepo != null && journalEntry.Id > 0)
+                    {
+                        var idStr = journalEntry.Id.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                        var freshPreparer = _auditLogRepo.TableNoTracking
+                            .Where(a => a.TableName == "__JournalEntryPreparer" && a.RecordId == idStr)
+                            .OrderByDescending(a => a.Id)
+                            .Select(a => a.NewValue)
+                            .FirstOrDefault();
+                        if (!string.IsNullOrEmpty(freshPreparer))
+                        {
+                            effectivePreparer = freshPreparer;
+                        }
+                    }
+
+                    entryFingerprint = Core.Authorization.AccessJournalFingerprint.Compute(
+                        journalEntry.Date,
+                        journalEntry.Memo,
+                        (int)(journalEntry.VoucherType ?? 0),
+                        journalEntry.JournalEntryLines.Select(l => (l.AccountId, l.DrCr, l.Amount, l.Memo)));
+
+                    var guardedPostResource = new Core.Authorization.AccessResourceContext
+                    {
+                        WorkspaceCompanyId = journalEntry.CompanyId > 0 ? journalEntry.CompanyId : null,
+                        ResourceCompanyId = journalEntry.CompanyId > 0 ? journalEntry.CompanyId : null,
+                        ResourceType = "JournalEntry",
+                        ResourceId = journalEntry.Id > 0 ? journalEntry.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) : null,
+                        ResourceFingerprint = entryFingerprint,
+                        WorkflowState = "Draft",
+                        IsPeriodLockedOrClosed = _booksLockGuard?.IsDateLocked(journalEntry.Date) == true,
+                        PreparedByUserId = effectivePreparer,
+                        IndependentApproverUserId = approverHeader,
+                        ApprovalRequestId = aprHeader
+                    };
+
+                    Core.Authorization.EffectiveApprovalRule liveRule = null;
+                    if (!isClosingEntry && _approvalPolicyResolver != null && journalEntry.CompanyId > 0)
+                    {
+                        liveRule = _approvalPolicyResolver.Resolve(
+                            journalEntry.CompanyId,
+                            Core.Authorization.AccessOperationCatalog.FinancialsJournalPost);
+                    }
+
+                    if (_auth != null)
+                    {
+                        var liveDecision = isClosingEntry
+                            ? _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsPeriodsClose, guardedPostResource)
+                            : _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsJournalPost, guardedPostResource);
+
+                        Core.Authorization.WorkspacePolicyTestGate.AfterAuthorizationRead?.Invoke(journalEntry.CompanyId);
+
+                        if (!liveDecision.Allowed)
+                        {
+                            journalEntry.Posted = false;
+                            journalEntry.GeneralLedgerHeader = null;
+                            journalEntry.GeneralLedgerHeaderId = null;
+                            _journalEntryRepo.Update(journalEntry);
+                            throw new InvalidOperationException(liveDecision.SafeMessage ?? "Unauthorized to post journal entry.");
+                        }
+                    }
+
+                    if (journalEntry.GeneralLedgerHeaderId == null || journalEntry.GeneralLedgerHeaderId == 0)
+                    {
+                        EnsureOnOrAfterBooksStart(journalEntry.Date);
+                        var glEntry = new GeneralLedgerHeader()
+                        {
+                            Date = journalEntry.Date,
+                            DocumentType = DocumentTypes.JournalEntry,
+                            Description = journalEntry.Memo,
+                            SourceDocumentId = journalEntry.Id > 0 ? journalEntry.Id : null,
+                        };
+
+                        foreach (var je in journalEntry.JournalEntryLines)
+                        {
+                            glEntry.GeneralLedgerLines.Add(new GeneralLedgerLine()
+                            {
+                                Account = GetAccounts().Where(a => a.Id == je.AccountId).FirstOrDefault(),
+                                AccountId = je.AccountId,
+                                DrCr = je.DrCr,
+                                Amount = je.Amount,
+                            });
+                        }
+
+                        if (ValidateGeneralLedgerEntry(glEntry))
+                        {
+                            journalEntry.GeneralLedgerHeader = glEntry;
+                            journalEntry.Posted = true;
+
+                            if (_auditLogRepo != null && !string.IsNullOrWhiteSpace(aprHeader) && AllowLinkedEntrySourcePostingDepth.Value <= 0)
+                            {
+                                var approvalRow = _auditLogRepo.Table
+                                    .FirstOrDefault(a => a.CompanyId == journalEntry.CompanyId &&
+                                                        a.TableName == "__AccessDelegationApproval" &&
+                                                        a.RecordId == aprHeader &&
+                                                        a.OriginalValue == "Approved");
+                                if (approvalRow == null)
+                                {
+                                    throw new InvalidOperationException("The independent approval for posting could not be found or is not in Approved state.");
+                                }
+
+                                var p = System.Text.Json.JsonSerializer.Deserialize<Core.Authorization.PersistedAccessApprovalPayload>(approvalRow.NewValue);
+                                if (p == null)
+                                {
+                                    throw new InvalidOperationException("The independent approval payload is invalid.");
+                                }
+
+                                if (!string.Equals(p.OperationKey, Core.Authorization.AccessOperationCatalog.FinancialsJournalPost, StringComparison.Ordinal))
+                                {
+                                    throw new InvalidOperationException("The approval is not for journal entry posting.");
+                                }
+
+                                if (journalEntry.Id > 0 && !string.IsNullOrWhiteSpace(p.ResourceId) &&
+                                    !string.Equals(p.ResourceId, journalEntry.Id.ToString(System.Globalization.CultureInfo.InvariantCulture), StringComparison.Ordinal))
+                                {
+                                    throw new InvalidOperationException("The independent approval is for a different journal entry.");
+                                }
+
+                                if (p.ExpiresAtUtc <= DateTimeOffset.UtcNow)
+                                {
+                                    throw new InvalidOperationException("The independent approval has expired.");
+                                }
+
+                                if (!string.IsNullOrWhiteSpace(p.ResourceFingerprint) && !string.Equals(p.ResourceFingerprint, entryFingerprint, StringComparison.Ordinal))
+                                {
+                                    throw new InvalidOperationException("The independent approval content fingerprint does not match the journal entry being posted.");
+                                }
+                                approvalRow.OriginalValue = "Consumed";
+                                p.Status = "Consumed";
+                                approvalRow.NewValue = System.Text.Json.JsonSerializer.Serialize(p);
+                                _auditLogRepo.Update(approvalRow);
+                            }
+
+                            if (!isClosingEntry)
+                            {
+                                RecordJournalPostingAuthorizationEvidence(
+                                    journalEntry,
+                                    entryFingerprint,
+                                    effectivePreparer: effectivePreparer
+                                        ?? _auth.ResolveActorContext()?.UserId
+                                        ?? "system:draft-preparer",
+                                    posterUserId: _auth.ResolveActorContext()?.UserId,
+                                    independentApprovalRequestId: aprHeader,
+                                    resolvedRule: liveRule);
+                            }
+                        }
+                    }
+
+                    _journalEntryRepo.Update(journalEntry);
+                };
+
+                if (journalEntry.CompanyId > 0)
+                {
+                    if (_policyTransaction == null)
+                        throw new InvalidOperationException("Workspace policy transaction service is required to post journal entries.");
+
+                    _policyTransaction.Execute(journalEntry.CompanyId, guard =>
+                    {
+                        executePosting();
+
+                        if (guard.Settings.InitializedAtUtc.HasValue)
+                        {
+                            // Write the durable first-action marker atomically with the posting (inside the
+                            // guard, under the coordination lock). Emit the histogram ONLY after the owning
+                            // transaction commits — whether this Execute owns it or joins a controller tx —
+                            // by enqueuing the emission. A rollback discards both marker and emission.
+                            var established = Core.Authorization.WorkspaceFirstActionEvidence.TryRecordFirstUsefulAction(
+                                _auditLogRepo,
+                                journalEntry.CompanyId,
+                                Core.Authorization.WorkspaceOperatingPolicyMetrics.ActionLabels.JournalPost,
+                                _auth?.ResolveActorContext()?.UserId,
+                                guard.Settings.InitializedAtUtc.Value,
+                                DateTime.UtcNow);
+                            if (established)
+                            {
+                                var d = (DateTime.UtcNow - guard.Settings.InitializedAtUtc.Value).TotalSeconds;
+                                var duration = d < 0 ? 0 : d;
+                                _policyTransaction.EnqueuePostCommit(() =>
+                                    Core.Authorization.WorkspaceOperatingPolicyMetrics.FirstUsefulActionDuration.Record(
+                                        duration,
+                                        new KeyValuePair<string, object?>("action", Core.Authorization.WorkspaceOperatingPolicyMetrics.ActionLabels.JournalPost)));
+                            }
+                        }
+                    });
+                }
+                else
+                {
+                    executePosting();
+                }
+            }
+            else
+            {
+                _journalEntryRepo.Update(journalEntry);
+            }
+        }
+
+        private bool IsLinkedEntryJournal(int companyId, int journalId) => _linkedEntryPairRepo != null &&
+            _linkedEntryPairRepo.Table.Any(p => (p.SourceCompanyId == companyId && p.SourceJournalId == journalId)
+                || (p.MirrorCompanyId == companyId && p.MirrorJournalId == journalId));
+
+        private bool IsLinkedEntryMirrorJournal(int companyId, int journalId) => _linkedEntryPairRepo != null &&
+            _linkedEntryPairRepo.Table.Any(p => p.MirrorCompanyId == companyId && p.MirrorJournalId == journalId);
+
+        /// <summary>
+        /// Records the durable first-useful-action marker for a qualifying committed action (sales invoice
+        /// or bill posting) and emits the first-useful-action histogram once, only when this call
+        /// established the marker. Intended to be called by the sales/purchasing posting paths immediately
+        /// <summary>
+        /// Records the durable first-useful-action marker for a qualifying committed action (sales invoice
+        /// or bill posting) and emits the first-useful-action histogram once, only when this call
+        /// established the marker. Runs through the workspace policy transaction so the marker is written
+        /// under the per-company coordination lock (serializing against concurrent journal/invoice/bill
+        /// first-action races) and commits in the SAME transaction as the document posting (the caller's
+        /// ambient transaction, which Execute joins). The histogram emission is enqueued to run only after
+        /// that owning transaction commits; a rollback discards both the marker and the emission. "First"
+        /// is established by the marker's absence, unique per workspace across all three paths.
+        /// </summary>
+        public void RecordFirstUsefulActionIfFirst(int companyId, string actionKind)
+        {
+            if (companyId <= 0 || _auditLogRepo == null || _policyTransaction == null)
+                return;
+
+            _policyTransaction.Execute(companyId, guard =>
+            {
+                var initializedAtUtc = guard.Settings.InitializedAtUtc;
+                if (!initializedAtUtc.HasValue)
+                    return;
+
+                var established = Core.Authorization.WorkspaceFirstActionEvidence.TryRecordFirstUsefulAction(
+                    _auditLogRepo,
+                    companyId,
+                    actionKind,
+                    _auth?.ResolveActorContext()?.UserId,
+                    initializedAtUtc.Value,
+                    DateTime.UtcNow);
+
+                if (established)
+                {
+                    var d = (DateTime.UtcNow - initializedAtUtc.Value).TotalSeconds;
+                    var duration = d < 0 ? 0 : d;
+                    _policyTransaction.EnqueuePostCommit(() =>
+                        Core.Authorization.WorkspaceOperatingPolicyMetrics.FirstUsefulActionDuration.Record(
+                            duration,
+                            new KeyValuePair<string, object?>("action", actionKind)));
+                }
+            });
+        }
+
+        private void RecordJournalPostingAuthorizationEvidence(
+            JournalEntryHeader journalEntry,
+            string entryFingerprint,
+            string effectivePreparer,
+            string posterUserId,
+            string independentApprovalRequestId,
+            Core.Authorization.EffectiveApprovalRule resolvedRule = null)
+        {
+            if (_auditLogRepo == null || journalEntry.CompanyId <= 0 || journalEntry.Id <= 0)
+                return;
+
+            Core.Authorization.EffectiveApprovalRule rule = resolvedRule;
+            if (rule == null && _approvalPolicyResolver != null)
+            {
+                rule = _approvalPolicyResolver.Resolve(
+                    journalEntry.CompanyId,
+                    Core.Authorization.AccessOperationCatalog.FinancialsJournalPost);
+            }
+
+            var mode = rule?.Mode ?? Core.Authorization.WorkspaceApprovalMode.CatalogDefault;
+            var independentReviewUsed = !string.IsNullOrWhiteSpace(independentApprovalRequestId);
+            string rendering;
+            if (mode == Core.Authorization.WorkspaceApprovalMode.SingleActorAllowed && !independentReviewUsed)
+            {
+                rendering = string.Equals(effectivePreparer, posterUserId, StringComparison.Ordinal)
+                    ? $"Prepared and posted by {posterUserId} under the single-user workflow."
+                    : $"Prepared by {effectivePreparer} and posted by {posterUserId}. Independent review was not required by the workspace policy.";
+            }
+            else if (independentReviewUsed)
+            {
+                rendering = $"Prepared by {effectivePreparer}, independently reviewed ({independentApprovalRequestId}), posted by {posterUserId}.";
+            }
+            else
+            {
+                rendering = $"Prepared by {effectivePreparer} and posted by {posterUserId}.";
+            }
+
+            var payload = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                operationKey = Core.Authorization.AccessOperationCatalog.FinancialsJournalPost,
+                policySchemaVersion = Core.Domain.WorkspaceOperatingPolicySchema.CurrentVersion,
+                journalEntryId = journalEntry.Id,
+                fingerprint = entryFingerprint,
+                journalFingerprint = entryFingerprint,
+                preparerUserId = effectivePreparer,
+                posterUserId,
+                actualReviewMode = mode.ToString(),
+                approvalMode = mode.ToString(),
+                policyRevision = rule?.PolicyRevision,
+                provenance = rule?.Provenance?.ToString(),
+                approvalRequestId = independentReviewUsed ? independentApprovalRequestId : null,
+                independentApprovalRequestId = independentApprovalRequestId,
+                independentReviewUsed,
+                rendering
+            });
+
+            _auditLogRepo.Insert(new Core.Domain.Auditing.AuditLog
+            {
+                CompanyId = journalEntry.CompanyId,
+                UserName = posterUserId ?? effectivePreparer ?? "system",
+                AuditEventDateUTC = DateTime.UtcNow,
+                AuditEventType = (int)Core.Domain.Auditing.AuditEventTypes.Added,
+                TableName = JournalPostingAuthorizationAuditTable,
+                RecordId = journalEntry.Id.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                FieldName = "AuthorizationEvidence",
+                OriginalValue = string.Empty,
+                NewValue = payload
+            });
+        }
+
+        public GeneralLedgerHeader GetGeneralLedgerHeader(int id)
+        {
+            if (_auth == null)
+                return null;
+
+            var decision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsJournalView);
+            if (!decision.Allowed)
+                return null;
+
+            return _generalLedgerRepository.Table.Where(gl => gl.Id == id).FirstOrDefault();
+        }
+
+        public IEnumerable<GeneralLedgerLine> GetGeneralLedgerLines(int generalLedgerHeaderId)
+        {
+            if (_auth == null)
+                return Enumerable.Empty<GeneralLedgerLine>();
+
+            var decision = _auth.Authorize(Core.Authorization.AccessOperationCatalog.FinancialsJournalView);
+            if (!decision.Allowed)
+                return Enumerable.Empty<GeneralLedgerLine>();
+
+            return _generalLedgerRepository.GetAllIncluding(gl => gl.GeneralLedgerLines)
+                .Where(gl => gl.Id == generalLedgerHeaderId)
+                .SelectMany(gl => gl.GeneralLedgerLines)
+                .ToList();
+        }
+
+        /// <summary>
+        /// An entry that undoes another, not yet saved: the same lines with debits and credits swapped, dated on the
+        /// reversal date. The reversal date cannot be before the original entry's date and must fall on or after the books start date.
+        /// </summary>
+        public void EnsureNotReconciled(int generalLedgerHeaderId)
+        {
+            if (_bankReconciliationRepo == null || _generalLedgerLineRepository == null)
+                return;
+
+            var finished = (
+                from line in _generalLedgerLineRepository.Table
+                where line.GeneralLedgerHeaderId == generalLedgerHeaderId && line.BankReconciliationId != null
+                join recon in _bankReconciliationRepo.Table on line.BankReconciliationId equals recon.Id
+                where recon.Status == BankReconciliationStatuses.Finished
+                select recon
+            ).FirstOrDefault();
+            if (finished == null)
+                return;
+
+            var bankName = _bankRepo?.GetById(finished.BankId)?.Name ?? "bank";
+            throw new Services.Banking.ReconciledTransactionException(bankName, finished.StatementEndDate);
+        }
+
+        public GeneralLedgerHeader CreateReversingEntry(int generalLedgerHeaderId, string description, DateTime reversalDate)
+        {
+            EnsureNotReconciled(generalLedgerHeaderId);
+
+            var original = _generalLedgerRepository.GetAllIncluding(gl => gl.GeneralLedgerLines)
+                .FirstOrDefault(gl => gl.Id == generalLedgerHeaderId)
+                ?? throw new InvalidOperationException($"Journal entry {generalLedgerHeaderId} was not found.");
+
+            if (reversalDate.Date < original.Date.Date)
+                throw new InvalidOperationException($"The void date ({reversalDate:yyyy-MM-dd}) cannot be earlier than the document date ({original.Date:yyyy-MM-dd}).");
+
+            EnsureOnOrAfterBooksStart(reversalDate.Date);
+
+            var reversal = CreateGeneralLedgerHeader(original.DocumentType, reversalDate.Date, description, original.SourceDocumentId, original.Id);
+            // The posting guard validates the tenant before repository insertion stamps new rows.
+            reversal.CompanyId = original.CompanyId;
+            foreach (var line in original.GeneralLedgerLines)
+                reversal.GeneralLedgerLines.Add(CreateGeneralLedgerLine(line.DrCr == DrOrCrSide.Dr ? DrOrCrSide.Cr : DrOrCrSide.Dr, line.AccountId, line.Amount));
+
+            ValidateGeneralLedgerEntry(reversal);
+            ClearStatementMatches(original.GeneralLedgerLines.Select(l => l.Id).ToList());
+            return reversal;
+        }
+
+        /// <summary>
+        /// Every void path reverses through <see cref="CreateReversingEntry"/>, so this is where statement lines stop
+        /// pointing at ledger lines of an entry that is being voided. The lines go back to unmatched.
+        /// </summary>
+        private void ClearStatementMatches(IReadOnlyCollection<int> generalLedgerLineIds)
+        {
+            if (_bankStatementLineRepo == null || generalLedgerLineIds.Count == 0)
+                return;
+
+            var matched = _bankStatementLineRepo.Table
+                .Where(l => l.MatchedGeneralLedgerLineId != null && generalLedgerLineIds.Contains(l.MatchedGeneralLedgerLineId.Value))
+                .ToList();
+            if (matched.Count == 0)
+                return;
+
+            foreach (var statementLine in matched)
+                statementLine.MatchedGeneralLedgerLineId = null;
+            // The repository saves every tracked change, so one Update persists all cleared matches.
+            _bankStatementLineRepo.Update(matched[0]);
+        }
+
+        public void SaveAccountClasses(IList<AccountClass> accountClasses)
+        {
+            foreach (var accountClass in accountClasses)
+            {
+                if (accountClass.Id == 0)
+                    _accountClassRepo.Insert(accountClass);
+                else
+                    _accountClassRepo.Update(accountClass);
+            }
+        }
+
+        public void SaveFinancialYear(FinancialYear financialYear)
+        {
+            if (financialYear.Id == 0)
+                _fiscalYearRepo.Insert(financialYear);
+            else
+                _fiscalYearRepo.Update(financialYear);
+        }
+
+        public void SavePaymentTerm(PaymentTerm paymentTerm)
+        {
+            if (paymentTerm.Id == 0)
+                _paymentTermRepo.Insert(paymentTerm);
+            else
+                _paymentTermRepo.Update(paymentTerm);
+        }
+
+        public void SaveBank(Bank bank)
+        {
+            if (bank.Id == 0)
+            {
+                _entitlements?.EnsureCanCreate(Core.Entitlements.MeteredResource.BankAccounts);
+                _bankRepo.Insert(bank);
+            }
+            else
+                _bankRepo.Update(bank);
+        }
+
+        public Bank GetBank(int id)
+        {
+            return _bankRepo.GetById(id);
+        }
+
+        public void DeleteBank(int id)
+        {
+            var bank = _bankRepo.GetById(id);
+            if (bank != null)
+                _bankRepo.Delete(bank);
+        }
+    }
+}

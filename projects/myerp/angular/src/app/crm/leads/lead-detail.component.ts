@@ -1,0 +1,141 @@
+import { Component, inject, OnInit, signal } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { ActivatedRoute, Router, RouterModule } from '@angular/router';
+import { FormsModule } from '@angular/forms';
+import { PageModule } from '@abp/ng.components/page';
+import { LocalizationPipe } from '@abp/ng.core';
+import { ConfirmationService, Confirmation, ToasterService } from '@abp/ng.theme.shared';
+import { LeadStore } from '../store/lead.store';
+import { LeadService } from '../../proxy/crm/lead.service';
+import { StatusBadgeComponent } from '../../shared/components/status-badge/status-badge.component';
+import type { CrmNoteDto, LeadDto } from '../../proxy/crm/models';
+
+import { BreadcrumbComponent } from '../../shared/components/breadcrumb/breadcrumb.component';
+
+@Component({
+  selector: 'app-lead-detail',
+  standalone: true,
+  imports: [BreadcrumbComponent, CommonModule, RouterModule, FormsModule, PageModule, LocalizationPipe, StatusBadgeComponent],
+  templateUrl: './lead-detail.component.html',
+  styleUrls: ['./lead-detail.component.scss'],
+})
+export class LeadDetailComponent implements OnInit {
+  private route = inject(ActivatedRoute);
+  private router = inject(Router);
+  private store = inject(LeadStore);
+  private service = inject(LeadService);
+  private confirmation = inject(ConfirmationService);
+  private toaster = inject(ToasterService);
+
+  lead: LeadDto | null = null;
+  notes = signal<CrmNoteDto[]>([]);
+  newNoteText = '';
+
+  ngOnInit(): void {
+    const id = this.route.snapshot.paramMap.get('id')!;
+    this.service.get(id).subscribe((result) => {
+      this.lead = result;
+    });
+    this.loadNotes();
+  }
+
+  loadNotes(): void {
+    const id = this.route.snapshot.paramMap.get('id')!;
+    this.service.getNotes(id).subscribe({ next: (r) => this.notes.set(r ?? []), error: () => {} });
+  }
+
+  addNote(): void {
+    if (!this.newNoteText.trim()) return;
+    const id = this.route.snapshot.paramMap.get('id')!;
+    this.service.addNote(id, { noteText: this.newNoteText }).subscribe({
+      next: () => { this.newNoteText = ''; this.loadNotes(); },
+      error: (err: any) => this.toaster.error(err?.error?.error?.message ?? 'Failed'),
+    });
+  }
+
+  qualify(): void {
+    this.store.qualify(this.lead!.id!);
+    this.reloadAfterAction();
+  }
+
+  markLost(): void {
+    this.confirmation.warn('::CRM:MarkLeadLostConfirmation', '::AreYouSure').subscribe((status) => {
+      if (status === Confirmation.Status.confirm) {
+        this.store.markLost(this.lead!.id!);
+        this.reloadAfterAction();
+      }
+    });
+  }
+
+  convertToOpportunity(): void {
+    this.service.convertToOpportunity({
+      leadId: this.lead!.id!,
+      title: `${this.lead!.fullName ?? this.lead!.firstName} - Opportunity`,
+      opportunityAmount: 0,
+    }).subscribe({
+      next: (opp) => {
+        this.toaster.success('::SuccessfullyConverted');
+        this.router.navigate(['/crm/opportunities', opp.id]);
+      },
+      error: (err) => {
+        this.toaster.error(err?.error?.error?.message ?? 'Conversion failed');
+      },
+    });
+  }
+
+  createProspect(): void {
+    this.service.createProspectAndContact(this.lead!.id!, {
+      createContact: true,
+      createProspect: true,
+    }).subscribe({
+      next: (result) => {
+        this.toaster.success('::SuccessfullyCreated');
+        if (result.prospectId) {
+          this.router.navigate(['/crm/prospects', result.prospectId]);
+        }
+      },
+      error: (err: any) => {
+        this.toaster.error(err?.error?.error?.message ?? 'Failed');
+      },
+    });
+  }
+
+  convertToCustomer(): void {
+    this.service.convertToCustomer({ leadId: this.lead!.id! }).subscribe({
+      next: (customerId) => {
+        this.toaster.success('::SuccessfullyConverted');
+        // responseType:'text' on this endpoint returns the raw JSON-quoted string, not a parsed value
+        this.router.navigate(['/customers', customerId.replace(/^"|"$/g, ''), 'edit']);
+      },
+      error: (err: any) => {
+        this.toaster.error(err?.error?.error?.message ?? 'Conversion failed');
+      },
+    });
+  }
+
+  delete(): void {
+    this.confirmation.warn('::DeleteConfirmationMessage', '::AreYouSure').subscribe((status) => {
+      if (status === Confirmation.Status.confirm) {
+        this.store.remove(this.lead!.id!);
+        this.router.navigate(['/crm/leads']);
+      }
+    });
+  }
+
+  private reloadAfterAction(): void {
+    this.service.get(this.lead!.id!).subscribe({
+      next: (result) => { this.lead = result; },
+      error: () => {}
+    });
+  }
+
+  getStatusLabel(): string {
+    const map: Record<number, string> = { 0: 'New', 1: 'Open', 2: 'Replied', 3: 'Interested', 4: 'Qualified', 5: 'Converted', 6: 'Lost', 7: 'DoNotContact' };
+    return map[this.lead?.status ?? 0] ?? 'New';
+  }
+
+  getSourceLabel(): string {
+    const map: Record<number, string> = { 0: 'Website', 1: 'Referral', 2: 'Campaign', 3: 'Cold Call', 4: 'Advertisement', 5: 'Social Media', 6: 'Trade Show', 7: 'Partner', 8: 'Other' };
+    return map[this.lead?.source ?? 0] ?? 'Other';
+  }
+}

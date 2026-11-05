@@ -1,0 +1,213 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Volo.Abp;
+using Volo.Abp.Domain.Entities;
+using Volo.Abp.Domain.Entities.Auditing;
+using Volo.Abp.MultiTenancy;
+
+namespace MyERP.Sales.Entities;
+
+/// <summary>
+/// POS Profile — defines configuration for a POS terminal/register.
+/// Each POS Profile specifies: warehouse, price list, accepted payment modes,
+/// default customer, and various operational settings.
+/// Per ERPNext selling/doctype/pos_profile:
+/// - Cannot disable while open POS Opening Entries exist
+/// - One-per-profile open session enforced
+/// Per DO-NOT: "Allow POS Profile disable while open POS Opening Entries exist"
+/// </summary>
+public class PosProfile : FullAuditedAggregateRoot<Guid>, IMultiTenant
+{
+    public Guid? TenantId { get; set; }
+    public Guid CompanyId { get; set; }
+
+    /// <summary>Profile name (e.g., "Counter 1", "Mall Outlet").</summary>
+    public string ProfileName { get; set; } = null!;
+
+    /// <summary>Default warehouse for stock deduction on POS sales.</summary>
+    public Guid WarehouseId { get; set; }
+
+    /// <summary>Price list for item pricing.</summary>
+    public Guid? PriceListId { get; set; }
+
+    /// <summary>Default customer for walk-in sales.</summary>
+    public Guid? DefaultCustomerId { get; set; }
+
+    /// <summary>Currency for POS transactions.</summary>
+    public string CurrencyCode { get; set; } = "MYR";
+
+    /// <summary>Whether to validate available stock before allowing sale.</summary>
+    public bool ValidateStock { get; set; } = true;
+
+    /// <summary>Whether to auto-create Sales Invoice (vs POS Invoice type).</summary>
+    public string InvoiceType { get; set; } = "POS Invoice";
+
+    /// <summary>Whether this profile is disabled.</summary>
+    public bool IsDisabled { get; set; }
+
+    /// <summary>
+    /// Whether to hide out-of-stock items on the POS interface.
+    /// Non-stock items (service/digital) remain visible even when enabled.
+    /// Per ERPNext PR #47493 / commit 57f3489dfa.
+    /// </summary>
+    public bool HideUnavailableItems { get; set; }
+
+    /// <summary>Tax template to apply on POS invoices (SST for Malaysia).</summary>
+    public Guid? TaxTemplateId { get; set; }
+
+    /// <summary>Write-off account for small rounding differences.</summary>
+    public Guid? WriteOffAccountId { get; set; }
+
+    /// <summary>Write-off cost center.</summary>
+    public Guid? WriteOffCostCenterId { get; set; }
+
+    /// <summary>Maximum write-off amount per invoice (prevents large accidental write-offs).</summary>
+    public decimal WriteOffLimit { get; set; }
+
+    /// <summary>Whether to post change (cash overpayment) to GL.</summary>
+    public bool PostChangeGlEntries { get; set; }
+
+    /// <summary>Income account override for this POS profile.</summary>
+    public Guid? IncomeAccountId { get; set; }
+
+    /// <summary>Expense account override for this POS profile.</summary>
+    public Guid? ExpenseAccountId { get; set; }
+
+    /// <summary>Default project for accounting dimensions on POS sales. Per ERPNext PR #46964 / commit 821d64241a.</summary>
+    public Guid? ProjectId { get; set; }
+
+    /// <summary>
+    /// Email template for receipts emailed from the POS terminal.
+    /// Per ERPNext PR #59332 / commit 328ec92662.
+    /// </summary>
+    public Guid? ReceiptEmailTemplateId { get; set; }
+
+    /// <summary>Accepted payment modes for this POS profile.</summary>
+    private readonly List<PosProfilePaymentMethod> _paymentMethods = new();
+    public IReadOnlyList<PosProfilePaymentMethod> PaymentMethods => _paymentMethods.AsReadOnly();
+
+    /// <summary>Authorized users for this POS profile (per ERPNext PR #58508 / commit 9018573179).</summary>
+    private readonly List<PosProfileUser> _users = new();
+    public IReadOnlyList<PosProfileUser> Users => _users.AsReadOnly();
+
+    /// <summary>Configured Item Groups for POS filtering (ERPNext pos_profile.json: item_groups).</summary>
+    private readonly List<PosProfileItemGroup> _itemGroups = new();
+    public IReadOnlyList<PosProfileItemGroup> ItemGroups => _itemGroups.AsReadOnly();
+
+    /// <summary>Configured Customer Groups for POS filtering (ERPNext pos_profile.json: customer_groups).</summary>
+    private readonly List<PosProfileCustomerGroup> _customerGroups = new();
+    public IReadOnlyList<PosProfileCustomerGroup> CustomerGroups => _customerGroups.AsReadOnly();
+
+    protected PosProfile() { }
+
+    public PosProfile(Guid id, Guid companyId, string profileName, Guid warehouseId, Guid? tenantId = null)
+        : base(id)
+    {
+        CompanyId = companyId;
+        ProfileName = Check.NotNullOrWhiteSpace(profileName, nameof(profileName), maxLength: 140);
+        WarehouseId = warehouseId;
+        TenantId = tenantId;
+    }
+
+    public void AddPaymentMethod(PosProfilePaymentMethod method)
+    {
+        _paymentMethods.Add(method);
+    }
+
+    public void ClearPaymentMethods()
+    {
+        _paymentMethods.Clear();
+    }
+
+    public void AddUser(Guid userId, bool isDefault = false)
+    {
+        if (_users.Any(u => u.UserId == userId))
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "User already assigned to this POS Profile.");
+
+        _users.Add(new PosProfileUser(Guid.NewGuid(), Id, userId, isDefault, TenantId));
+    }
+
+    public void RemoveUser(Guid userId)
+    {
+        _users.RemoveAll(u => u.UserId == userId);
+    }
+
+    public void ClearUsers()
+    {
+        _users.Clear();
+    }
+
+    public void AddItemGroup(Guid itemGroupId)
+    {
+        if (_itemGroups.Any(g => g.ItemGroupId == itemGroupId))
+            return;
+        _itemGroups.Add(new PosProfileItemGroup(Guid.NewGuid(), Id, itemGroupId, TenantId));
+    }
+
+    public void RemoveItemGroup(Guid itemGroupId)
+    {
+        _itemGroups.RemoveAll(g => g.ItemGroupId == itemGroupId);
+    }
+
+    public void ClearItemGroups()
+    {
+        _itemGroups.Clear();
+    }
+
+    public void AddCustomerGroup(Guid customerGroupId)
+    {
+        if (_customerGroups.Any(g => g.CustomerGroupId == customerGroupId))
+            return;
+        _customerGroups.Add(new PosProfileCustomerGroup(Guid.NewGuid(), Id, customerGroupId, TenantId));
+    }
+
+    public void RemoveCustomerGroup(Guid customerGroupId)
+    {
+        _customerGroups.RemoveAll(g => g.CustomerGroupId == customerGroupId);
+    }
+
+    public void ClearCustomerGroups()
+    {
+        _customerGroups.Clear();
+    }
+
+    public void Disable()
+    {
+        IsDisabled = true;
+    }
+
+    public void Enable()
+    {
+        IsDisabled = false;
+    }
+}
+
+/// <summary>
+/// Payment method configuration for a POS Profile.
+/// Each row links a Mode of Payment to a GL account for that POS register.
+/// </summary>
+public class PosProfilePaymentMethod : Entity<Guid>
+{
+    public Guid PosProfileId { get; set; }
+
+    /// <summary>Mode of Payment ID (Cash, Credit Card, E-Wallet, etc.).</summary>
+    public Guid ModeOfPaymentId { get; set; }
+
+    /// <summary>GL Account to post payments to for this mode.</summary>
+    public Guid AccountId { get; set; }
+
+    /// <summary>Whether this is the default payment mode for this profile.</summary>
+    public bool IsDefault { get; set; }
+
+    protected PosProfilePaymentMethod() { }
+
+    public PosProfilePaymentMethod(Guid id, Guid posProfileId, Guid modeOfPaymentId, Guid accountId)
+        : base(id)
+    {
+        PosProfileId = posProfileId;
+        ModeOfPaymentId = modeOfPaymentId;
+        AccountId = accountId;
+    }
+}

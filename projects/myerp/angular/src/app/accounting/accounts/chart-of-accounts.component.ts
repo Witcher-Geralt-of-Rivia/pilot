@@ -1,0 +1,106 @@
+import { Component, inject, OnInit, signal } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { Router } from '@angular/router';
+import { LocalizationPipe } from '@abp/ng.core';
+import { PageModule } from '@abp/ng.components/page';
+import { AccountService } from '../../proxy/accounting/account.service';
+import type { AccountDto } from '../../proxy/accounting/models';
+
+export interface AccountNode {
+  id: string;
+  accountCode: string;
+  accountName: string;
+  accountType: string;
+  isGroup: boolean;
+  currency?: string | null;
+  isFrozen?: boolean;
+  isActive?: boolean;
+  balance?: number;
+  children?: AccountNode[];
+}
+
+@Component({
+  selector: 'app-chart-of-accounts',
+  standalone: true,
+  imports: [
+    CommonModule,
+    LocalizationPipe,
+    PageModule],
+  templateUrl: './chart-of-accounts.component.html',
+  styleUrls: ['./chart-of-accounts.component.scss'],
+})
+export class ChartOfAccountsComponent implements OnInit {
+  private accountService = inject(AccountService);
+  private router = inject(Router);
+  accounts = signal<AccountNode[]>([]);
+  expandedIds = new Set<string>();
+
+  addAccount(): void {
+    this.router.navigate(['/accounting/accounts/new']);
+  }
+
+  toggleNode(id: string): void {
+    if (this.expandedIds.has(id)) {
+      this.expandedIds.delete(id);
+    } else {
+      this.expandedIds.add(id);
+    }
+  }
+
+  isExpanded(id: string): boolean {
+    return this.expandedIds.has(id);
+  }
+
+  hasChild = (node: AccountNode) => node.isGroup && !!node.children?.length;
+
+  ngOnInit(): void {
+    this.accountService.getList({ skipCount: 0, maxResultCount: 500, sorting: 'accountCode asc' })
+      .subscribe({ next: (result) => {
+        const accs = result.items ?? [];
+        this.accounts.set(this.buildTree(accs));
+      }, error: () => {} });
+  }
+
+  private buildTree(accounts: AccountDto[]): AccountNode[] {
+    const map = new Map<string, AccountNode>();
+    const roots: AccountNode[] = [];
+
+    // Create nodes
+    for (const acc of accounts) {
+      map.set(acc.id!, {
+        id: acc.id!,
+        accountCode: acc.accountCode ?? '',
+        accountName: acc.accountName ?? '',
+        accountType: acc.accountType as any ?? '',
+        isGroup: acc.isGroup ?? false,
+        currency: acc.currency,
+        isFrozen: acc.isFrozen ?? false,
+        isActive: acc.isActive ?? true,
+        children: [],
+      });
+    }
+
+    // Build hierarchy
+    for (const acc of accounts) {
+      const node = map.get(acc.id!)!;
+      if (acc.parentAccountId && map.has(acc.parentAccountId)) {
+        map.get(acc.parentAccountId)!.children!.push(node);
+      } else {
+        roots.push(node);
+      }
+    }
+
+    return roots;
+  }
+
+  getTypeIcon(type: string): string {
+    switch (type) {
+      case 'Asset': return 'account_balance';
+      case 'Liability': return 'credit_card';
+      case 'Equity': return 'savings';
+      case 'Revenue': return 'trending_up';
+      case 'Expense': return 'trending_down';
+      default: return 'folder';
+    }
+  }
+}

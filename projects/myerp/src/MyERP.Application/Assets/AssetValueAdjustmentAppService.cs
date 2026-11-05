@@ -1,0 +1,239 @@
+using System;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authorization;
+using MyERP.Accounting.DomainServices;
+using MyERP.Assets.DomainServices;
+using MyERP.Assets.Entities;
+using MyERP.Permissions;
+using Volo.Abp;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+
+namespace MyERP.Assets;
+
+[Authorize(MyERPPermissions.AssetValueAdjustments.Default)]
+public class AssetValueAdjustmentAppService : ApplicationService, IAssetValueAdjustmentAppService
+{
+    private readonly IRepository<AssetValueAdjustment, Guid> _repository;
+    private readonly IRepository<Asset, Guid> _assetRepository;
+    private readonly IRepository<AssetActivity, Guid> _activityRepository;
+    private readonly AssetValueAdjustmentMapper _mapper;
+    private readonly AssetLifecycleManager _lifecycleManager;
+    private readonly DocumentPostingOrchestrator _postingOrchestrator;
+
+    public AssetValueAdjustmentAppService(
+        IRepository<AssetValueAdjustment, Guid> repository,
+        IRepository<Asset, Guid> assetRepository,
+        IRepository<AssetActivity, Guid> activityRepository,
+        AssetValueAdjustmentMapper mapper,
+        AssetLifecycleManager lifecycleManager,
+        DocumentPostingOrchestrator postingOrchestrator)
+    {
+        _repository = repository;
+        _assetRepository = assetRepository;
+        _activityRepository = activityRepository;
+        _mapper = mapper;
+        _lifecycleManager = lifecycleManager;
+        _postingOrchestrator = postingOrchestrator;
+    }
+
+    public async Task<PagedResultDto<AssetValueAdjustmentDto>> GetListAsync(PagedAndSortedResultRequestDto input)
+    {
+        var query = await _repository.GetQueryableAsync();
+        var totalCount = await AsyncExecuter.CountAsync(query);
+        var items = await AsyncExecuter.ToListAsync(
+            query.OrderByDescending(a => a.Date)
+                .Skip(input.SkipCount)
+                .Take(input.MaxResultCount));
+
+        return new PagedResultDto<AssetValueAdjustmentDto>(totalCount, items.Select(_mapper.Map).ToList());
+    }
+
+    public async Task<AssetValueAdjustmentDto> GetAsync(Guid id)
+    {
+        var adj = await _repository.GetAsync(id);
+        return _mapper.Map(adj);
+    }
+
+    [Authorize(MyERPPermissions.AssetValueAdjustments.Create)]
+    public async Task<AssetValueAdjustmentDto> CreateAsync(CreateUpdateAssetValueAdjustmentDto input)
+    {
+        var asset = await GetAssetWithDepreciationDetailsAsync(input.AssetId);
+        ValidateFinanceBook(asset, input.FinanceBookId);
+
+        var currentVal = input.CurrentAssetValue > 0
+            ? input.CurrentAssetValue
+            : GetCurrentAssetValue(asset, input.FinanceBookId);
+
+        var adjNumber = $"AS-ADJ-{DateTime.UtcNow:yyyyMMdd}-{GuidGenerator.Create().ToString()[..6].ToUpper()}";
+        var adj = new AssetValueAdjustment(
+            GuidGenerator.Create(),
+            adjNumber,
+            input.CompanyId,
+            input.AssetId,
+            input.Date,
+            currentVal,
+            input.NewAssetValue,
+            input.DifferenceAccountId,
+            input.FinanceBookId,
+            input.CostCenterId,
+            CurrentTenant.Id)
+        {
+            Notes = input.Notes,
+        };
+
+        await _repository.InsertAsync(adj);
+        return _mapper.Map(adj);
+    }
+
+    [Authorize(MyERPPermissions.AssetValueAdjustments.Edit)]
+    public async Task<AssetValueAdjustmentDto> UpdateAsync(Guid id, CreateUpdateAssetValueAdjustmentDto input)
+    {
+        var adj = await _repository.GetAsync(id);
+        if (adj.Status != Core.DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        var asset = await GetAssetWithDepreciationDetailsAsync(input.AssetId);
+        ValidateFinanceBook(asset, input.FinanceBookId);
+
+        adj.Date = input.Date;
+        adj.UpdateValues(input.CurrentAssetValue, input.NewAssetValue);
+        adj.DifferenceAccountId = input.DifferenceAccountId;
+        adj.FinanceBookId = input.FinanceBookId;
+        adj.CostCenterId = input.CostCenterId;
+        adj.Notes = input.Notes;
+
+        await _repository.UpdateAsync(adj);
+        return _mapper.Map(adj);
+    }
+
+    [Authorize(MyERPPermissions.AssetValueAdjustments.Delete)]
+    public async Task DeleteAsync(Guid id)
+    {
+        var adj = await _repository.GetAsync(id);
+        if (adj.Status != Core.DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        await _repository.DeleteAsync(id);
+    }
+
+    [Authorize(MyERPPermissions.AssetValueAdjustments.Edit)]
+    public async Task<AssetValueAdjustmentDto> SubmitAsync(Guid id)
+    {
+        var adj = await _repository.GetAsync(id);
+        var asset = await GetAssetWithDepreciationDetailsAsync(adj.AssetId);
+        ValidateFinanceBook(asset, adj.FinanceBookId);
+
+        adj.Submit();
+
+        var journalEntryId = await _lifecycleManager.PostValueAdjustmentJournalEntryAsync(adj, asset);
+        if (journalEntryId.HasValue)
+        {
+            adj.JournalEntryId = journalEntryId;
+        }
+
+        asset.ApplyValueAdjustment(adj.NewAssetValue, adj.FinanceBookId, adj.DifferenceAmount);
+        await _assetRepository.UpdateAsync(asset);
+
+        var activity = new AssetActivity(
+            GuidGenerator.Create(),
+            asset.Id,
+            AssetActivityType.Adjusted,
+            $"Asset Value Adjustment #{adj.AdjustmentNumber} submitted",
+            adj.Date,
+            $"Adjusted from {adj.CurrentAssetValue:N2} to {adj.NewAssetValue:N2} (Diff: {adj.DifferenceAmount:N2})",
+            "AssetValueAdjustment",
+            adj.Id.ToString(),
+            CurrentTenant.Id);
+
+        await _activityRepository.InsertAsync(activity);
+        await _repository.UpdateAsync(adj);
+        return _mapper.Map(adj);
+    }
+
+    [Authorize(MyERPPermissions.AssetValueAdjustments.Edit)]
+    public async Task<AssetValueAdjustmentDto> CancelAsync(Guid id)
+    {
+        var adj = await _repository.GetAsync(id);
+        var asset = await GetAssetWithDepreciationDetailsAsync(adj.AssetId);
+
+        // Per ERPNext PR #61459: block cancellation if asset has been disposed or split after this adjustment
+        if (asset.Status is AssetStatus.Sold or AssetStatus.Scrapped or AssetStatus.Capitalized)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"Cannot cancel Asset Value Adjustment because Asset {asset.AssetNumber} is {asset.Status}.");
+        }
+
+        var adjTimestamp = adj.LastModificationTime ?? adj.CreationTime;
+        var assetQuery = await _assetRepository.GetQueryableAsync();
+        if (assetQuery.Any(a => a.SplitFromAssetId == asset.Id && a.CreationTime >= adjTimestamp))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"Cannot cancel Asset Value Adjustment because Asset {asset.AssetNumber} was split after this adjustment.");
+        }
+
+        adj.Cancel();
+
+        if (adj.JournalEntryId.HasValue)
+        {
+            await _postingOrchestrator.ReverseGlForJournalEntryAsync(adj.JournalEntryId.Value);
+        }
+
+        asset.ApplyValueAdjustment(adj.CurrentAssetValue, adj.FinanceBookId, -adj.DifferenceAmount);
+        await _assetRepository.UpdateAsync(asset);
+
+        var activity = new AssetActivity(
+            GuidGenerator.Create(),
+            asset.Id,
+            AssetActivityType.Adjusted,
+            $"Asset Value Adjustment #{adj.AdjustmentNumber} cancelled",
+            DateTime.UtcNow,
+            $"Reverted back to {adj.CurrentAssetValue:N2}",
+            "AssetValueAdjustment",
+            adj.Id.ToString(),
+            CurrentTenant.Id);
+
+        await _activityRepository.InsertAsync(activity);
+        await _repository.UpdateAsync(adj);
+        return _mapper.Map(adj);
+    }
+
+    private async Task<Asset> GetAssetWithDepreciationDetailsAsync(Guid assetId)
+    {
+        var withDetails = await _assetRepository.WithDetailsAsync(a => a.DepreciationDetails);
+        return withDetails?.FirstOrDefault(a => a.Id == assetId)
+            ?? await _assetRepository.GetAsync(assetId);
+    }
+
+    private static decimal GetCurrentAssetValue(Asset asset, Guid? financeBookId)
+    {
+        if (financeBookId.HasValue)
+        {
+            var detail = asset.DepreciationDetails.FirstOrDefault(d => d.FinanceBookId == financeBookId.Value);
+            if (detail != null) return detail.ValueAfterDepreciation;
+        }
+        return asset.ValueAfterDepreciation;
+    }
+
+    private static void ValidateFinanceBook(Asset asset, Guid? financeBookId)
+    {
+        if (!asset.CalculateDepreciation || asset.DepreciationDetails.Count == 0)
+            return;
+
+        if (financeBookId.HasValue)
+        {
+            if (!asset.DepreciationDetails.Any(d => d.FinanceBookId == financeBookId.Value))
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", "Selected Finance Book does not exist on the Asset.");
+            }
+        }
+        else if (asset.DepreciationDetails.All(d => d.FinanceBookId.HasValue))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Please select a Finance Book, as the Asset only has named finance books.");
+        }
+    }
+}

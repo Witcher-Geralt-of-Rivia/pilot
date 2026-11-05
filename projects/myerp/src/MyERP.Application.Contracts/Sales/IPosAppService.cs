@@ -1,0 +1,110 @@
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.Threading.Tasks;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+
+namespace MyERP.Sales;
+
+public interface IPosAppService : IApplicationService
+{
+    Task<PosInvoiceDto> CompleteSaleAsync(CreatePosInvoiceDto input);
+    Task<PagedResultDto<PosItemDto>> SearchItemsAsync(PosItemSearchDto input);
+    Task<BarcodeScanResultDto> ScanBarcodeAsync(ScanBarcodeInput input);
+    Task<PosReceiptEmailContentDto> GetReceiptEmailContentAsync(Guid invoiceId);
+    Task<ParentItemGroupDto> GetParentItemGroupAsync(Guid posProfileId);
+    Task<List<ParentItemGroupDto>> GetItemGroupsAsync(Guid posProfileId);
+}
+
+public class PosReceiptEmailContentDto
+{
+    public string Subject { get; set; } = null!;
+    public string Message { get; set; } = null!;
+}
+
+public class CreatePosInvoiceDto
+{
+    [Required]
+    public Guid CompanyId { get; set; }
+
+    public Guid? CustomerId { get; set; }
+
+    /// <summary>POS Profile this sale was made under. Per ERPNext PR #46907 / commit 3de1b22480.</summary>
+    public Guid? PosProfileId { get; set; }
+
+    /// <summary>Warehouse from which stock is deducted (required for stock items).</summary>
+    public Guid? WarehouseId { get; set; }
+
+    [Required]
+    public List<PosLineItemDto> Items { get; set; } = new();
+
+    public string PaymentMethod { get; set; } = "Cash";
+
+    public decimal AmountReceived { get; set; }
+    [StringLength(SalesInvoiceConsts.MaxCurrencyCodeLength)]
+    public string? CurrencyCode { get; set; }
+    public decimal? ExchangeRate { get; set; }
+}
+
+public class PosLineItemDto
+{
+    [Required]
+    public Guid ItemId { get; set; }
+
+    public string Description { get; set; } = null!;
+    public decimal Quantity { get; set; }
+    public decimal UnitPrice { get; set; }
+    public decimal TaxAmount { get; set; }
+}
+
+public class PosInvoiceDto : EntityDto<Guid>
+{
+    public string InvoiceNumber { get; set; } = null!;
+    public DateTime IssueDate { get; set; }
+    public decimal NetTotal { get; set; }
+    public decimal TaxAmount { get; set; }
+    public decimal GrandTotal { get; set; }
+    public decimal AmountReceived { get; set; }
+    public decimal Change { get; set; }
+    public decimal BaseChange { get; set; }
+    public string Status { get; set; } = null!;
+}
+
+public class PosItemDto
+{
+    public Guid Id { get; set; }
+    public string ItemCode { get; set; } = null!;
+    public string ItemName { get; set; } = null!;
+    public decimal SellingPrice { get; set; }
+    public string Uom { get; set; } = null!;
+    public string? Barcode { get; set; }
+}
+
+public class PosItemSearchDto
+{
+    public string? Search { get; set; }
+    public int MaxResultCount { get; set; } = 20;
+    public Guid? WarehouseId { get; set; }
+    public Guid? PosProfileId { get; set; }
+    public Guid? ItemGroupId { get; set; }
+    public bool HideUnavailableItems { get; set; }
+}
+
+public class ScanBarcodeInput
+{
+    [Required]
+    public string Barcode { get; set; } = null!;
+    public Guid? CompanyId { get; set; }
+}
+
+public class BarcodeScanResultDto
+{
+    public bool Found { get; set; }
+    public Guid? ItemId { get; set; }
+    public string? ItemCode { get; set; }
+    public string? ItemName { get; set; }
+    public decimal Rate { get; set; }
+    public string? Uom { get; set; }
+    public string? Barcode { get; set; }
+}

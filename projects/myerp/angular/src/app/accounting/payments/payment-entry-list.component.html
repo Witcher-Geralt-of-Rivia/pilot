@@ -1,0 +1,144 @@
+<abp-page [title]="'::PaymentEntries' | abpLocalization">
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <div class="d-flex gap-2 align-items-center">
+      <input type="text" class="form-control form-control-sm" style="width: 180px;"
+        [placeholder]="'::Search' | abpLocalization" [(ngModel)]="searchTerm" (keyup.enter)="onSearch()">
+      <div class="input-group input-group-sm" style="width: 260px;">
+        <span class="input-group-text"><i class="fa fa-calendar"></i></span>
+        <input type="date" class="form-control" [(ngModel)]="fromDate" (change)="onDateChange()">
+        <span class="input-group-text">–</span>
+        <input type="date" class="form-control" [(ngModel)]="toDate" (change)="onDateChange()">
+      </div>
+      <select class="form-select form-select-sm" style="width: 140px;" [(ngModel)]="statusFilter" (change)="onStatusChange()">
+        <option value="">{{ '::AllStatuses' | abpLocalization }}</option>
+        <option value="Draft">{{ '::Draft' | abpLocalization }}</option>
+        <option value="Submitted">{{ '::Submitted' | abpLocalization }}</option>
+        <option value="Posted">{{ '::Posted' | abpLocalization }}</option>
+        <option value="Cancelled">{{ '::Cancelled' | abpLocalization }}</option>
+      </select>
+      <span class="text-muted small">{{ store.totalCount() }} {{ '::Results' | abpLocalization }}</span>
+    </div>
+    <div class="d-flex gap-2">
+      <button class="btn btn-outline-secondary btn-sm" (click)="exportCsv()">
+        <i class="fa fa-download me-1"></i> {{ '::ExportCSV' | abpLocalization }}
+      </button>
+      <button class="btn btn-primary btn-sm" routerLink="new">
+        <i class="fa fa-plus me-1"></i> {{ '::NewPayment' | abpLocalization }}
+      </button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-body">
+      @if (store.isLoading()) {
+        <div class="text-center py-5">
+          <div class="spinner-border text-primary" role="status">
+            <span class="visually-hidden">Loading...</span>
+          </div>
+        </div>
+      } @else if (store.entities().length === 0) {
+        <div class="text-center py-5">
+          <i class="fa fa-money-bill fa-3x text-muted mb-3 d-block"></i>
+          <h6 class="text-muted">{{ '::NoRecordsFound' | abpLocalization }}</h6>
+          <p class="text-muted small mb-3">{{ '::NoPaymentEntriesYet' | abpLocalization }}</p>
+          <button class="btn btn-primary btn-sm" routerLink="new">
+            <i class="fa fa-plus me-1"></i>{{ '::NewPayment' | abpLocalization }}
+          </button>
+        </div>
+      } @else {
+        <!-- Bulk action bar -->
+        @if (selectedIds.size > 0) {
+          <div class="alert alert-info d-flex align-items-center gap-3 py-2 mb-3">
+            <span class="fw-medium">{{ selectedIds.size }} {{ '::Selected' | abpLocalization }}</span>
+            <button class="btn btn-sm btn-outline-primary" (click)="bulkSubmit()" [disabled]="isBulkProcessing">
+              <i class="fa fa-paper-plane me-1"></i> {{ '::BulkSubmit' | abpLocalization }}
+            </button>
+            <button class="btn btn-sm btn-outline-primary" (click)="bulkPost()" [disabled]="isBulkProcessing">
+              <i class="fa fa-check-double me-1"></i> {{ '::BulkPost' | abpLocalization }}
+            </button>
+            <button class="btn btn-sm btn-outline-secondary" (click)="clearSelection()">
+              <i class="fa fa-times me-1"></i> {{ '::ClearSelection' | abpLocalization }}
+            </button>
+            @if (isBulkProcessing) {
+              <div class="spinner-border spinner-border-sm text-primary ms-2"></div>
+            }
+          </div>
+        }
+        <div class="table-responsive">
+                    <table class="table table-hover w-100">
+            <thead>
+              <tr>
+                <th style="width: 40px;">
+                  <input type="checkbox" class="form-check-input"
+                    [checked]="isAllSelected()"
+                    (change)="toggleSelectAll($any($event.target).checked)">
+                </th>
+                <th style="min-width: 150px;">
+                  <app-sortable-header field="paymentNumber" [currentField]="sortField" [currentDirection]="sortDirection" (sort)="onSort($event)">
+                    {{ '::PaymentNumber' | abpLocalization }}
+                  </app-sortable-header>
+                </th>
+                <th style="width: 110px;">
+                  <app-sortable-header field="postingDate" [currentField]="sortField" [currentDirection]="sortDirection" (sort)="onSort($event)">
+                    {{ '::PaymentDate' | abpLocalization }}
+                  </app-sortable-header>
+                </th>
+                <th>{{ '::Type' | abpLocalization }}</th>
+                <th>{{ '::Party' | abpLocalization }}</th>
+                <th class="text-end" style="width: 130px;">
+                  <app-sortable-header field="paidAmount" [currentField]="sortField" [currentDirection]="sortDirection" (sort)="onSort($event)">
+                    {{ '::Amount' | abpLocalization }}
+                  </app-sortable-header>
+                </th>
+                <th style="width: 120px;">
+                  <app-sortable-header field="status" [currentField]="sortField" [currentDirection]="sortDirection" (sort)="onSort($event)">
+                    {{ '::Status' | abpLocalization }}
+                  </app-sortable-header>
+                </th>
+                <th class="text-end" style="width: 100px;"></th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (row of store.entities(); track row.id ?? $index) {
+                <tr [class.table-active]="selectedIds.has(row.id)">
+                  <td>
+                    <input type="checkbox" class="form-check-input"
+                      [checked]="selectedIds.has(row.id)"
+                      (change)="toggleSelect(row.id, $any($event.target).checked)">
+                  </td>
+                  <td class="fw-medium"><a [routerLink]="['/accounting/payments', row.id]" class="text-decoration-none">{{ row.paymentNumber }}</a></td>
+                  <td>{{ row.postingDate | date:'dd/MM/yyyy' }}</td>
+                  <td>{{ row.paymentType }}</td>
+                  <td class="text-truncate" style="max-width: 160px;">{{ row.partyName || '—' }}</td>
+                  <td class="text-end font-monospace">{{ row.paidAmount | number:'1.2-2' }}</td>
+                  <td><app-status-badge [status]="row.status ?? ''" /></td>
+                  <td class="text-end">
+                    <div class="btn-group btn-group-sm">
+                      @if (row.status === 'Draft') {
+                        <button class="btn btn-outline-primary" (click)="store.submitPayment(row.id)"
+                          title="Submit" aria-label="Submit">
+                          <i class="fa fa-paper-plane"></i>
+                        </button>
+                      }
+                      @if (row.status === 'Submitted') {
+                        <button class="btn btn-outline-primary" (click)="store.postPayment(row.id)"
+                          title="Post" aria-label="Post">
+                          <i class="fa fa-check-double"></i>
+                        </button>
+                      }
+                    </div>
+                  </td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        </div>
+      }
+    </div>
+  </div>
+  <app-pagination
+    [totalCount]="store.totalCount()"
+    [pageSize]="pageSize"
+    [currentPage]="currentPage"
+    (pageChange)="onPageChange($event)" />
+</abp-page>

@@ -1,0 +1,2144 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using MyERP.Core;
+using MyERP.Core.DomainServices;
+using MyERP.Core.Entities;
+using MyERP.Inventory.DomainServices;
+using MyERP.Inventory.Entities;
+using MyERP.Manufacturing.Entities;
+using MyERP.Permissions;
+using MyERP.Settings;
+using MyERP.Shared;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Settings;
+using MyERP.Accounting.Entities;
+using MyERP.Manufacturing;
+using MyERP.Projects.Entities;
+using MyERP.Purchasing.Entities;
+using MyERP.Sales.Entities;
+
+namespace MyERP.Inventory;
+
+[Authorize(MyERPPermissions.StockEntries.Default)]
+public class StockEntryAppService : ApplicationService, IStockEntryAppService
+{
+    private readonly IRepository<StockEntry, Guid> _repository;
+    private readonly IRepository<DocumentActivityLog, Guid> _activityLogRepository;
+    private readonly IDocumentNumberGenerator _numberGenerator;
+    private readonly StockPostingService _stockPostingService;
+    private readonly ISettingProvider _settingProvider;
+
+    public StockEntryAppService(
+        IRepository<StockEntry, Guid> repository,
+        IRepository<DocumentActivityLog, Guid> activityLogRepository,
+        IDocumentNumberGenerator numberGenerator,
+        StockPostingService stockPostingService,
+        ISettingProvider settingProvider)
+    {
+        _repository = repository;
+        _activityLogRepository = activityLogRepository;
+        _numberGenerator = numberGenerator;
+        _stockPostingService = stockPostingService;
+        _settingProvider = settingProvider;
+    }
+
+    public async Task<StockEntryDto> GetAsync(Guid id)
+    {
+        var entry = await _repository.GetAsync(id);
+        var dto = ObjectMapper.Map<StockEntry, StockEntryDto>(entry);
+
+        // Resolve item and warehouse names
+        var itemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Item, Guid>>();
+        var warehouseRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Warehouse, Guid>>();
+
+        var itemIds = dto.Items.Select(i => i.ItemId).Distinct().ToList();
+        var whIds = dto.Items.SelectMany(i => new[] { i.SourceWarehouseId, i.TargetWarehouseId })
+            .Where(id => id.HasValue).Select(id => id!.Value).Distinct().ToList();
+
+        var itemQuery = await itemRepo.GetQueryableAsync();
+        var itemNames = itemQuery.Where(i => itemIds.Contains(i.Id))
+            .Select(i => new { i.Id, i.ItemCode, i.ItemName }).ToList()
+            .ToDictionary(i => i.Id, i => $"{i.ItemCode} — {i.ItemName}");
+
+        var whQuery = await warehouseRepo.GetQueryableAsync();
+        var whNames = whQuery.Where(w => whIds.Contains(w.Id))
+            .Select(w => new { w.Id, w.Name }).ToList()
+            .ToDictionary(w => w.Id, w => w.Name);
+
+        foreach (var item in dto.Items)
+        {
+            item.ItemName = itemNames.GetValueOrDefault(item.ItemId, item.ItemId.ToString()[..8]);
+            if (item.SourceWarehouseId.HasValue)
+                item.SourceWarehouseName = whNames.GetValueOrDefault(item.SourceWarehouseId.Value);
+            if (item.TargetWarehouseId.HasValue)
+                item.TargetWarehouseName = whNames.GetValueOrDefault(item.TargetWarehouseId.Value);
+        }
+
+        return dto;
+    }
+
+    public async Task<PagedResultDto<StockEntryDto>> GetListAsync(CompanyFilteredPagedRequestDto input)
+    {
+        var query = await _repository.GetQueryableAsync();
+
+        if (input.CompanyId.HasValue)
+            query = query.Where(x => x.CompanyId == input.CompanyId.Value);
+
+        if (!string.IsNullOrWhiteSpace(input.Filter))
+        {
+            var filter = input.Filter;
+            query = query.Where(x => x.EntryNumber != null && x.EntryNumber.Contains(filter));
+        }
+
+        if (!string.IsNullOrWhiteSpace(input.Status) && Enum.TryParse<Core.DocumentStatus>(input.Status, true, out var status))
+            query = query.Where(x => x.Status == status);
+
+        if (input.FromDate.HasValue)
+            query = query.Where(x => x.PostingDate >= input.FromDate.Value);
+
+        if (input.ToDate.HasValue)
+            query = query.Where(x => x.PostingDate <= input.ToDate.Value);
+
+        var totalCount = query.Count();
+        var sorted = SortingHelper.ApplySorting(query, input.Sorting,
+            q => q.OrderByDescending(x => x.PostingDate),
+            ("entryNumber", x => (object)(x.EntryNumber ?? string.Empty)),
+            ("postingDate", x => x.PostingDate),
+            ("entryType", x => x.EntryType),
+            ("status", x => x.Status));
+        var entries = sorted
+            .Skip(input.SkipCount)
+            .Take(input.MaxResultCount)
+            .ToList();
+
+        return new PagedResultDto<StockEntryDto>(
+            totalCount,
+            entries.Select(ObjectMapper.Map<StockEntry, StockEntryDto>).ToList());
+    }
+
+    [Authorize(MyERPPermissions.StockEntries.Create)]
+    public async Task<StockEntryDto> CreateAsync(CreateStockEntryDto input)
+    {
+        // Validate items are not empty
+        if (input.Items == null || input.Items.Count == 0)
+            throw new Volo.Abp.BusinessException("MyERP:01007")
+                .WithData("documentType", "Stock Entry");
+
+        // Validate all items are active
+        var itemIds = input.Items.Select(i => i.ItemId).Distinct().ToArray();
+        var itemValidation = LazyServiceProvider.LazyGetRequiredService<DomainServices.ItemTransactionValidationService>();
+        await itemValidation.ValidateItemsForTransactionAsync(itemIds);
+        await ValidateStockItemsAsync(itemIds);
+
+        await ValidateCompanyBoundariesAsync(input, input.CompanyId);
+
+        // Create entry first so we can validate warehouses via domain manager
+        var entryNumber = await _numberGenerator.GenerateAsync("StockEntry", input.CompanyId);
+
+        var entry = new StockEntry(
+            GuidGenerator.Create(),
+            input.CompanyId,
+            input.EntryType,
+            input.PostingDate);
+
+        entry.EntryNumber = entryNumber;
+        entry.ReferenceType = input.ReferenceType;
+        entry.ReferenceId = input.ReferenceId;
+        entry.WorkOrderId = input.WorkOrderId;
+        entry.JobCardId = input.JobCardId;
+        entry.FgCompletedQty = input.FgCompletedQty;
+        entry.ProcessLossQty = input.ProcessLossQty;
+        entry.ProcessLossPercentage = input.ProcessLossPercentage;
+        entry.SyncProcessLoss();
+        entry.IsFgConversion = input.IsFgConversion;
+        entry.WeightPerPiece = input.WeightPerPiece;
+        entry.TotalAdditionalCosts = input.TotalAdditionalCosts;
+        entry.CostCenterId = input.CostCenterId;
+        entry.ProjectId = input.ProjectId;
+        entry.Notes = input.Notes;
+        entry.IsOpening = input.IsOpening;
+        entry.IsReturn = input.IsReturn;
+
+        foreach (var item in input.Items)
+        {
+            entry.AddItem(
+                item.ItemId, item.Quantity, item.SourceWarehouseId, item.TargetWarehouseId,
+                item.ValuationRate, item.IsFinishedItem, item.BatchId,
+                secondaryItemType: item.SecondaryItemType,
+                conversionFactor: item.ConversionFactor > 0 ? item.ConversionFactor : 1m,
+                stockUom: item.StockUom ?? "Unit",
+                valuationType: item.ValuationType,
+                bomSecondaryItemId: item.BomSecondaryItemId,
+                allowZeroValuationRate: item.AllowZeroValuationRate,
+                setBasicRateManually: item.SetBasicRateManually);
+            if (item.CostCenterId.HasValue || input.CostCenterId.HasValue)
+                entry.Items[^1].CostCenterId = item.CostCenterId ?? input.CostCenterId;
+            if (item.ExpenseAccountId.HasValue)
+                entry.Items[^1].ExpenseAccountId = item.ExpenseAccountId;
+            if (item.ProjectId.HasValue || input.ProjectId.HasValue)
+                entry.Items[^1].ProjectId = item.ProjectId ?? input.ProjectId;
+            if (item.AdditionalCost > 0)
+                entry.Items[^1].AdditionalCost = item.AdditionalCost;
+            if (item.MaterialRequestItemId.HasValue)
+                entry.Items[^1].MaterialRequestItemId = item.MaterialRequestItemId;
+        }
+
+        if (entry.TotalAdditionalCosts > 0)
+        {
+            StockEntryManager.DistributeAdditionalCosts(entry);
+        }
+
+        var seManager = LazyServiceProvider.LazyGetRequiredService<StockEntryManager>();
+        if (entry.EntryType == StockEntryType.MaterialTransferForManufacture && entry.WorkOrderId.HasValue)
+        {
+            var sreManager = LazyServiceProvider.LazyGetRequiredService<StockReservationManager>();
+            await seManager.ApplyBatchReservationsForTransferAsync(entry, sreManager);
+        }
+
+        // Delegate purpose-specific validation to StockEntryManager (DDD pattern)
+        // Per DO-NOT: same-warehouse transfers blocked, group warehouses blocked
+        await seManager.ValidateWarehousesAsync(entry);
+        await seManager.ValidateDifferenceAccountAsync(entry);
+        // ValidateRepackItems/ValidateManufactureItems were domain-service methods with no
+        // caller anywhere — a manually-authored Repack or Manufacture Stock Entry (via this
+        // generic create path) skipped their purpose-specific rules entirely (Repack's
+        // outgoing/incoming-item and multi-FG-manual-rate checks; Manufacture's one-unique-FG
+        // rule and mandatory manufactured qty check per PR #58005).
+        seManager.ValidateRepackItems(entry);
+        seManager.ValidateManufactureItems(entry);
+        seManager.ValidateBatchSplit(entry);
+        var mrRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Purchasing.Entities.MaterialRequest, Guid>>();
+        await seManager.ValidateMaterialRequestItemsAsync(entry, mrRepo);
+
+        var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+        var altRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<ItemAlternative, Guid>>();
+        var mfgSettingsRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Manufacturing.Entities.ManufacturingSettings, Guid>>();
+        await seManager.ValidateFgConversionAsync(entry, woRepo, altRepo, _repository, mfgSettingsRepo);
+
+        var mfgSettings = await mfgSettingsRepo.FindAsync(s => s.CompanyId == entry.CompanyId);
+        var overproductionPct = mfgSettings?.OverproductionPercentage ?? 5m;
+        await seManager.ValidateDuplicateManufactureEntryAsync(entry, woRepo, _repository, overproductionPct);
+
+        await seManager.SetAllowAlternativeItemAsync(entry, woRepo);
+
+        var jcRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<JobCard, Guid>>();
+        await seManager.ValidateOperationsCompletedAsync(entry, woRepo, jcRepo, overproductionPct);
+
+        if (entry.WorkOrderId.HasValue)
+        {
+            var wo = await woRepo.FindAsync(entry.WorkOrderId.Value);
+            seManager.ValidateWorkOrderStatus(entry, wo);
+            if (entry.IsReturn)
+            {
+                seManager.ValidateWorkOrderStatusForReturn(entry, wo);
+                seManager.ValidateWorkOrderReturnItems(entry, wo);
+            }
+        }
+
+        await _repository.InsertAsync(entry, autoSave: true);
+        return ObjectMapper.Map<StockEntry, StockEntryDto>(entry);
+    }
+
+    [Authorize(MyERPPermissions.StockEntries.Submit)]
+    public async Task<StockEntryDto> SubmitAsync(Guid id)
+    {
+        var entry = await _repository.GetAsync(id);
+
+        // ERPNext validate_closed_subcontracting_order: no stock movement against a closed SCO.
+        if (entry.SubcontractingOrderId.HasValue)
+        {
+            var scoRepository = LazyServiceProvider.LazyGetRequiredService<IRepository<SubcontractingOrder, Guid>>();
+            var sco = await scoRepository.FindAsync(entry.SubcontractingOrderId.Value);
+            if (sco != null && sco.Status == MyERP.Purchasing.SubcontractingOrderStatus.Closed)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.LinkedSubcontractingOrderClosed)
+                    .WithData("subcontractingOrderNumber", sco.OrderNumber);
+            }
+        }
+
+        // Per DO-NOT: "Allow excess material transfer for manufacture beyond required_qty -
+        // already_transferred_qty" — applies to manually-authored SendToSubcontractor entries too,
+        // not just the auto-generated ones from CreateRmTransferStockEntryAsync (which self-caps).
+        if (entry.EntryType == StockEntryType.SendToSubcontractor && entry.SubcontractingOrderId.HasValue)
+        {
+            var rmService = LazyServiceProvider.LazyGetRequiredService<Purchasing.DomainServices.SubcontractingRmTransferService>();
+            var allowancePctString = await _settingProvider.GetOrNullAsync(MyERPSettings.Buying.OverTransferAllowance);
+            var allowancePct = decimal.TryParse(allowancePctString, out var pct) ? pct : 0m;
+
+            foreach (var line in entry.Items.GroupBy(i => i.ItemId))
+            {
+                await rmService.ValidateTransferQuantityAsync(
+                    entry.SubcontractingOrderId.Value, line.Key, line.Sum(i => i.Quantity), allowancePct);
+            }
+        }
+
+        var seManager = LazyServiceProvider.LazyGetRequiredService<StockEntryManager>();
+        await seManager.ValidateDifferenceAccountAsync(entry);
+        seManager.ValidateBatchSplit(entry);
+
+        if (entry.WeightPerPiece > 0)
+        {
+            var batchSplitManager = LazyServiceProvider.LazyGetRequiredService<DomainServices.BatchSplitManager>();
+            await batchSplitManager.ProcessBatchSplitAsync(entry);
+        }
+
+        var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+        var mfgSettingsRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Manufacturing.Entities.ManufacturingSettings, Guid>>();
+        var mfgSettings = await mfgSettingsRepo.FindAsync(s => s.CompanyId == entry.CompanyId);
+        var overproductionPct = mfgSettings?.OverproductionPercentage ?? 5m;
+
+        if (entry.IsFgConversion)
+        {
+            var altRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<ItemAlternative, Guid>>();
+            await seManager.ValidateFgConversionAsync(entry, woRepo, altRepo, _repository, mfgSettingsRepo);
+        }
+
+        // Operations completion check (per ERPNext PR #58000 / commit 401eb30963 & 26a05044c0)
+        var jcRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<JobCard, Guid>>();
+        await seManager.ValidateOperationsCompletedAsync(entry, woRepo, jcRepo, overproductionPct);
+
+        // Mandatory manufactured qty (PR #58005) & duplicate manufacture check (PR #58004)
+        if (entry.WorkOrderId.HasValue && entry.EntryType == StockEntryType.Manufacture)
+        {
+            var wo = await woRepo.FindAsync(entry.WorkOrderId.Value);
+            seManager.ValidateManufacturedQty(entry, wo);
+            await seManager.ValidateDuplicateManufactureEntryAsync(entry, woRepo, _repository, overproductionPct);
+
+            if (wo != null && wo.BomId != Guid.Empty)
+            {
+                var bomRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<BillOfMaterials, Guid>>();
+                var bom = await bomRepo.FindAsync(wo.BomId, includeDetails: true);
+                if (bom != null && bom.Items.Any())
+                {
+                    var bomItems = bom.Items
+                        .Select(bi => (bi.ItemId, bi.ItemName, bi.GetQtyConsumedPerUnit(bom.Quantity)))
+                        .ToList();
+                    seManager.ValidateManufactureBomComponentQty(entry, bomItems, bom.BomNumber);
+                }
+            }
+        }
+
+        await seManager.SetAllowAlternativeItemAsync(entry, woRepo);
+
+        if (entry.WorkOrderId.HasValue)
+        {
+            var wo = await woRepo.FindAsync(entry.WorkOrderId.Value);
+            seManager.ValidateWorkOrderStatus(entry, wo);
+            if (entry.IsReturn)
+            {
+                seManager.ValidateWorkOrderStatusForReturn(entry, wo);
+                seManager.ValidateWorkOrderReturnItems(entry, wo);
+            }
+        }
+
+        // Validate Job Card submitted before manufacture entry (ERPNext PR #60650 / commit e8b5e394f4)
+        if (entry.EntryType == StockEntryType.Manufacture && entry.JobCardId.HasValue)
+        {
+            var jobCardRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Manufacturing.Entities.JobCard, Guid>>();
+            var jc = await jobCardRepo.FindAsync(entry.JobCardId.Value);
+            if (jc != null && !jc.IsCorrective && jc.Status != MyERP.Manufacturing.JobCardStatus.Completed)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.SubmitJobCardBeforeManufacture)
+                    .WithData("jobCardNumber", jc.Id.ToString());
+            }
+        }
+
+        // Material Request over-fulfillment guard + fulfillment tracking (Transfer/Issue MR types).
+        // Per DO-NOT: "Allow Material Request over-fulfillment beyond mr_qty_allowance percentage" —
+        // this was the one MR-consuming document with zero cap; PO/RFQ already enforce pending qty
+        // via PurchaseConversionAppService. Validate against the CURRENT pending qty (0% allowance,
+        // matching ERPNext's mapper.py hard filter) before committing, then persist the increment.
+        var mrLinkedItems = entry.Items.Where(i => i.MaterialRequestItemId.HasValue).ToList();
+        List<(Guid MaterialRequestItemId, decimal Quantity)>? mrFulfillmentLines = null;
+        if (mrLinkedItems.Any())
+        {
+            var mrRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Purchasing.Entities.MaterialRequest, Guid>>();
+            await seManager.ValidateMaterialRequestItemsAsync(entry, mrRepo);
+
+            var mrManager = LazyServiceProvider.LazyGetRequiredService<Purchasing.DomainServices.MaterialRequestManager>();
+            var mrItemIds = mrLinkedItems.Select(i => i.MaterialRequestItemId!.Value).Distinct().ToList();
+            var mrQuery = await mrRepo.GetQueryableAsync();
+            var affectedMRs = mrQuery.Where(mr => mr.Items.Any(i => mrItemIds.Contains(i.Id))).ToList();
+
+            mrFulfillmentLines = mrLinkedItems
+                .GroupBy(i => i.MaterialRequestItemId!.Value)
+                .Select(g => (MaterialRequestItemId: g.Key, Quantity: g.Sum(i => i.Quantity)))
+                .ToList();
+
+            foreach (var line in mrFulfillmentLines)
+            {
+                var mrItem = affectedMRs.SelectMany(mr => mr.Items).FirstOrDefault(i => i.Id == line.MaterialRequestItemId);
+                if (mrItem == null) continue;
+                mrManager.ValidateOrderedQty(mrItem, mrItem.OrderedQuantity + line.Quantity);
+            }
+        }
+
+        // Traceability mapping validation and auto-mapping (ERPNext PR #59706 / commit d4f5d39ee8)
+        if (entry.EntryType == StockEntryType.Manufacture || entry.EntryType == StockEntryType.Repack)
+        {
+            var bundleRepo = LazyServiceProvider.LazyGetService<IRepository<SerialAndBatchBundle, Guid>>();
+            var batchRepo = LazyServiceProvider.LazyGetService<IRepository<Batch, Guid>>();
+            if (bundleRepo != null)
+            {
+                await StockEntryManager.ValidateFinishedGoodMappingsAsync(entry, bundleRepo, batchRepo);
+
+                var autoMapVal = await _settingProvider.GetOrNullAsync(MyERPSettings.Stock.AutoMapRawMaterialsToFinishedGoods);
+                if (bool.TryParse(autoMapVal, out var autoMap) && autoMap)
+                {
+                    await StockEntryManager.AutoMapRawMaterialsToFinishedGoodsAsync(entry, bundleRepo, batchRepo);
+                }
+            }
+        }
+
+        // Auto-assign batches for outward rows if enabled
+        // Per ERPNext PR #60120 / commits d148eeebfd & bd1fa04508:
+        // auto_create_serial_and_batch_bundle_for_outward allocates batches before submit with cumulative row exclusions
+        var autoPickSetting = await _settingProvider.GetOrNullAsync(MyERPSettings.Stock.AutoCreateSerialAndBatchBundleForOutward);
+        if (bool.TryParse(autoPickSetting, out var autoPickOutward) && autoPickOutward)
+        {
+            await AutoAssignBatchesForEntryAsync(entry);
+        }
+
+        entry.Submit();
+
+        if (mrFulfillmentLines != null)
+        {
+            var mrManager = LazyServiceProvider.LazyGetRequiredService<Purchasing.DomainServices.MaterialRequestManager>();
+            await mrManager.UpdateFulfillmentForItemsAsync(mrFulfillmentLines);
+        }
+
+        await _repository.UpdateAsync(entry, autoSave: true);
+        return ObjectMapper.Map<StockEntry, StockEntryDto>(entry);
+    }
+
+    [Authorize(MyERPPermissions.StockEntries.Post)]
+    public async Task<StockEntryDto> PostAsync(Guid id)
+    {
+        var entry = await _repository.GetAsync(id);
+        entry.Post();
+
+        // Batch expiry validation for outward stock paths
+        // Per DO-NOT: must block expired batch consumption in transactions
+        {
+            var batchOutItems = entry.Items
+                .Where(i => i.SourceWarehouseId.HasValue && i.BatchId.HasValue)
+                .Select(i => new DomainServices.BatchValidationItem(i.ItemId, i.BatchId, null))
+                .ToList();
+            if (batchOutItems.Any())
+            {
+                var batchValidation = LazyServiceProvider.LazyGetRequiredService<DomainServices.BatchExpiryValidationService>();
+                await batchValidation.ValidateForStockOutAsync(batchOutItems, entry.PostingDate);
+            }
+        }
+
+        // Quality Inspection enforcement for outward stock paths
+        // Per DO-NOT: Material Consumption for Manufacture is explicitly excluded
+        {
+            var itemIds = entry.Items.Select(i => i.ItemId).Distinct().ToArray();
+            if (itemIds.Length > 0)
+            {
+                var qiEnforcement = LazyServiceProvider.LazyGetRequiredService<DomainServices.QualityInspectionEnforcementService>();
+                await qiEnforcement.ValidateForStockEntryAsync(
+                    entry.Id, itemIds, entry.EntryType.ToString(), entry.TenantId);
+            }
+        }
+
+        // Create SLE entries + update Bin balances
+        await _stockPostingService.PostStockEntryAsync(entry);
+
+        // GL posting for perpetual inventory (stock movement accounting)
+        // Uses configured accounting rules: Material Receipt → DR Stock CR Adj,
+        // Material Issue → DR Expense CR Stock, Transfer → no P&L impact.
+        // Routed through the orchestrator (not _ruleEngine directly) so the Journal Entry
+        // is actually validated against period-closure and persisted — calling _ruleEngine
+        // alone builds and discards it in memory, it is never written to the ledger.
+        var postingOrchestratorForPost = LazyServiceProvider
+            .LazyGetRequiredService<Accounting.DomainServices.DocumentPostingOrchestrator>();
+        await postingOrchestratorForPost.PostStockEntryAsync(entry);
+
+        // Update Work Order material transferred qty for manufacturing transfers
+        // Per ERPNext PR #58091 / #58080: exclude corrective job card transfers from Work Order transferred qty
+        if (entry.EntryType == StockEntryType.MaterialTransferForManufacture && entry.WorkOrderId.HasValue)
+        {
+            bool isCorrective = false;
+            if (entry.JobCardId.HasValue)
+            {
+                var jcRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Manufacturing.Entities.JobCard, Guid>>();
+                var jc = await jcRepo.FindAsync(entry.JobCardId.Value);
+                isCorrective = jc?.IsCorrective ?? false;
+            }
+
+            if (!isCorrective)
+            {
+                var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+                var wo = await woRepo.GetAsync(entry.WorkOrderId.Value, includeDetails: true);
+                var totalTransferredQty = entry.Items.Sum(i => i.StockQty);
+                if (entry.IsReturn)
+                {
+                    var seManager = LazyServiceProvider.LazyGetRequiredService<StockEntryManager>();
+                    seManager.ValidateWorkOrderStatusForReturn(entry, wo);
+                    seManager.ValidateWorkOrderReturnItems(entry, wo);
+
+                    wo.MaterialTransferred = Math.Max(0, wo.MaterialTransferred - totalTransferredQty);
+                    foreach (var seItem in entry.Items)
+                    {
+                        Manufacturing.DomainServices.WorkOrderManager.DistributeTransferredQuantity(
+                            wo, seItem.ItemId, seItem.SourceWarehouseId, seItem.StockQty, isDeduction: true);
+
+                        if (seItem.SourceWarehouseId.HasValue)
+                        {
+                            var sreManager = LazyServiceProvider.LazyGetRequiredService<StockReservationManager>();
+                            await sreManager.RevertWorkOrderTransferAsync(
+                                wo.Id, seItem.ItemId, seItem.SourceWarehouseId.Value, seItem.StockQty, seItem.BatchId,
+                                targetWarehouseId: seItem.TargetWarehouseId, stockEntryId: entry.Id);
+                        }
+                    }
+                    var dateWoManager = LazyServiceProvider.LazyGetRequiredService<Manufacturing.DomainServices.WorkOrderManager>();
+                    var dateJcRepo = LazyServiceProvider.LazyGetService<IRepository<Manufacturing.Entities.JobCard, Guid>>();
+                    await dateWoManager.UpdateActualDatesAsync(wo, _repository, dateJcRepo, currentStockEntry: entry);
+                    await woRepo.UpdateAsync(wo, autoSave: true);
+                }
+                else
+                {
+                    wo.RecordMaterialTransfer(totalTransferredQty);
+
+                    // Per ERPNext PR #47511 / commit 963d1e502e & PR #47548 / commit fc554ba599:
+                    // Track transferred qty and add extra/additional items against work order unless ValidateComponentsQuantitiesPerBom is set
+                    var mfgSettingsRepo = LazyServiceProvider.LazyGetService<IRepository<Manufacturing.Entities.ManufacturingSettings, Guid>>();
+                    var mfgSettings = mfgSettingsRepo != null
+                        ? (await mfgSettingsRepo.GetQueryableAsync()).FirstOrDefault(s => s.CompanyId == entry.CompanyId)
+                        : null;
+                    var disallowAdditionalItems = mfgSettings?.ValidateComponentsQuantitiesPerBom ?? false;
+
+                    foreach (var seItem in entry.Items)
+                    {
+                        var hasExisting = wo.RequiredItems.Any(ri => ri.ItemId == seItem.ItemId);
+                        if (hasExisting)
+                        {
+                            Manufacturing.DomainServices.WorkOrderManager.DistributeTransferredQuantity(
+                                wo, seItem.ItemId, seItem.SourceWarehouseId, seItem.StockQty, isDeduction: false);
+                        }
+                        else if (!disallowAdditionalItems)
+                        {
+                            var itemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Item, Guid>>();
+                            var itemObj = await itemRepo.FindAsync(seItem.ItemId);
+                            var itemName = itemObj?.ItemName ?? "Additional Item";
+                            var stockUom = itemObj?.Uom ?? "Unit";
+
+                            var addlItem = new WorkOrderItem(
+                                GuidGenerator.Create(), wo.Id, seItem.ItemId,
+                                itemName, seItem.StockQty)
+                            {
+                                TransferredQuantity = seItem.StockQty,
+                                SourceWarehouseId = seItem.SourceWarehouseId,
+                                StockUom = stockUom,
+                                IsAdditionalItem = true,
+                                VoucherDetailReference = seItem.Id,
+                            };
+                            wo.RequiredItems.Add(addlItem);
+                        }
+
+                        // Per ERPNext PR #59424 / commit dbada3f461: apply transfer on work order reservations with batch matching
+                        if (seItem.SourceWarehouseId.HasValue)
+                        {
+                            var sreManager = LazyServiceProvider.LazyGetRequiredService<StockReservationManager>();
+                            await sreManager.ApplyWorkOrderTransferAsync(
+                                wo.Id, seItem.ItemId, seItem.SourceWarehouseId.Value, seItem.StockQty, seItem.BatchId,
+                                targetWarehouseId: seItem.TargetWarehouseId, stockEntryId: entry.Id, stockEntryItemId: seItem.Id);
+                        }
+                    }
+
+                    var dateWoManager = LazyServiceProvider.LazyGetRequiredService<Manufacturing.DomainServices.WorkOrderManager>();
+                    var dateJcRepo = LazyServiceProvider.LazyGetService<IRepository<Manufacturing.Entities.JobCard, Guid>>();
+                    await dateWoManager.UpdateActualDatesAsync(wo, _repository, dateJcRepo, currentStockEntry: entry);
+                    await woRepo.UpdateAsync(wo, autoSave: true);
+                }
+            }
+        }
+
+        // Update Job Card transferred qty and transfer status (ERPNext PR #60650 / commit beaca59338)
+        if (entry.JobCardId.HasValue && entry.EntryType == StockEntryType.MaterialTransferForManufacture)
+        {
+            var jcRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Manufacturing.Entities.JobCard, Guid>>();
+            var jc = await jcRepo.FindAsync(entry.JobCardId.Value);
+            if (jc != null && entry.WorkOrderId.HasValue)
+            {
+                var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+                var jcManager = LazyServiceProvider.LazyGetRequiredService<Manufacturing.DomainServices.JobCardManager>();
+                var matchingItems = await jcManager.GetRawMaterialsAsync(jc, woRepo);
+                var wo = await woRepo.FindAsync(entry.WorkOrderId.Value);
+                if (wo != null && matchingItems.Any() && wo.Quantity > 0)
+                {
+                    decimal minFraction = decimal.MaxValue;
+                    bool anyTransferred = false;
+                    bool allTransferred = true;
+
+                    foreach (var rm in matchingItems)
+                    {
+                        var expected = (rm.RequiredQuantity / wo.Quantity) * jc.ForQuantity;
+                        if (expected > 0)
+                        {
+                            var fraction = rm.TransferredQuantity / expected;
+                            if (fraction < minFraction)
+                            {
+                                minFraction = fraction;
+                            }
+                            if (rm.TransferredQuantity > 0)
+                            {
+                                anyTransferred = true;
+                            }
+                            if (rm.TransferredQuantity < expected - 0.0001m)
+                            {
+                                allTransferred = false;
+                            }
+                        }
+                    }
+
+                    if (minFraction == decimal.MaxValue) minFraction = 0m;
+                    jc.TransferredQty = Math.Min(jc.ForQuantity, Math.Max(0m, Math.Round(minFraction * jc.ForQuantity, 4)));
+                    jc.UpdateTransferStatus(allTransferred, anyTransferred);
+                    await jcRepo.UpdateAsync(jc, autoSave: true);
+                }
+            }
+        }
+
+        // Update Subcontracting Order's supplied-item TransferredQty for RM transfers.
+        // Without this, SubcontractingRmTransferService.CalculateRmRequirementsAsync would keep
+        // reporting the full required qty as pending forever, and ValidateTransferQuantityAsync's
+        // "already transferred" figure would never move.
+        if (entry.EntryType == StockEntryType.SendToSubcontractor && entry.SubcontractingOrderId.HasValue)
+        {
+            var rmService = LazyServiceProvider.LazyGetRequiredService<Purchasing.DomainServices.SubcontractingRmTransferService>();
+            var transferLines = entry.Items
+                .GroupBy(i => i.ItemId)
+                .Select(g => new Purchasing.DomainServices.RmTransferLine { ItemId = g.Key, Qty = g.Sum(i => i.Quantity) });
+            await rmService.RecordRmTransferAsync(entry.SubcontractingOrderId.Value, transferLines);
+        }
+
+        // Update Work Order produced qty for manufacture entries
+        if (entry.EntryType == StockEntryType.Manufacture && entry.WorkOrderId.HasValue)
+        {
+            var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+            var wo = await woRepo.GetAsync(entry.WorkOrderId.Value, includeDetails: true);
+            // FG qty = sum of items going to target warehouse (finished goods)
+            var fgQty = entry.Items
+                .Where(i => i.TargetWarehouseId.HasValue && !i.SourceWarehouseId.HasValue)
+                .Sum(i => i.Quantity);
+            var processLoss = entry.ProcessLossQty > 0
+                ? entry.ProcessLossQty
+                : (entry.FgCompletedQty > fgQty ? entry.FgCompletedQty - fgQty : 0m);
+
+            // Track raw materials consumed against Work Order
+            foreach (var seItem in entry.Items.Where(i => i.SourceWarehouseId.HasValue && !i.IsFinishedItem && !i.TargetWarehouseId.HasValue))
+            {
+                Manufacturing.DomainServices.WorkOrderManager.DistributeConsumedQuantity(
+                    wo, seItem.ItemId, seItem.SourceWarehouseId, seItem.Quantity, isDeduction: false);
+
+                // Per ERPNext PR #59424 & PR #60647: apply consumption on work order reservations with batch matching
+                var sreManager = LazyServiceProvider.LazyGetRequiredService<StockReservationManager>();
+                await sreManager.ApplyWorkOrderConsumptionAsync(
+                    wo.Id, seItem.ItemId, seItem.SourceWarehouseId!.Value, seItem.Quantity, seItem.BatchId);
+            }
+
+            if (fgQty > 0 || processLoss > 0)
+            {
+                var mfgSettingsRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Manufacturing.Entities.ManufacturingSettings, Guid>>();
+                var mfgSettings = await mfgSettingsRepo.FindAsync(s => s.CompanyId == entry.CompanyId);
+                var overproductionPct = mfgSettings?.OverproductionPercentage ?? 0m;
+
+                if (wo.ProductionPlanId.HasValue)
+                {
+                    var planRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Manufacturing.Entities.ProductionPlan, Guid>>();
+                    var woManager = LazyServiceProvider.LazyGetRequiredService<Manufacturing.DomainServices.WorkOrderManager>();
+                    await woManager.ValidateProductionPlanQuantityAsync(wo, planRepo, woRepo, overproductionPct);
+                }
+
+                wo.RecordProduction(fgQty, overproductionPercentage: overproductionPct, processLoss: processLoss);
+                var dateWoManager = LazyServiceProvider.LazyGetRequiredService<Manufacturing.DomainServices.WorkOrderManager>();
+                var dateJcRepo = LazyServiceProvider.LazyGetService<IRepository<Manufacturing.Entities.JobCard, Guid>>();
+                await dateWoManager.UpdateActualDatesAsync(wo, _repository, dateJcRepo, currentStockEntry: entry);
+                await woRepo.UpdateAsync(wo, autoSave: true);
+
+                if (wo.SalesOrderId.HasValue)
+                {
+                    var soRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.SalesOrder, Guid>>();
+                    await dateWoManager.UpdateSalesOrderWorkOrderQtyAsync(wo.SalesOrderId.Value, soRepo, woRepo);
+                }
+
+                var planItemRepo = LazyServiceProvider.LazyGetService<IRepository<Manufacturing.Entities.ProductionPlanItem, Guid>>();
+                if (planItemRepo != null)
+                {
+                    var planItemQuery = await planItemRepo.GetQueryableAsync();
+                    var linkedPlanItem = planItemQuery.FirstOrDefault(p => (wo.ProductionPlanItemId.HasValue && p.Id == wo.ProductionPlanItemId.Value) || p.WorkOrderId == wo.Id);
+                    if (linkedPlanItem != null)
+                    {
+                        linkedPlanItem.ProducedQty = wo.ProducedQuantity;
+                        await planItemRepo.UpdateAsync(linkedPlanItem, autoSave: true);
+                    }
+                }
+
+                // Per ERPNext PR #59449 & #59454: sync production plan status (releases reservations if complete; keeps closed plan closed)
+                if (wo.ProductionPlanId.HasValue)
+                {
+                    var planRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Manufacturing.Entities.ProductionPlan, Guid>>();
+                    var plan = await planRepo.GetAsync(wo.ProductionPlanId.Value, includeDetails: true);
+                    if (plan.Status != Manufacturing.ProductionPlanStatus.Closed)
+                    {
+                        var allProduced = plan.PlannedItems.All(p => p.PlannedQty - p.ProducedQty < 0.0001m);
+                        var woQuery = await woRepo.GetQueryableAsync();
+                        var openWos = woQuery.Where(w => w.ProductionPlanId == plan.Id
+                            && w.Status != Manufacturing.WorkOrderStatus.Cancelled
+                            && w.Status != Manufacturing.WorkOrderStatus.Closed).ToList();
+                        var allWosCompleted = openWos.Count == 0 || openWos.All(w => w.Status == Manufacturing.WorkOrderStatus.Completed);
+                        var anyProduced = plan.PlannedItems.Any(p => p.ProducedQty > 0);
+
+                        plan.UpdateProducedStatus(allProduced && allWosCompleted, anyProduced);
+                        await planRepo.UpdateAsync(plan, autoSave: true);
+                    }
+                }
+
+
+                // Per ERPNext PR #59419 / commit d687024b88: refresh planned qty after status update
+                var fgWhId = entry.Items.FirstOrDefault(i => i.TargetWarehouseId.HasValue && !i.SourceWarehouseId.HasValue)?.TargetWarehouseId ?? wo.FgWarehouseId;
+                if (fgWhId.HasValue)
+                {
+                    var binService = LazyServiceProvider.LazyGetRequiredService<DomainServices.BinService>();
+                    var woManager = LazyServiceProvider.LazyGetRequiredService<Manufacturing.DomainServices.WorkOrderManager>();
+                    await woManager.RefreshPlannedQtyAsync(woRepo, binService, wo.ItemId, fgWhId.Value, entry.TenantId);
+                }
+            }
+
+            // Auto-reserve finished goods for linked Sales Order (ERPNext PR #47382 / commit 5225d4c318)
+            if (wo.SalesOrderId.HasValue && fgQty > 0)
+            {
+                try
+                {
+                    var soRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesOrder, Guid>>();
+                    var so = (await soRepo.WithDetailsAsync(s => s.Items)).FirstOrDefault(s => s.Id == wo.SalesOrderId.Value);
+                    if (so != null && so.Status == DocumentStatus.Submitted)
+                    {
+                        var soItem = wo.SalesOrderItemId.HasValue
+                            ? so.Items.FirstOrDefault(i => i.Id == wo.SalesOrderItemId.Value)
+                            : so.Items.FirstOrDefault(i => i.ItemId == wo.ItemId);
+
+                        if (soItem != null)
+                        {
+                            var targetWarehouseId = entry.Items
+                                .FirstOrDefault(i => i.TargetWarehouseId.HasValue && !i.SourceWarehouseId.HasValue)?.TargetWarehouseId
+                                ?? wo.FgWarehouseId;
+
+                            if (targetWarehouseId.HasValue)
+                            {
+                                var sreManager = LazyServiceProvider.LazyGetRequiredService<StockReservationManager>();
+                                var existingReserved = await sreManager.GetReservedQtyAsync(soItem.ItemId, targetWarehouseId.Value);
+
+                                // Per ERPNext PR #47382 / commit 5225d4c318:
+                                // Pending reservable qty = stock_qty - (stock_reserved_qty + delivered_qty)
+                                var pendingReservableQty = Math.Max(0, (soItem.Quantity - soItem.DeliveredQty) * soItem.ConversionFactor - existingReserved);
+                                var reserveQty = Math.Min(fgQty, pendingReservableQty);
+
+                                if (reserveQty > 0)
+                                {
+                                    await sreManager.ReserveStockAsync(
+                                        soItem.ItemId, targetWarehouseId.Value, entry.CompanyId,
+                                        reserveQty, "SalesOrder", so.Id, null, entry.TenantId);
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogWarning(ex, "Auto-reserve finished goods for SO failed after Work Order {WorkOrderId} Manufacture entry {EntryId} — non-blocking", wo.Id, entry.Id);
+                }
+            }
+        }
+
+        // Update Work Order disassembled qty for disassemble entries (ERPNext PR #48184 / commit 3e4d160626)
+        if (entry.EntryType == StockEntryType.Disassemble && entry.WorkOrderId.HasValue)
+        {
+            var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+            var wo = await woRepo.GetAsync(entry.WorkOrderId.Value);
+            var disQty = entry.FgCompletedQty > 0
+                ? entry.FgCompletedQty
+                : entry.Items.Where(i => i.IsFinishedItem || (i.SourceWarehouseId.HasValue && !i.TargetWarehouseId.HasValue)).Sum(i => i.Quantity);
+            if (disQty > 0)
+            {
+                wo.RecordDisassembly(disQty);
+                await woRepo.UpdateAsync(wo, autoSave: true);
+            }
+        }
+
+        // Update Work Order consumed qty for material consumption entries
+        // Per ERPNext PR #61500: only count rows with SourceWarehouseId and !IsFinishedItem && !TargetWarehouseId,
+        // and distribute proportionally across matching WorkOrder RequiredItems rows.
+        if (entry.EntryType == StockEntryType.MaterialConsumptionForManufacture && entry.WorkOrderId.HasValue)
+        {
+            var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+            var wo = await woRepo.GetAsync(entry.WorkOrderId.Value, includeDetails: true);
+            foreach (var seItem in entry.Items.Where(i => i.SourceWarehouseId.HasValue && !i.IsFinishedItem && !i.TargetWarehouseId.HasValue))
+            {
+                MyERP.Manufacturing.DomainServices.WorkOrderManager.DistributeConsumedQuantity(
+                    wo, seItem.ItemId, seItem.SourceWarehouseId, seItem.Quantity);
+            }
+            await woRepo.UpdateAsync(wo, autoSave: true);
+        }
+
+        // Auto-reorder check for stock-out entries (Issue, Transfer source)
+        if (entry.EntryType == StockEntryType.MaterialIssue
+            || entry.EntryType == StockEntryType.MaterialTransfer
+            || entry.EntryType == StockEntryType.MaterialTransferForManufacture)
+        {
+            var autoReorder = LazyServiceProvider.LazyGetRequiredService<DomainServices.AutoReorderService>();
+            foreach (var item in entry.Items.Where(i => i.SourceWarehouseId.HasValue))
+            {
+                await autoReorder.CheckSingleItemAsync(
+                    item.ItemId, item.SourceWarehouseId!.Value, entry.CompanyId, entry.TenantId);
+            }
+
+            // Low-stock alert for procurement staff, distinct from AutoReorderService above
+            // (which auto-creates a Material Request) — StockAlertNotificationService had zero
+            // callers anywhere despite its own doc comment saying it should fire here.
+            var stockAlert = LazyServiceProvider.LazyGetRequiredService<DomainServices.StockAlertNotificationService>();
+            var alertWarehouseGroups = entry.Items
+                .Where(i => i.SourceWarehouseId.HasValue)
+                .GroupBy(i => i.SourceWarehouseId!.Value);
+            foreach (var group in alertWarehouseGroups)
+            {
+                await stockAlert.CheckMultipleAndNotifyAsync(
+                    group.Select(i => i.ItemId), group.Key, entry.CompanyId, entry.TenantId);
+            }
+        }
+
+        // Update project costing based on item-level ProjectId (per ERPNext PR #51014 / commit e57d2b4811)
+        await UpdateProjectCostingAsync(entry, sign: 1);
+
+        await _repository.UpdateAsync(entry, autoSave: true);
+
+        // Audit trail
+        await _activityLogRepository.InsertAsync(new DocumentActivityLog(
+            GuidGenerator.Create(), "StockEntry", entry.Id, "Posted",
+            entry.CompanyId, entry.EntryNumber, "Submitted", "Posted",
+            CurrentUser.Id, tenantId: entry.TenantId));
+
+        return ObjectMapper.Map<StockEntry, StockEntryDto>(entry);
+    }
+
+    [Authorize(MyERPPermissions.StockEntries.Cancel)]
+    public async Task<StockEntryDto> CancelAsync(Guid id)
+    {
+        var entry = await _repository.GetAsync(id);
+
+        // Validate posting period is not frozen/closed before reversing
+        var postingOrchestrator = LazyServiceProvider
+            .LazyGetRequiredService<Accounting.DomainServices.DocumentPostingOrchestrator>();
+        await postingOrchestrator.ValidatePostingPeriodAsync(entry.CompanyId, entry.PostingDate, "StockEntry");
+
+        // Repost Guard: cannot cancel while an active valuation repost is in progress (gotcha #6183)
+        var repostGuard = LazyServiceProvider.LazyGetRequiredService<Inventory.DomainServices.StockRepostGuardService>();
+        await repostGuard.ValidateCanCancelVoucherAsync("StockEntry", entry.Id);
+
+        // Guard: cannot cancel a Stock Entry linked to a Completed Work Order. Per ERPNext
+        // validate_work_order_status(): the WO is done (FG received, downstream DN/SI may
+        // already reference the produced items), so reversing material movements now would
+        // corrupt a finished production run. This is the reverse of the "can't cancel a WO
+        // with submitted Stock Entries" guard — this one gates the Stock Entry side.
+        if (entry.WorkOrderId.HasValue)
+        {
+            var workOrderRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+            var workOrder = await workOrderRepo.FindAsync(entry.WorkOrderId.Value);
+            if (workOrder != null && workOrder.Status == Manufacturing.WorkOrderStatus.Completed)
+            {
+                throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                    .WithData("detail", "Cannot cancel this transaction — the linked Work Order is Completed.");
+            }
+        }
+
+        entry.Cancel();
+
+        // Reverse Material Request fulfillment tracking (mirrors PurchaseOrderManager's
+        // UpdateMaterialRequestOrderedQtyAsync(reverse: true) on PO Cancel).
+        var mrLinkedItemsForCancel = entry.Items.Where(i => i.MaterialRequestItemId.HasValue).ToList();
+        if (mrLinkedItemsForCancel.Any())
+        {
+            var mrManager = LazyServiceProvider.LazyGetRequiredService<Purchasing.DomainServices.MaterialRequestManager>();
+            var lines = mrLinkedItemsForCancel
+                .GroupBy(i => i.MaterialRequestItemId!.Value)
+                .Select(g => (MaterialRequestItemId: g.Key, Quantity: g.Sum(i => i.Quantity)));
+            await mrManager.UpdateFulfillmentForItemsAsync(lines, reverse: true);
+        }
+
+        if (entry.WeightPerPiece > 0)
+        {
+            var batchSplitManager = LazyServiceProvider.LazyGetRequiredService<DomainServices.BatchSplitManager>();
+            await batchSplitManager.CancelBatchSplitAsync(entry);
+        }
+
+        // Keep WorkOrder.ProducedQuantity in sync when a Manufacture entry is cancelled — it's
+        // the only signal CancelWorkOrderAsync's own stock-reversal block has for "how much of
+        // this WO's production is still unreversed." Without this, cancelling this Stock Entry
+        // (which already reverses SLE/Bin/GL below) then cancelling the WO would reverse the
+        // same units a second time via that block (round-76 fix).
+        if (entry.WorkOrderId.HasValue && entry.EntryType == StockEntryType.Manufacture)
+        {
+            var workOrderRepoForProduction = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+            var producingWorkOrder = await workOrderRepoForProduction.FindAsync(entry.WorkOrderId.Value, includeDetails: true);
+            if (producingWorkOrder != null)
+            {
+                var fgQty = entry.Items
+                    .Where(i => i.TargetWarehouseId.HasValue && !i.SourceWarehouseId.HasValue)
+                    .Sum(i => i.Quantity);
+                var processLoss = entry.ProcessLossQty > 0
+                    ? entry.ProcessLossQty
+                    : (entry.FgCompletedQty > fgQty ? entry.FgCompletedQty - fgQty : 0m);
+
+                // Roll back raw materials consumed against Work Order
+                foreach (var seItem in entry.Items.Where(i => i.SourceWarehouseId.HasValue && !i.IsFinishedItem && !i.TargetWarehouseId.HasValue))
+                {
+                    Manufacturing.DomainServices.WorkOrderManager.DistributeConsumedQuantity(
+                        producingWorkOrder, seItem.ItemId, seItem.SourceWarehouseId, seItem.Quantity, isDeduction: true);
+
+                    // Per ERPNext PR #59424 & PR #60647: revert consumption on work order reservations with batch matching
+                    var sreManager = LazyServiceProvider.LazyGetRequiredService<StockReservationManager>();
+                    await sreManager.RevertWorkOrderConsumptionAsync(
+                        producingWorkOrder.Id, seItem.ItemId, seItem.SourceWarehouseId!.Value, seItem.Quantity, seItem.BatchId);
+                }
+
+                producingWorkOrder.ReverseProduction(fgQty, processLoss: processLoss);
+                var dateWoManager = LazyServiceProvider.LazyGetRequiredService<Manufacturing.DomainServices.WorkOrderManager>();
+                var dateJcRepo = LazyServiceProvider.LazyGetService<IRepository<Manufacturing.Entities.JobCard, Guid>>();
+                await dateWoManager.UpdateActualDatesAsync(producingWorkOrder, _repository, dateJcRepo, currentStockEntry: entry);
+                await workOrderRepoForProduction.UpdateAsync(producingWorkOrder);
+
+                if (producingWorkOrder.SalesOrderId.HasValue)
+                {
+                    var soRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.SalesOrder, Guid>>();
+                    await dateWoManager.UpdateSalesOrderWorkOrderQtyAsync(producingWorkOrder.SalesOrderId.Value, soRepo, workOrderRepoForProduction);
+                }
+
+                var planItemRepo = LazyServiceProvider.LazyGetService<IRepository<Manufacturing.Entities.ProductionPlanItem, Guid>>();
+                if (planItemRepo != null)
+                {
+                    var planItemQuery = await planItemRepo.GetQueryableAsync();
+                    var linkedPlanItem = planItemQuery.FirstOrDefault(p => p.WorkOrderId == producingWorkOrder.Id);
+                    if (linkedPlanItem != null)
+                    {
+                        linkedPlanItem.ProducedQty = producingWorkOrder.ProducedQuantity;
+                        await planItemRepo.UpdateAsync(linkedPlanItem, autoSave: true);
+                    }
+                }
+
+                // Per ERPNext PR #59449 & #59454: sync production plan status (reverts completion and restores reservations if production reversed)
+                if (producingWorkOrder.ProductionPlanId.HasValue)
+                {
+                    var planRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Manufacturing.Entities.ProductionPlan, Guid>>();
+                    var plan = await planRepo.GetAsync(producingWorkOrder.ProductionPlanId.Value, includeDetails: true);
+                    if (plan.Status != Manufacturing.ProductionPlanStatus.Closed)
+                    {
+                        var allProduced = plan.PlannedItems.All(p => p.PlannedQty - p.ProducedQty < 0.0001m);
+                        var woQuery = await workOrderRepoForProduction.GetQueryableAsync();
+                        var openWos = woQuery.Where(w => w.ProductionPlanId == plan.Id
+                            && w.Status != Manufacturing.WorkOrderStatus.Cancelled
+                            && w.Status != Manufacturing.WorkOrderStatus.Closed).ToList();
+                        var allWosCompleted = openWos.Count == 0 || openWos.All(w => w.Status == Manufacturing.WorkOrderStatus.Completed);
+                        var anyProduced = plan.PlannedItems.Any(p => p.ProducedQty > 0);
+
+                        plan.UpdateProducedStatus(allProduced && allWosCompleted, anyProduced);
+                        await planRepo.UpdateAsync(plan, autoSave: true);
+                    }
+                }
+
+
+                // Per ERPNext PR #59419 / commit d687024b88: refresh planned qty after status update
+                var fgWhId = entry.Items.FirstOrDefault(i => i.TargetWarehouseId.HasValue && !i.SourceWarehouseId.HasValue)?.TargetWarehouseId ?? producingWorkOrder.FgWarehouseId;
+                if (fgWhId.HasValue)
+                {
+                    var binService = LazyServiceProvider.LazyGetRequiredService<DomainServices.BinService>();
+                    var woManager = LazyServiceProvider.LazyGetRequiredService<Manufacturing.DomainServices.WorkOrderManager>();
+                    await woManager.RefreshPlannedQtyAsync(workOrderRepoForProduction, binService, producingWorkOrder.ItemId, fgWhId.Value, entry.TenantId);
+                }
+            }
+        }
+
+        // Reverse WorkOrder.RequiredItems.ConsumedQuantity on MaterialConsumption cancellation
+        if (entry.WorkOrderId.HasValue && entry.EntryType == StockEntryType.MaterialConsumptionForManufacture)
+        {
+            var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+            var wo = await woRepo.FindAsync(entry.WorkOrderId.Value, includeDetails: true);
+            if (wo != null)
+            {
+                foreach (var seItem in entry.Items)
+                {
+                    var reqItem = wo.RequiredItems.FirstOrDefault(ri => ri.ItemId == seItem.ItemId);
+                    if (reqItem != null)
+                    {
+                        reqItem.ConsumedQuantity = Math.Max(0, reqItem.ConsumedQuantity - seItem.Quantity);
+                    }
+                }
+                await woRepo.UpdateAsync(wo);
+            }
+        }
+
+        // Reverse WorkOrder.DisassembledQuantity on Disassemble cancellation (ERPNext PR #48184 / commit 3e4d160626)
+        if (entry.WorkOrderId.HasValue && entry.EntryType == StockEntryType.Disassemble)
+        {
+            var workOrderRepoForDisassembly = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+            var woForDisassembly = await workOrderRepoForDisassembly.FindAsync(entry.WorkOrderId.Value);
+            if (woForDisassembly != null)
+            {
+                var disQty = entry.FgCompletedQty > 0
+                    ? entry.FgCompletedQty
+                    : entry.Items.Where(i => i.IsFinishedItem || (i.SourceWarehouseId.HasValue && !i.TargetWarehouseId.HasValue)).Sum(i => i.Quantity);
+                woForDisassembly.ReverseDisassembly(disQty);
+                await workOrderRepoForDisassembly.UpdateAsync(woForDisassembly);
+            }
+        }
+
+        // Reverse Material Transfer for Manufacture: reduce TransferredQuantity or remove additional items (ERPNext PR #47511 / commit 963d1e502e)
+        if (entry.WorkOrderId.HasValue && entry.EntryType == StockEntryType.MaterialTransferForManufacture)
+        {
+            var workOrderRepoForTransfer = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+            var woForTransfer = await workOrderRepoForTransfer.FindAsync(entry.WorkOrderId.Value, includeDetails: true);
+            if (woForTransfer != null)
+            {
+                var totalTransferredQty = entry.Items.Sum(i => i.Quantity);
+                if (entry.IsReturn)
+                {
+                    woForTransfer.RecordMaterialTransfer(totalTransferredQty);
+                    foreach (var seItem in entry.Items)
+                    {
+                        Manufacturing.DomainServices.WorkOrderManager.DistributeTransferredQuantity(
+                            woForTransfer, seItem.ItemId, seItem.SourceWarehouseId, seItem.Quantity, isDeduction: false);
+                    }
+                }
+                else
+                {
+                    woForTransfer.MaterialTransferred = Math.Max(0, woForTransfer.MaterialTransferred - totalTransferredQty);
+
+                    foreach (var seItem in entry.Items)
+                    {
+                        var addlItem = woForTransfer.RequiredItems.FirstOrDefault(ri => ri.IsAdditionalItem && ri.VoucherDetailReference == seItem.Id);
+                        if (addlItem != null)
+                        {
+                            woForTransfer.RequiredItems.Remove(addlItem);
+                        }
+                        else
+                        {
+                            Manufacturing.DomainServices.WorkOrderManager.DistributeTransferredQuantity(
+                                woForTransfer, seItem.ItemId, seItem.SourceWarehouseId, seItem.Quantity, isDeduction: true);
+
+                            // Per ERPNext PR #59424 / commit dbada3f461: revert transfer on work order reservations with batch matching
+                            if (seItem.SourceWarehouseId.HasValue)
+                            {
+                                var sreManager = LazyServiceProvider.LazyGetRequiredService<StockReservationManager>();
+                                await sreManager.RevertWorkOrderTransferAsync(
+                                    woForTransfer.Id, seItem.ItemId, seItem.SourceWarehouseId.Value, seItem.Quantity, seItem.BatchId,
+                                    targetWarehouseId: seItem.TargetWarehouseId, stockEntryId: entry.Id);
+                            }
+                        }
+                    }
+                }
+
+                var dateWoManager = LazyServiceProvider.LazyGetRequiredService<Manufacturing.DomainServices.WorkOrderManager>();
+                var dateJcRepo = LazyServiceProvider.LazyGetService<IRepository<Manufacturing.Entities.JobCard, Guid>>();
+                await dateWoManager.UpdateActualDatesAsync(woForTransfer, _repository, dateJcRepo, currentStockEntry: entry);
+                await workOrderRepoForTransfer.UpdateAsync(woForTransfer);
+            }
+        }
+
+        // Reverse Job Card transferred qty and transfer status (ERPNext PR #60650 / commit beaca59338)
+        if (entry.JobCardId.HasValue && entry.EntryType == StockEntryType.MaterialTransferForManufacture)
+        {
+            var jcRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Manufacturing.Entities.JobCard, Guid>>();
+            var jc = await jcRepo.FindAsync(entry.JobCardId.Value);
+            if (jc != null && entry.WorkOrderId.HasValue)
+            {
+                var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+                var jcManager = LazyServiceProvider.LazyGetRequiredService<Manufacturing.DomainServices.JobCardManager>();
+                var matchingItems = await jcManager.GetRawMaterialsAsync(jc, woRepo);
+                var wo = await woRepo.FindAsync(entry.WorkOrderId.Value);
+                if (wo != null && matchingItems.Any() && wo.Quantity > 0)
+                {
+                    decimal minFraction = decimal.MaxValue;
+                    bool anyTransferred = false;
+                    bool allTransferred = true;
+
+                    foreach (var rm in matchingItems)
+                    {
+                        var expected = (rm.RequiredQuantity / wo.Quantity) * jc.ForQuantity;
+                        if (expected > 0)
+                        {
+                            var fraction = rm.TransferredQuantity / expected;
+                            if (fraction < minFraction)
+                            {
+                                minFraction = fraction;
+                            }
+                            if (rm.TransferredQuantity > 0)
+                            {
+                                anyTransferred = true;
+                            }
+                            if (rm.TransferredQuantity < expected - 0.0001m)
+                            {
+                                allTransferred = false;
+                            }
+                        }
+                    }
+
+                    if (minFraction == decimal.MaxValue) minFraction = 0m;
+                    jc.TransferredQty = Math.Min(jc.ForQuantity, Math.Max(0m, Math.Round(minFraction * jc.ForQuantity, 4)));
+                    jc.UpdateTransferStatus(allTransferred, anyTransferred);
+                    await jcRepo.UpdateAsync(jc, autoSave: true);
+                }
+            }
+        }
+
+        // Reverse the Subcontracting Order's supplied-item TransferredQty (mirrors PostAsync).
+        if (entry.EntryType == StockEntryType.SendToSubcontractor && entry.SubcontractingOrderId.HasValue)
+        {
+            var rmService = LazyServiceProvider.LazyGetRequiredService<Purchasing.DomainServices.SubcontractingRmTransferService>();
+            var transferLines = entry.Items
+                .GroupBy(i => i.ItemId)
+                .Select(g => new Purchasing.DomainServices.RmTransferLine { ItemId = g.Key, Qty = g.Sum(i => i.Quantity) });
+            await rmService.RecordRmTransferAsync(entry.SubcontractingOrderId.Value, transferLines, reverse: true);
+        }
+
+        // Reverse SLE entries + Bin balances
+        await _stockPostingService.ReverseStockEntryAsync(entry);
+
+        // Reverse PLE entries (StockEntry has no party, so this is normally a no-op)
+        // and reverse the posted GL Journal Entry (per ERPNext: stock entries have perpetual inventory GL)
+        await postingOrchestrator.ReversePleForDocumentAsync("StockEntry", entry.Id);
+        await postingOrchestrator.ReverseGlForDocumentAsync("StockEntry", entry.Id);
+
+        // Reverse project costing based on item-level ProjectId (per ERPNext PR #51014 / commit e57d2b4811)
+        await UpdateProjectCostingAsync(entry, sign: -1);
+
+        await _repository.UpdateAsync(entry, autoSave: true);
+
+        // Audit trail
+        await _activityLogRepository.InsertAsync(new DocumentActivityLog(
+            GuidGenerator.Create(), "StockEntry", entry.Id, "Cancelled",
+            entry.CompanyId, entry.EntryNumber, "Posted", "Cancelled",
+            CurrentUser.Id, tenantId: entry.TenantId));
+
+        return ObjectMapper.Map<StockEntry, StockEntryDto>(entry);
+    }
+
+    /// <summary>
+    /// Updates Project.TotalConsumedMaterialCost for each unique item-level ProjectId.
+    /// Per ERPNext PR #51014 / commit e57d2b4811.
+    /// </summary>
+    private async Task UpdateProjectCostingAsync(StockEntry entry, int sign)
+    {
+        var projectItemGroups = entry.Items
+            .Where(i => i.ProjectId.HasValue)
+            .GroupBy(i => i.ProjectId!.Value);
+
+        if (!projectItemGroups.Any()) return;
+
+        var projectRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Projects.Entities.Project, Guid>>();
+        foreach (var group in projectItemGroups)
+        {
+            var project = await projectRepo.FindAsync(group.Key);
+            if (project == null) continue;
+
+            // Consumed material cost: items outgoing from warehouse (SourceWarehouse set, TargetWarehouse null)
+            var consumedAmount = group
+                .Where(i => i.SourceWarehouseId.HasValue && !i.TargetWarehouseId.HasValue)
+                .Sum(i => (i.ValuationRate ?? 0) * i.Quantity);
+
+            if (consumedAmount > 0)
+            {
+                project.TotalConsumedMaterialCost = Math.Max(0, project.TotalConsumedMaterialCost + (sign * consumedAmount));
+                await projectRepo.UpdateAsync(project);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Returns pre-populated items for a Manufacture stock entry based on a Work Order's BOM.
+    /// Calculates proportional material quantities for the desired production qty.
+    /// RM items get SourceWarehouseId, FG item gets TargetWarehouseId.
+    /// </summary>
+    public async Task<ManufactureItemsDto> GetManufactureItemsAsync(Guid workOrderId, decimal produceQty)
+    {
+        // Enforce Work Order read permissions (ERPNext PR #59678 / commit 982cdca33f)
+        await AuthorizationService.CheckAsync(MyERPPermissions.Manufacturing.Default);
+
+        var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+        var bomRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<BillOfMaterials, Guid>>();
+        var woManager = LazyServiceProvider.LazyGetRequiredService<MyERP.Manufacturing.DomainServices.WorkOrderManager>();
+
+        var wo = await woRepo.FindAsync(workOrderId, includeDetails: true);
+        BillOfMaterials bom;
+        ManufactureItemsDto result;
+
+        if (wo != null)
+        {
+            if (wo.Status == Manufacturing.WorkOrderStatus.Closed)
+            {
+                throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.StockEntryAgainstClosedWorkOrder)
+                    .WithData("workOrder", wo.WorkOrderNumber ?? wo.Id.ToString())
+                    .WithData("detail", $"Transaction not allowed against closed Work Order {wo.WorkOrderNumber ?? wo.Id.ToString()}");
+            }
+            if (wo.Status == Manufacturing.WorkOrderStatus.Stopped)
+            {
+                throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                    .WithData("detail", $"Transaction not allowed against stopped Work Order {wo.WorkOrderNumber ?? wo.Id.ToString()}");
+            }
+            if (wo.BomId == Guid.Empty)
+                throw new Volo.Abp.BusinessException("MyERP:10003")
+                    .WithData("reason", "Work Order has no linked BOM");
+
+            bom = await bomRepo.GetAsync(wo.BomId, includeDetails: true);
+            result = new ManufactureItemsDto
+            {
+                WorkOrderId = wo.Id,
+                BomId = bom.Id,
+                ProduceQty = produceQty,
+                FgItemId = bom.ItemId,
+                FgWarehouseId = wo.FgWarehouseId ?? bom.TargetWarehouseId,
+                SourceWarehouseId = wo.SourceWarehouseId ?? bom.SourceWarehouseId,
+            };
+
+            var backflushMethod = await woManager.GetBackflushMethodAsync(bom.Id, wo.CompanyId);
+            if ((backflushMethod == "Material Transferred" || backflushMethod == "Material Transferred for Manufacture")
+                && !wo.SkipTransfer)
+            {
+                var productionService = LazyServiceProvider
+                    .LazyGetRequiredService<MyERP.Manufacturing.Services.WorkOrderProductionService>();
+                var transferredItems = productionService.CalculateRawMaterialConsumption(wo, produceQty, backflushMethod);
+                foreach (var c in transferredItems)
+                {
+                    var bomRate = bom.Items.FirstOrDefault(b => b.ItemId == c.ItemId)?.Rate ?? 0m;
+                    result.Items.Add(new ManufactureItemLineDto
+                    {
+                        ItemId = c.ItemId,
+                        ItemName = c.ItemName,
+                        RequiredQty = Math.Round(c.Quantity, 4),
+                        Rate = bomRate,
+                        SourceWarehouseId = wo.WipWarehouseId ?? c.SourceWarehouseId ?? result.SourceWarehouseId,
+                        IsRawMaterial = true,
+                    });
+                }
+            }
+            else
+            {
+                var reqs = await woManager.CalculateMaterialRequirementsAsync(bom.Id, produceQty);
+                foreach (var req in reqs)
+                {
+                    result.Items.Add(new ManufactureItemLineDto
+                    {
+                        ItemId = req.ItemId,
+                        ItemName = req.ItemName,
+                        RequiredQty = Math.Round(req.RequiredQty, 4),
+                        Rate = req.Rate,
+                        SourceWarehouseId = req.SourceWarehouseId ?? result.SourceWarehouseId,
+                        IsRawMaterial = true,
+                    });
+                }
+            }
+        }
+        else
+        {
+            // Per ERPNext PR #62943 / commit 8f40bec4f5:
+            // Standalone Manufacture / Material Consumption for Manufacture without a Work Order
+            // always fetches raw materials from the BOM even if BackflushRawMaterialsBasedOn is Material Transferred.
+            bom = await bomRepo.GetAsync(workOrderId, includeDetails: true);
+            result = new ManufactureItemsDto
+            {
+                WorkOrderId = Guid.Empty,
+                BomId = bom.Id,
+                ProduceQty = produceQty,
+                FgItemId = bom.ItemId,
+                FgWarehouseId = bom.TargetWarehouseId,
+                SourceWarehouseId = bom.SourceWarehouseId,
+            };
+
+            var reqs = await woManager.CalculateMaterialRequirementsAsync(bom.Id, produceQty);
+            foreach (var req in reqs)
+            {
+                result.Items.Add(new ManufactureItemLineDto
+                {
+                    ItemId = req.ItemId,
+                    ItemName = req.ItemName,
+                    RequiredQty = Math.Round(req.RequiredQty, 4),
+                    Rate = req.Rate,
+                    SourceWarehouseId = req.SourceWarehouseId ?? result.SourceWarehouseId,
+                    IsRawMaterial = true,
+                });
+            }
+        }
+
+        // Finished good item
+        result.Items.Add(new ManufactureItemLineDto
+        {
+            ItemId = bom.ItemId,
+            ItemName = $"FG: {bom.BomNumber}",
+            RequiredQty = produceQty,
+            Rate = bom.TotalCost / (bom.Quantity > 0 ? bom.Quantity : 1m),
+            TargetWarehouseId = result.FgWarehouseId,
+            IsRawMaterial = false,
+        });
+
+        return result;
+    }
+
+    /// <summary>
+    /// Auto-creates a MaterialTransferForManufacture Stock Entry from a Work Order.
+    /// Transfers raw materials from source warehouse to WIP warehouse.
+    /// Per ERPNext WO→SE "Material Transfer" button behavior.
+    /// Only transfers materials not yet transferred (requiredQty - transferredQty per item).
+    /// </summary>
+    [Authorize(MyERPPermissions.StockEntries.Create)]
+    public async Task<StockEntryDto> CreateMaterialTransferForManufactureAsync(Guid workOrderId)
+    {
+        var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+        var bomRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<BillOfMaterials, Guid>>();
+        var numberGenerator = LazyServiceProvider.LazyGetRequiredService<IDocumentNumberGenerator>();
+
+        var wo = await woRepo.GetAsync(workOrderId, includeDetails: true);
+
+        if (wo.Status == Manufacturing.WorkOrderStatus.Closed)
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.StockEntryAgainstClosedWorkOrder)
+                .WithData("workOrder", wo.WorkOrderNumber ?? wo.Id.ToString())
+                .WithData("detail", $"Transaction not allowed against closed Work Order {wo.WorkOrderNumber ?? wo.Id.ToString()}");
+        }
+        if (wo.Status == Manufacturing.WorkOrderStatus.Stopped)
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("detail", $"Transaction not allowed against stopped Work Order {wo.WorkOrderNumber ?? wo.Id.ToString()}");
+        }
+        if (wo.Status == Manufacturing.WorkOrderStatus.Draft || wo.Status == Manufacturing.WorkOrderStatus.Cancelled)
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("detail", "Work Order must be Submitted or In Process to transfer materials");
+
+        var bom = await bomRepo.GetAsync(wo.BomId, includeDetails: true);
+        var multiplier = wo.Quantity / (bom.Quantity > 0 ? bom.Quantity : 1m);
+
+        var sourceWarehouseId = wo.SourceWarehouseId ?? bom.SourceWarehouseId;
+        var wipWarehouseId = wo.WipWarehouseId;
+
+        if (!sourceWarehouseId.HasValue)
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.MissingWarehouse)
+                .WithData("field", "SourceWarehouse");
+
+        if (!wipWarehouseId.HasValue)
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.MissingWarehouse)
+                .WithData("field", "WIPWarehouse");
+
+        // Create the transfer Stock Entry
+        var entry = new StockEntry(
+            Guid.NewGuid(), wo.CompanyId,
+            StockEntryType.MaterialTransferForManufacture,
+            DateTime.UtcNow.Date, CurrentTenant.Id);
+
+        entry.WorkOrderId = wo.Id;
+        entry.EntryNumber = await numberGenerator.GenerateAsync("SE", wo.CompanyId);
+        entry.Notes = $"Material Transfer for Work Order {wo.WorkOrderNumber ?? wo.Id.ToString()}";
+
+        // Add raw materials (only pending qty not yet transferred, considering transfer extra allowance)
+        // Per ERPNext PR #60647 / commit 9122afdd1d: check transfer_extra_materials_percentage before overproduction_percentage
+        var mfgSettingsRepoForTransfer = LazyServiceProvider.LazyGetService<IRepository<Manufacturing.Entities.ManufacturingSettings, Guid>>();
+        var mfgSettingsForTransfer = mfgSettingsRepoForTransfer != null
+            ? (await mfgSettingsRepoForTransfer.GetQueryableAsync()).FirstOrDefault(s => s.CompanyId == wo.CompanyId)
+            : null;
+        var transferExtraPct = mfgSettingsForTransfer?.TransferExtraMaterialsPercentage > 0
+            ? mfgSettingsForTransfer.TransferExtraMaterialsPercentage
+            : (mfgSettingsForTransfer?.OverproductionPercentage ?? 0m);
+
+        // Per ERPNext PR #60647 / commit a036285538: keep transfer rows of the same material apart per source warehouse
+        // and aggregate required & transferred quantities for identical item + warehouse pairs.
+        var groupedRequiredItems = wo.RequiredItems
+            .GroupBy(woItem => new
+            {
+                woItem.ItemId,
+                SourceWarehouseId = woItem.SourceWarehouseId ?? sourceWarehouseId.Value
+            })
+            .Select(g => new
+            {
+                g.Key.ItemId,
+                g.Key.SourceWarehouseId,
+                RequiredQuantity = g.Sum(x => x.RequiredQuantity),
+                TransferredQuantity = g.Sum(x => x.TransferredQuantity),
+                FirstRowId = g.First().Id
+            })
+            .ToList();
+
+        var sreManager = LazyServiceProvider.LazyGetRequiredService<StockReservationManager>();
+        foreach (var group in groupedRequiredItems)
+        {
+            var maxAllowedTransfer = group.RequiredQuantity * (1m + transferExtraPct / 100m);
+            var pendingQty = maxAllowedTransfer - group.TransferredQuantity;
+            if (pendingQty <= 0) continue;
+
+            // Find BOM item for valuation rate
+            var bomItem = bom.Items.FirstOrDefault(b => b.ItemId == group.ItemId);
+            var rate = bomItem?.Rate ?? 0m;
+
+            var itemSourceWarehouse = group.SourceWarehouseId;
+
+            var allocations = await sreManager.AllocateReservedMaterialsForTransferAsync(
+                "WorkOrder", wo.Id, group.ItemId, itemSourceWarehouse, pendingQty, group.FirstRowId);
+
+            foreach (var alloc in allocations)
+            {
+                var seItem = entry.AddItem(
+                    itemId: group.ItemId,
+                    quantity: alloc.Quantity,
+                    sourceWarehouseId: itemSourceWarehouse,
+                    targetWarehouseId: wipWarehouseId.Value,
+                    valuationRate: rate);
+                seItem.BatchId = alloc.BatchId;
+            }
+        }
+
+        if (!entry.Items.Any())
+            throw new Volo.Abp.BusinessException("MyERP:10013")
+                .WithData("reason", "All materials have already been transferred for this Work Order");
+
+        await _repository.InsertAsync(entry, autoSave: true);
+        return ObjectMapper.Map<StockEntry, StockEntryDto>(entry);
+    }
+
+    [Authorize(MyERPPermissions.StockEntries.Edit)]
+    public async Task<StockEntryDto> UpdateAsync(Guid id, CreateStockEntryDto input)
+    {
+        var entry = await _repository.GetAsync(id);
+        if (entry.Status != Core.DocumentStatus.Draft)
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("detail", "Only Draft stock entries can be edited");
+
+        if (input.Items == null || input.Items.Count == 0)
+            throw new Volo.Abp.BusinessException("MyERP:01007")
+                .WithData("documentType", "Stock Entry");
+
+        var itemIds = input.Items.Select(i => i.ItemId).Distinct().ToArray();
+        var itemValidation = LazyServiceProvider.LazyGetRequiredService<DomainServices.ItemTransactionValidationService>();
+        await itemValidation.ValidateItemsForTransactionAsync(itemIds);
+        await ValidateStockItemsAsync(itemIds);
+
+        await ValidateCompanyBoundariesAsync(input, entry.CompanyId);
+
+        entry.EntryType = input.EntryType;
+        entry.PostingDate = input.PostingDate;
+        entry.Notes = input.Notes;
+        entry.ReferenceType = input.ReferenceType;
+        entry.ReferenceId = input.ReferenceId;
+        entry.WorkOrderId = input.WorkOrderId;
+        entry.JobCardId = input.JobCardId;
+        entry.FgCompletedQty = input.FgCompletedQty;
+        entry.ProcessLossQty = input.ProcessLossQty;
+        entry.ProcessLossPercentage = input.ProcessLossPercentage;
+        entry.SyncProcessLoss();
+        entry.IsFgConversion = input.IsFgConversion;
+        entry.WeightPerPiece = input.WeightPerPiece;
+        entry.TotalAdditionalCosts = input.TotalAdditionalCosts;
+        entry.CostCenterId = input.CostCenterId;
+        entry.ProjectId = input.ProjectId;
+        entry.IsOpening = input.IsOpening;
+        entry.IsReturn = input.IsReturn;
+
+        // Replace items
+        entry.ClearItems();
+        foreach (var item in input.Items)
+        {
+            entry.AddItem(
+                item.ItemId, item.Quantity, item.SourceWarehouseId, item.TargetWarehouseId,
+                item.ValuationRate, item.IsFinishedItem, item.BatchId,
+                secondaryItemType: item.SecondaryItemType,
+                conversionFactor: item.ConversionFactor > 0 ? item.ConversionFactor : 1m,
+                stockUom: item.StockUom ?? "Unit",
+                valuationType: item.ValuationType,
+                bomSecondaryItemId: item.BomSecondaryItemId,
+                allowZeroValuationRate: item.AllowZeroValuationRate,
+                setBasicRateManually: item.SetBasicRateManually);
+            if (item.CostCenterId.HasValue || input.CostCenterId.HasValue)
+                entry.Items[^1].CostCenterId = item.CostCenterId ?? input.CostCenterId;
+            if (item.ExpenseAccountId.HasValue)
+                entry.Items[^1].ExpenseAccountId = item.ExpenseAccountId;
+            if (item.ProjectId.HasValue || input.ProjectId.HasValue)
+                entry.Items[^1].ProjectId = item.ProjectId ?? input.ProjectId;
+            if (item.AdditionalCost > 0)
+                entry.Items[^1].AdditionalCost = item.AdditionalCost;
+            if (item.MaterialRequestItemId.HasValue)
+                entry.Items[^1].MaterialRequestItemId = item.MaterialRequestItemId;
+        }
+
+        if (entry.TotalAdditionalCosts > 0)
+        {
+            StockEntryManager.DistributeAdditionalCosts(entry);
+        }
+
+        var seManager = LazyServiceProvider.LazyGetRequiredService<StockEntryManager>();
+        await seManager.ValidateWarehousesAsync(entry);
+        await seManager.ValidateDifferenceAccountAsync(entry);
+        seManager.ValidateRepackItems(entry);
+        seManager.ValidateManufactureItems(entry);
+        seManager.ValidateBatchSplit(entry);
+        var mrRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Purchasing.Entities.MaterialRequest, Guid>>();
+        await seManager.ValidateMaterialRequestItemsAsync(entry, mrRepo);
+
+        var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+        var altRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<ItemAlternative, Guid>>();
+        var mfgSettingsRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Manufacturing.Entities.ManufacturingSettings, Guid>>();
+        await seManager.ValidateFgConversionAsync(entry, woRepo, altRepo, _repository, mfgSettingsRepo);
+
+        var mfgSettings = await mfgSettingsRepo.FindAsync(s => s.CompanyId == entry.CompanyId);
+        var overproductionPct = mfgSettings?.OverproductionPercentage ?? 5m;
+        await seManager.ValidateDuplicateManufactureEntryAsync(entry, woRepo, _repository, overproductionPct);
+
+        await seManager.SetAllowAlternativeItemAsync(entry, woRepo);
+
+        if (entry.WorkOrderId.HasValue)
+        {
+            var wo = await woRepo.FindAsync(entry.WorkOrderId.Value);
+            seManager.ValidateWorkOrderStatus(entry, wo);
+            if (entry.IsReturn)
+            {
+                seManager.ValidateWorkOrderStatusForReturn(entry, wo);
+                seManager.ValidateWorkOrderReturnItems(entry, wo);
+            }
+        }
+
+        await _repository.UpdateAsync(entry, autoSave: true);
+        return ObjectMapper.Map<StockEntry, StockEntryDto>(entry);
+    }
+
+    [Authorize(MyERPPermissions.StockEntries.Delete)]
+    public async Task DeleteAsync(Guid id)
+    {
+        var entry = await _repository.GetAsync(id);
+        if (entry.Status != Core.DocumentStatus.Draft)
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("detail", "Only Draft stock entries can be deleted");
+        await _repository.DeleteAsync(id);
+    }
+
+    // ─── Transit Transfer Operations ────────────────────────────────────────
+
+    /// <summary>
+    /// Creates a transit transfer (2-step): Source → Transit warehouse.
+    /// The receiving leg is created separately after this entry is posted.
+    /// </summary>
+    [Authorize(MyERPPermissions.StockEntries.Create)]
+    public async Task<StockEntryDto> CreateTransitTransferAsync(CreateTransitTransferDto input)
+    {
+        var transitService = LazyServiceProvider.LazyGetRequiredService<TransitTransferService>();
+
+        var items = input.Items.Select(i => new TransitTransferItem(
+            i.ItemId, i.Quantity, i.ValuationRate)).ToArray();
+
+        var entry = await transitService.CreateSendToWarehouseAsync(
+            input.CompanyId,
+            input.SourceWarehouseId,
+            input.DestinationWarehouseId,
+            items,
+            input.PostingDate,
+            input.Notes,
+            CurrentTenant.Id);
+
+        entry.EntryNumber = await _numberGenerator.GenerateAsync("StockEntry", entry.CompanyId);
+
+        await _repository.InsertAsync(entry);
+        return ObjectMapper.Map<StockEntry, StockEntryDto>(entry);
+    }
+
+    /// <summary>
+    /// Creates the receiving leg of a transit transfer: Transit → Destination warehouse.
+    /// Requires the outgoing entry to be Posted first.
+    /// </summary>
+    [Authorize(MyERPPermissions.StockEntries.Create)]
+    public async Task<StockEntryDto> CreateReceiveAtWarehouseAsync(
+        Guid outgoingStockEntryId, Guid destinationWarehouseId, DateTime postingDate)
+    {
+        var transitService = LazyServiceProvider.LazyGetRequiredService<TransitTransferService>();
+
+        var entry = await transitService.CreateReceiveAtWarehouseAsync(
+            outgoingStockEntryId, destinationWarehouseId, postingDate);
+
+        entry.EntryNumber = await _numberGenerator.GenerateAsync("StockEntry", entry.CompanyId);
+
+        await _repository.InsertAsync(entry);
+        return ObjectMapper.Map<StockEntry, StockEntryDto>(entry);
+    }
+
+    /// <summary>
+    /// Gets pending transit transfers (sent but not yet received) for a company.
+    /// </summary>
+    public async Task<PendingTransitTransferDto[]> GetPendingTransitTransfersAsync(Guid companyId)
+    {
+        var transitService = LazyServiceProvider.LazyGetRequiredService<TransitTransferService>();
+        var warehouseRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Warehouse, Guid>>();
+
+        var pending = await transitService.GetPendingTransfersAsync(companyId);
+
+        // Resolve warehouse names
+        var warehouseIds = pending.Select(p => p.SourceWarehouseId).Distinct().ToList();
+        var wQuery = await warehouseRepo.GetQueryableAsync();
+        var warehouseNames = wQuery
+            .Where(w => warehouseIds.Contains(w.Id))
+            .ToDictionary(w => w.Id, w => w.Name);
+
+        return pending.Select(p => new PendingTransitTransferDto
+        {
+            StockEntryId = p.StockEntryId,
+            EntryNumber = p.EntryNumber,
+            PostingDate = p.PostingDate,
+            SourceWarehouseId = p.SourceWarehouseId,
+            SourceWarehouseName = warehouseNames.GetValueOrDefault(p.SourceWarehouseId),
+            TotalQuantity = p.TotalQuantity,
+            ItemCount = p.ItemCount
+        }).ToArray();
+    }
+
+    /// <summary>
+    /// Gets items from a Material Request to pre-populate a Stock Entry form.
+    /// Per ERPNext MR→SE mapper: creates SE with purpose based on MR type
+    /// (Purchase→MaterialReceipt, Transfer→MaterialTransfer, Issue→MaterialIssue).
+    /// Returns pending items (requested - already ordered/transferred).
+    /// </summary>
+    public async Task<MaterialRequestItemsForSeDto> GetItemsFromMaterialRequestAsync(
+        Guid materialRequestId)
+    {
+        var mrRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Purchasing.Entities.MaterialRequest, Guid>>();
+        var mr = (await mrRepo.WithDetailsAsync()).First(m => m.Id == materialRequestId);
+
+        // Map MR type → SE purpose
+        var purpose = mr.RequestType switch
+        {
+            Purchasing.MaterialRequestType.MaterialTransfer => StockEntryType.MaterialTransfer,
+            Purchasing.MaterialRequestType.MaterialIssue => StockEntryType.MaterialIssue,
+            _ => StockEntryType.MaterialTransfer,
+        };
+
+        var result = new MaterialRequestItemsForSeDto
+        {
+            MaterialRequestId = mr.Id,
+            MaterialRequestNumber = mr.RequestNumber,
+            SuggestedPurpose = purpose.ToString(),
+            SourceWarehouseId = mr.SourceWarehouseId,
+            TargetWarehouseId = mr.TargetWarehouseId,
+        };
+
+        if (mr.JobCardId.HasValue)
+        {
+            result.JobCardId = mr.JobCardId;
+            result.WorkOrderId = mr.WorkOrderId;
+            result.SuggestedPurpose = StockEntryType.MaterialTransferForManufacture.ToString();
+
+            var jcRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Manufacturing.Entities.JobCard, Guid>>();
+            var jc = await jcRepo.FindAsync(mr.JobCardId.Value);
+            if (jc != null)
+            {
+                result.FgCompletedQty = jc.ForQuantity;
+                result.FromBom = true;
+                if (jc.SemiFgBomId.HasValue)
+                {
+                    result.BomId = jc.SemiFgBomId;
+                }
+                else if (mr.WorkOrderId.HasValue)
+                {
+                    var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Manufacturing.Entities.WorkOrder, Guid>>();
+                    var wo = await woRepo.FindAsync(mr.WorkOrderId.Value);
+                    result.BomId = wo?.BomId;
+                }
+            }
+        }
+        else if (mr.WorkOrderId.HasValue)
+        {
+            result.WorkOrderId = mr.WorkOrderId;
+            result.SuggestedPurpose = StockEntryType.MaterialTransferForManufacture.ToString();
+
+            var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Manufacturing.Entities.WorkOrder, Guid>>();
+            var wo = await woRepo.FindAsync(mr.WorkOrderId.Value);
+            if (wo != null)
+            {
+                result.BomId = wo.BomId;
+                result.FromBom = true;
+                // Per ERPNext PR #60246 / commit c18d8a4237:
+                // Not fg-qty-driven, mirrors Pick List -> Stock Entry transfer for this Work Order
+                result.FgCompletedQty = 0;
+            }
+        }
+
+        // Account for draft Stock Entries already pulled from this MR (per ERPNext PR #58617 /
+        // commit d8432d92c8, mirrored from PurchaseConversionAppService's draft-PO discount) —
+        // OrderedQuantity only increments on Submit, so a second draft pulling the same MR item
+        // would otherwise still see the full pending qty.
+        var seQuery = await _repository.GetQueryableAsync();
+        var draftSeQtyMap = seQuery
+            .Where(se => se.CompanyId == mr.CompanyId && se.Status == Core.DocumentStatus.Draft)
+            .SelectMany(se => se.Items)
+            .Where(i => i.MaterialRequestItemId.HasValue)
+            .GroupBy(i => i.MaterialRequestItemId!.Value)
+            .Select(g => new { MrItemId = g.Key, Qty = g.Sum(i => i.Quantity) })
+            .ToList()
+            .ToDictionary(x => x.MrItemId, x => x.Qty);
+
+        foreach (var item in mr.Items)
+        {
+            var pendingQty = item.Quantity - item.OrderedQuantity - draftSeQtyMap.GetValueOrDefault(item.Id, 0m);
+            if (pendingQty <= 0) continue;
+
+            result.Items.Add(new MaterialRequestItemLineDto
+            {
+                ItemId = item.ItemId,
+                ItemName = item.ItemName,
+                Quantity = pendingQty,
+                Uom = item.Uom,
+                WarehouseId = item.WarehouseId,
+                MaterialRequestItemId = item.Id,
+                JobCardItemId = item.JobCardItemId,
+            });
+        }
+
+        return result;
+    }
+
+    private async Task ValidateCompanyBoundariesAsync(CreateStockEntryDto input, Guid companyId)
+    {
+        var allCostCenterIds = input.Items
+            .Where(i => i.CostCenterId.HasValue)
+            .Select(i => i.CostCenterId!.Value)
+            .ToList();
+        if (input.CostCenterId.HasValue)
+        {
+            allCostCenterIds.Add(input.CostCenterId.Value);
+        }
+        allCostCenterIds = allCostCenterIds.Distinct().ToList();
+
+        if (allCostCenterIds.Count > 0)
+        {
+            var ccRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<CostCenter, Guid>>();
+            var costCenters = await ccRepo.GetListAsync(c => allCostCenterIds.Contains(c.Id));
+            var ccMismatch = costCenters.FirstOrDefault(c => c.CompanyId != companyId);
+            if (ccMismatch != null)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("costCenterCompany", ccMismatch.CompanyId)
+                    .WithData("stockEntryCompany", companyId);
+            }
+        }
+
+        var allProjectIds = input.Items
+            .Where(i => i.ProjectId.HasValue)
+            .Select(i => i.ProjectId!.Value)
+            .ToList();
+        if (input.ProjectId.HasValue)
+        {
+            allProjectIds.Add(input.ProjectId.Value);
+        }
+        allProjectIds = allProjectIds.Distinct().ToList();
+
+        if (allProjectIds.Count > 0)
+        {
+            var projRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Project, Guid>>();
+            var projects = await projRepo.GetListAsync(p => allProjectIds.Contains(p.Id));
+            var projMismatch = projects.FirstOrDefault(p => p.CompanyId != companyId);
+            if (projMismatch != null)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("projectCompany", projMismatch.CompanyId)
+                    .WithData("stockEntryCompany", companyId);
+            }
+        }
+
+        var expenseAcctIds = input.Items
+            .Where(i => i.ExpenseAccountId.HasValue)
+            .Select(i => i.ExpenseAccountId!.Value)
+            .Distinct()
+            .ToList();
+
+        if (expenseAcctIds.Count > 0)
+        {
+            var acctRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Account, Guid>>();
+            var accounts = await acctRepo.GetListAsync(a => expenseAcctIds.Contains(a.Id));
+            var acctMismatch = accounts.FirstOrDefault(a => a.CompanyId != companyId);
+            if (acctMismatch != null)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("accountCompany", acctMismatch.CompanyId)
+                    .WithData("stockEntryCompany", companyId);
+            }
+        }
+
+        var allWarehouseIds = input.Items
+            .SelectMany(i => new[] { i.SourceWarehouseId, i.TargetWarehouseId })
+            .Where(id => id.HasValue)
+            .Select(id => id!.Value)
+            .Distinct()
+            .ToList();
+
+        if (allWarehouseIds.Count > 0)
+        {
+            var whRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Warehouse, Guid>>();
+            var warehouses = await whRepo.GetListAsync(w => allWarehouseIds.Contains(w.Id));
+            var whMismatch = warehouses.FirstOrDefault(w => w.CompanyId != companyId);
+            if (whMismatch != null)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("warehouseCompany", whMismatch.CompanyId)
+                    .WithData("stockEntryCompany", companyId);
+            }
+        }
+
+        if (input.WorkOrderId.HasValue)
+        {
+            var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+            var wo = await woRepo.FindAsync(input.WorkOrderId.Value);
+            if (wo != null && wo.CompanyId != companyId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("workOrderCompany", wo.CompanyId)
+                    .WithData("stockEntryCompany", companyId);
+            }
+        }
+
+        if (input.ReferenceId.HasValue && !string.IsNullOrWhiteSpace(input.ReferenceType))
+        {
+            if (string.Equals(input.ReferenceType, "SalesOrder", StringComparison.OrdinalIgnoreCase))
+            {
+                var soRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesOrder, Guid>>();
+                var so = await soRepo.FindAsync(input.ReferenceId.Value);
+                if (so != null && so.CompanyId != companyId)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                        .WithData("salesOrderCompany", so.CompanyId)
+                        .WithData("stockEntryCompany", companyId);
+                }
+            }
+            else if (string.Equals(input.ReferenceType, "SubcontractingOrder", StringComparison.OrdinalIgnoreCase))
+            {
+                var scoRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SubcontractingOrder, Guid>>();
+                var sco = await scoRepo.FindAsync(input.ReferenceId.Value);
+                if (sco != null && sco.CompanyId != companyId)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                        .WithData("subcontractingOrderCompany", sco.CompanyId)
+                        .WithData("stockEntryCompany", companyId);
+                }
+            }
+            else if (string.Equals(input.ReferenceType, "MaterialRequest", StringComparison.OrdinalIgnoreCase))
+            {
+                var mrRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<MaterialRequest, Guid>>();
+                var mr = await mrRepo.FindAsync(input.ReferenceId.Value);
+                if (mr != null && mr.CompanyId != companyId)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                        .WithData("materialRequestCompany", mr.CompanyId)
+                        .WithData("stockEntryCompany", companyId);
+                }
+            }
+        }
+
+        var itemIds = input.Items.Select(i => i.ItemId).Distinct().ToList();
+        var companyRestriction = LazyServiceProvider.LazyGetRequiredService<CompanyRestrictionValidationService>();
+        await companyRestriction.ValidateTransactionCompanyAsync(
+            "StockEntry", companyId,
+            itemIds: itemIds,
+            warehouseIds: allWarehouseIds.Count > 0 ? allWarehouseIds : null,
+            accountIds: expenseAcctIds.Count > 0 ? expenseAcctIds : null);
+    }
+
+    /// <summary>ERPNext StockEntryDetail.validate_and_update_item_details: only stock items can move.</summary>
+    private async Task ValidateStockItemsAsync(Guid[] itemIds)
+    {
+        var itemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Item, Guid>>();
+        var nonStock = (await itemRepo.GetQueryableAsync())
+            .Where(i => itemIds.Contains(i.Id) && !i.MaintainStock)
+            .Select(i => i.ItemName)
+            .FirstOrDefault();
+        if (nonStock != null)
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"{nonStock} is not a stock Item.");
+    }
+
+    [Authorize(MyERPPermissions.StockEntries.Default)]
+    public async Task<StockEntryFgMappingDto> GetFinishedGoodMappingAsync(Guid stockEntryId)
+    {
+        var entry = await _repository.GetAsync(stockEntryId);
+        if (entry.EntryType != StockEntryType.Manufacture && entry.EntryType != StockEntryType.Repack)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.FinishedGoodMappingNotAllowed);
+        }
+
+        var bundleRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SerialAndBatchBundle, Guid>>();
+        var batchRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Batch, Guid>>();
+        var itemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Item, Guid>>();
+
+        var fgItems = entry.Items.Where(i => i.IsFinishedItem && i.TargetWarehouseId.HasValue).ToList();
+        var rmItems = entry.Items.Where(i => !i.IsFinishedItem && i.SourceWarehouseId.HasValue && !i.TargetWarehouseId.HasValue).ToList();
+
+        var allItemIds = fgItems.Select(i => i.ItemId).Concat(rmItems.Select(i => i.ItemId)).Distinct().ToList();
+        var itemQuery = await itemRepo.GetQueryableAsync();
+        var itemsDict = itemQuery.Where(i => allItemIds.Contains(i.Id))
+            .Select(i => new { i.Id, Name = $"{i.ItemCode} — {i.ItemName}" })
+            .ToDictionary(i => i.Id, i => i.Name);
+
+        var entryBundles = (await bundleRepo.WithDetailsAsync(b => b.Entries))
+            .Where(b => b.VoucherType == "StockEntry" && b.VoucherId == stockEntryId && !b.IsCancelled)
+            .ToList();
+
+        var batchIds = fgItems.Where(i => i.BatchId.HasValue).Select(i => i.BatchId!.Value)
+            .Concat(rmItems.Where(i => i.BatchId.HasValue).Select(i => i.BatchId!.Value))
+            .Concat(entryBundles.SelectMany(b => b.Entries).Where(e => e.BatchId.HasValue).Select(e => e.BatchId!.Value))
+            .Distinct().ToList();
+
+        var batchDict = new Dictionary<Guid, string>();
+        if (batchIds.Any())
+        {
+            var bQuery = await batchRepo.GetQueryableAsync();
+            batchDict = bQuery.Where(b => batchIds.Contains(b.Id)).ToDictionary(b => b.Id, b => b.BatchNo);
+        }
+
+        var fgTargets = new List<StockEntryFinishedGoodTargetDto>();
+        var fgItemDetailIds = fgItems.Select(i => i.Id).ToHashSet();
+        var fgBundles = entryBundles.Where(b => b.VoucherDetailId.HasValue && fgItemDetailIds.Contains(b.VoucherDetailId.Value)).ToList();
+        var fgBundleMap = fgBundles.ToDictionary(b => b.VoucherDetailId!.Value);
+
+        foreach (var fg in fgItems)
+        {
+            var itemName = itemsDict.GetValueOrDefault(fg.ItemId);
+            if (fgBundleMap.TryGetValue(fg.Id, out var bundle) && bundle.Entries.Any())
+            {
+                var serialized = bundle.Entries.Any(e => !string.IsNullOrWhiteSpace(e.SerialNo));
+                foreach (var e in bundle.Entries)
+                {
+                    if (serialized && !string.IsNullOrWhiteSpace(e.SerialNo))
+                    {
+                        if (!fgTargets.Any(t => t.SerialNo == e.SerialNo))
+                        {
+                            fgTargets.Add(new StockEntryFinishedGoodTargetDto
+                            {
+                                SerialNo = e.SerialNo,
+                                ItemId = fg.ItemId,
+                                ItemName = itemName,
+                                TargetType = "Serial"
+                            });
+                        }
+                    }
+                    else if (e.BatchId.HasValue)
+                    {
+                        var bNo = batchDict.GetValueOrDefault(e.BatchId.Value) ?? e.BatchId.Value.ToString();
+                        if (!fgTargets.Any(t => t.BatchNo == bNo))
+                        {
+                            fgTargets.Add(new StockEntryFinishedGoodTargetDto
+                            {
+                                BatchId = e.BatchId,
+                                BatchNo = bNo,
+                                ItemId = fg.ItemId,
+                                ItemName = itemName,
+                                TargetType = "Batch"
+                            });
+                        }
+                    }
+                }
+            }
+            else if (fg.BatchId.HasValue)
+            {
+                var bNo = batchDict.GetValueOrDefault(fg.BatchId.Value) ?? fg.BatchId.Value.ToString();
+                if (!fgTargets.Any(t => t.BatchNo == bNo))
+                {
+                    fgTargets.Add(new StockEntryFinishedGoodTargetDto
+                    {
+                        BatchId = fg.BatchId,
+                        BatchNo = bNo,
+                        ItemId = fg.ItemId,
+                        ItemName = itemName,
+                        TargetType = "Batch"
+                    });
+                }
+            }
+        }
+
+        var rmList = new List<RawMaterialMappingItemDto>();
+        var rmItemDetailIds = rmItems.Select(i => i.Id).ToHashSet();
+        var rmBundles = entryBundles.Where(b => b.VoucherDetailId.HasValue && rmItemDetailIds.Contains(b.VoucherDetailId.Value)).ToList();
+
+        foreach (var b in rmBundles)
+        {
+            var itemName = itemsDict.GetValueOrDefault(b.ItemId);
+            foreach (var e in b.Entries)
+            {
+                rmList.Add(new RawMaterialMappingItemDto
+                {
+                    EntryId = e.Id,
+                    BundleId = b.Id,
+                    ItemId = b.ItemId,
+                    ItemName = itemName,
+                    SerialNo = e.SerialNo,
+                    BatchId = e.BatchId,
+                    BatchNo = e.BatchId.HasValue ? batchDict.GetValueOrDefault(e.BatchId.Value) : null,
+                    Quantity = e.Qty,
+                    FgSerialNo = e.FgSerialNo,
+                    FgBatchNo = e.FgBatchNo
+                });
+            }
+        }
+
+        return new StockEntryFgMappingDto
+        {
+            StockEntryId = entry.Id,
+            EntryNumber = entry.EntryNumber,
+            EntryType = entry.EntryType,
+            Status = entry.Status.ToString(),
+            FinishedGoods = fgTargets,
+            RawMaterials = rmList
+        };
+    }
+
+    [Authorize(MyERPPermissions.StockEntries.Edit)]
+    public async Task<StockEntryFgMappingDto> MapRawMaterialsToFinishedGoodsAsync(Guid stockEntryId, MapRawMaterialsToFinishedGoodsInput input)
+    {
+        var entry = await _repository.GetAsync(stockEntryId);
+        if (entry.Status == Core.DocumentStatus.Cancelled)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.FinishedGoodMappingNotAllowedForCancelled);
+        }
+
+        if (entry.EntryType != StockEntryType.Manufacture && entry.EntryType != StockEntryType.Repack)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.FinishedGoodMappingNotAllowed);
+        }
+
+        var isSubmitted = entry.Status == Core.DocumentStatus.Submitted;
+
+        var bundleRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SerialAndBatchBundle, Guid>>();
+        var batchRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Batch, Guid>>();
+
+        var rmItems = entry.Items.Where(i => !i.IsFinishedItem && i.SourceWarehouseId.HasValue && !i.TargetWarehouseId.HasValue).ToList();
+        var rmItemDetailIds = rmItems.Select(i => i.Id).ToHashSet();
+
+        var entryBundles = (await bundleRepo.WithDetailsAsync(b => b.Entries))
+            .Where(b => b.VoucherType == "StockEntry" && b.VoucherId == stockEntryId && !b.IsCancelled)
+            .ToList();
+        var rmBundles = entryBundles.Where(b => b.VoucherDetailId.HasValue && rmItemDetailIds.Contains(b.VoucherDetailId.Value)).ToList();
+
+        var allEntries = rmBundles.SelectMany(b => b.Entries.Select(e => new { Bundle = b, Entry = e })).ToDictionary(x => x.Entry.Id);
+
+        var fgTargets = await StockEntryManager.GetFinishedGoodTargetsAsync(entry, bundleRepo, batchRepo);
+        var fgSerialSet = fgTargets.Where(t => !string.IsNullOrWhiteSpace(t.FgSerialNo)).Select(t => t.FgSerialNo!).ToHashSet();
+        var fgBatchSet = fgTargets.Where(t => !string.IsNullOrWhiteSpace(t.FgBatchNo)).Select(t => t.FgBatchNo!).ToHashSet();
+
+        var modifiedBundles = new HashSet<SerialAndBatchBundle>();
+
+        foreach (var mapItem in input.Mappings)
+        {
+            if (!allEntries.TryGetValue(mapItem.EntryId, out var item))
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ItemNotFound)
+                    .WithData("entryId", mapItem.EntryId);
+            }
+
+            var entryRow = item.Entry;
+
+            if (isSubmitted)
+            {
+                // In ERPNext: locked if already mapped when mapping after submit
+                if (!string.IsNullOrWhiteSpace(entryRow.FgSerialNo) || !string.IsNullOrWhiteSpace(entryRow.FgBatchNo))
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.FinishedGoodMappingAlreadySet)
+                        .WithData("rawMaterial", entryRow.SerialNo ?? entryRow.BatchId?.ToString() ?? "Raw Material");
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(mapItem.FgSerialNo) && !fgSerialSet.Contains(mapItem.FgSerialNo))
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.InvalidFinishedGoodMapping)
+                    .WithData("rawMaterial", entryRow.SerialNo ?? entryRow.BatchId?.ToString() ?? "Raw Material")
+                    .WithData("target", mapItem.FgSerialNo);
+            }
+
+            if (!string.IsNullOrWhiteSpace(mapItem.FgBatchNo) && !fgBatchSet.Contains(mapItem.FgBatchNo))
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.InvalidFinishedGoodMapping)
+                    .WithData("rawMaterial", entryRow.SerialNo ?? entryRow.BatchId?.ToString() ?? "Raw Material")
+                    .WithData("target", mapItem.FgBatchNo);
+            }
+
+            entryRow.SetFinishedGoodMapping(mapItem.FgSerialNo, mapItem.FgBatchNo);
+            modifiedBundles.Add(item.Bundle);
+        }
+
+        if (modifiedBundles.Any())
+        {
+            await bundleRepo.UpdateManyAsync(modifiedBundles);
+        }
+
+        return await GetFinishedGoodMappingAsync(stockEntryId);
+    }
+
+    /// <summary>
+    /// Explicitly auto-picks batches for outward rows in a draft Stock Entry that do not have a batch assigned.
+    /// Per ERPNext PR #60120 (commits d148eeebfd, 79d66532e2, bd1fa04508).
+    /// </summary>
+    [Authorize(MyERPPermissions.StockEntries.Edit)]
+    public async Task<StockEntryDto> AutoPickBatchesAsync(Guid id)
+    {
+        var entry = await _repository.GetAsync(id);
+        if (entry.Status != DocumentStatus.Draft)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        }
+
+        await AutoAssignBatchesForEntryAsync(entry);
+        await _repository.UpdateAsync(entry, autoSave: true);
+        return ObjectMapper.Map<StockEntry, StockEntryDto>(entry);
+    }
+
+    private async Task AutoAssignBatchesForEntryAsync(StockEntry entry)
+    {
+        var outwardItems = entry.Items
+            .Where(i => i.SourceWarehouseId.HasValue && i.Quantity > 0)
+            .ToList();
+
+        if (!outwardItems.Any())
+            return;
+
+        var itemIds = outwardItems.Select(i => i.ItemId).Distinct().ToList();
+        var itemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Item, Guid>>();
+        var itemQuery = await itemRepo.GetQueryableAsync();
+        var batchItemIds = itemQuery
+            .Where(i => itemIds.Contains(i.Id) && i.HasBatchNo)
+            .Select(i => i.Id)
+            .ToHashSet();
+
+        if (!batchItemIds.Any())
+            return;
+
+        var targetRows = outwardItems.Where(i => batchItemIds.Contains(i.ItemId)).ToList();
+        var autoPickDto = new AutoPickBatchesForDocumentDto
+        {
+            CompanyId = entry.CompanyId,
+            Rows = targetRows.Select(i => new AutoPickDocumentRowDto
+            {
+                RowId = i.Id,
+                ItemId = i.ItemId,
+                WarehouseId = i.SourceWarehouseId!.Value,
+                RequiredStockQty = i.Quantity,
+                PreselectedBatchId = i.BatchId
+            }).ToList()
+        };
+
+        var batchAppService = LazyServiceProvider.LazyGetRequiredService<IBatchAppService>();
+        var allocations = await batchAppService.AutoPickBatchesForDocumentAsync(autoPickDto);
+
+        var allocMap = allocations.Where(a => a.BatchId.HasValue).ToDictionary(a => a.RowId);
+        foreach (var seItem in targetRows)
+        {
+            if (allocMap.TryGetValue(seItem.Id, out var alloc))
+            {
+                seItem.BatchId = alloc.BatchId;
+            }
+        }
+    }
+}

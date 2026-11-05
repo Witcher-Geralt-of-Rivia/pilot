@@ -1,0 +1,236 @@
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.Threading.Tasks;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+
+namespace MyERP.Manufacturing;
+
+// === Production Plan DTOs ===
+
+public class ProductionPlanDto : AuditedEntityDto<Guid>
+{
+    public string PlanNumber { get; set; } = null!;
+    public ProductionPlanStatus Status { get; set; }
+    public Guid CompanyId { get; set; }
+    public DateTime PostingDate { get; set; }
+    public bool CombineItems { get; set; }
+    public bool IgnoreExistingOrderedQty { get; set; }
+    public bool ConsiderMinimumOrderQty { get; set; }
+    public bool IncludeSafetyStock { get; set; }
+    public bool SkipAvailableSubAssemblyItem { get; set; }
+    public Guid? RawMaterialGroupWarehouseId { get; set; }
+    public Guid? ForWarehouseId { get; set; }
+    public Guid? SubAssemblyWarehouseId { get; set; }
+    public bool ReserveStock { get; set; }
+    public string? Notes { get; set; }
+    public List<ProductionPlanItemDto> PlannedItems { get; set; } = new();
+    public List<ProductionPlanMrItemDto> MaterialRequirements { get; set; } = new();
+}
+
+public class ProductionPlanItemDto
+{
+    public Guid Id { get; set; }
+    public Guid ItemId { get; set; }
+    public string ItemName { get; set; } = null!;
+    public Guid BomId { get; set; }
+    public decimal PlannedQty { get; set; }
+    public decimal OrderedQty { get; set; }
+    public decimal PendingQty { get; set; }
+    public decimal ProducedQty { get; set; }
+    public Guid? WarehouseId { get; set; }
+    public DateTime? PlannedStartDate { get; set; }
+    public Guid? SalesOrderId { get; set; }
+    public Guid? SalesOrderItemId { get; set; }
+    public bool IsProductBundleItem { get; set; }
+    public Guid? MaterialRequestId { get; set; }
+    public Guid? WorkOrderId { get; set; }
+}
+
+public class ProductionPlanMrItemDto
+{
+    public Guid Id { get; set; }
+    public Guid ItemId { get; set; }
+    public string ItemName { get; set; } = null!;
+    public decimal RequiredQty { get; set; }
+    public decimal OrderedQty { get; set; }
+    public decimal AvailableQty { get; set; }
+    public decimal PlannedQty { get; set; }
+    public decimal MinOrderQty { get; set; }
+    public decimal SafetyStock { get; set; }
+    public string? Uom { get; set; }
+    public Guid? WarehouseId { get; set; }
+    public Guid? MaterialRequestId { get; set; }
+    public SubAssemblyType ProcurementType { get; set; }
+}
+
+public class CreateProductionPlanDto
+{
+    [Required] public Guid CompanyId { get; set; }
+    public DateTime PostingDate { get; set; } = DateTime.UtcNow;
+    public bool CombineItems { get; set; }
+    public bool IgnoreExistingOrderedQty { get; set; }
+    public bool ConsiderMinimumOrderQty { get; set; }
+    public bool IncludeSafetyStock { get; set; }
+    public bool SkipAvailableSubAssemblyItem { get; set; }
+    public Guid? RawMaterialGroupWarehouseId { get; set; }
+    public Guid? ForWarehouseId { get; set; }
+    public Guid? SubAssemblyWarehouseId { get; set; }
+    public bool ReserveStock { get; set; }
+    [StringLength(ProductionPlanConsts.MaxNoteLength)] public string? Notes { get; set; }
+    public List<CreateProductionPlanItemDto> Items { get; set; } = new();
+}
+
+public class CreateProductionPlanItemDto
+{
+    [Required] public Guid ItemId { get; set; }
+    [Required] public string ItemName { get; set; } = null!;
+    [Required] public Guid BomId { get; set; }
+    [Range(0.01, double.MaxValue)] public decimal PlannedQty { get; set; }
+    public Guid? WarehouseId { get; set; }
+    public DateTime? PlannedStartDate { get; set; }
+    public Guid? SalesOrderId { get; set; }
+    public Guid? SalesOrderItemId { get; set; }
+    public bool IsProductBundleItem { get; set; }
+    public Guid? MaterialRequestId { get; set; }
+}
+
+public class OpenSalesOrderItemDto
+{
+    public Guid SalesOrderId { get; set; }
+    public Guid SalesOrderItemId { get; set; }
+    public string SalesOrderNumber { get; set; } = null!;
+    public Guid CustomerId { get; set; }
+    public string? CustomerName { get; set; }
+    public DateTime TransactionDate { get; set; }
+    public DateTime? DeliveryDate { get; set; }
+    public Guid ItemId { get; set; }
+    public string ItemCode { get; set; } = null!;
+    public string ItemName { get; set; } = null!;
+    public string? Description { get; set; }
+    public string StockUom { get; set; } = "Unit";
+    public decimal StockQty { get; set; }
+    public decimal OrderedQty { get; set; }
+    public decimal AlreadyPlannedQty { get; set; }
+    public decimal UnplannedQty { get; set; }
+    public Guid? WarehouseId { get; set; }
+    public Guid? BomId { get; set; }
+}
+
+public class GetProductionPlanListDto : PagedAndSortedResultRequestDto
+{
+    public ProductionPlanStatus? Status { get; set; }
+    public Guid? CompanyId { get; set; }
+    public string? Filter { get; set; }
+}
+
+public class ProductionPlanVisualizerDto
+{
+    public Guid PlanId { get; set; }
+    public string PlanNumber { get; set; } = null!;
+    public ProductionPlanStatus Status { get; set; }
+    public decimal TotalPlannedQty { get; set; }
+    public decimal TotalProducedQty { get; set; }
+    public decimal CompletionPercentage { get; set; }
+    public List<VisualizerFinishedGoodDto> FinishedGoods { get; set; } = new();
+    public List<VisualizerMaterialDto> RawMaterials { get; set; } = new();
+}
+
+public class VisualizerFinishedGoodDto
+{
+    public Guid ItemId { get; set; }
+    public string ItemName { get; set; } = null!;
+    public decimal PlannedQty { get; set; }
+    public decimal ProducedQty { get; set; }
+    public decimal PendingQty { get; set; }
+    public Guid? WarehouseId { get; set; }
+    public DateTime? PlannedStartDate { get; set; }
+    public Guid? SalesOrderId { get; set; }
+    public List<VisualizerLinkedDocDto> WorkOrders { get; set; } = new();
+}
+
+public class VisualizerMaterialDto
+{
+    public Guid ItemId { get; set; }
+    public string ItemName { get; set; } = null!;
+    public decimal RequiredQty { get; set; }
+    public decimal AvailableQty { get; set; }
+    public decimal OrderedQty { get; set; }
+    public decimal ReceivedQty { get; set; }
+    public Guid? WarehouseId { get; set; }
+    public List<VisualizerLinkedDocDto> MaterialRequests { get; set; } = new();
+}
+
+public class VisualizerLinkedDocDto
+{
+    public Guid Id { get; set; }
+    public string DocumentNumber { get; set; } = null!;
+    public string Status { get; set; } = null!;
+    public decimal Qty { get; set; }
+    public decimal CompletedQty { get; set; }
+}
+
+public class ProductionPlanSummaryDto
+{
+    public Guid ProductionPlanId { get; set; }
+    public string PlanNumber { get; set; } = null!;
+    public List<ProductionPlanSummaryRowDto> Rows { get; set; } = new();
+}
+
+public class ProductionPlanSummaryRowDto
+{
+    public int Indent { get; set; }
+    public string ItemCode { get; set; } = null!;
+    public string ItemName { get; set; } = null!;
+    public string? SalesOrderNumber { get; set; }
+    public string? DocumentType { get; set; }
+    public string? DocumentName { get; set; }
+    public string? Status { get; set; }
+    public int BomLevel { get; set; }
+    public decimal Qty { get; set; }
+    public decimal ProducedQty { get; set; }
+    public decimal PendingQty { get; set; }
+}
+
+public class PooledBinDetailsDto
+{
+    public decimal ActualQty { get; set; }
+    public decimal ProjectedQty { get; set; }
+}
+
+// === Interface ===
+
+public interface IProductionPlanAppService : IApplicationService
+{
+    Task<ProductionPlanDto> GetAsync(Guid id);
+    Task<PagedResultDto<ProductionPlanDto>> GetListAsync(GetProductionPlanListDto input);
+    Task<ProductionPlanDto> CreateAsync(CreateProductionPlanDto input);
+    Task<ProductionPlanDto> UpdateAsync(Guid id, CreateProductionPlanDto input);
+    Task DeleteAsync(Guid id);
+    Task<ProductionPlanDto> SubmitAsync(Guid id);
+    Task<ProductionPlanDto> CancelAsync(Guid id);
+    Task<ProductionPlanDto> CloseAsync(Guid id);
+    Task<ProductionPlanDto> ReopenAsync(Guid id);
+
+    /// <summary>Explode BOMs and calculate material requirements for the plan.</summary>
+    Task<ProductionPlanDto> CalculateMaterialRequirementsAsync(Guid id);
+
+    /// <summary>Generate Work Orders from planned items.</summary>
+    Task<ProductionPlanDto> GenerateWorkOrdersAsync(Guid id);
+
+    /// <summary>Generate Material Requests from material requirements.</summary>
+    Task<ProductionPlanDto> GenerateMaterialRequestsAsync(Guid id);
+
+    /// <summary>Fetch unified visualizer data including linked work orders, material requests, and live stock readiness.</summary>
+    Task<ProductionPlanVisualizerDto> GetVisualizerDataAsync(Guid id);
+
+    /// <summary>Generate hierarchical summary report of planned finished goods, sub-assemblies, and linked work/purchase orders (ERPNext PR #58541).</summary>
+    Task<ProductionPlanSummaryDto> GetSummaryReportAsync(Guid id);
+
+    /// <summary>Pulls open Sales Order items with remaining unplanned quantity for planning (ERPNext PR #60271, PR #55685a08be).</summary>
+    Task<List<OpenSalesOrderItemDto>> GetOpenSalesOrderItemsAsync(Guid companyId, List<Guid>? salesOrderIds = null);
+
+    /// <summary>Fetch pooled bin details for an item and warehouse, aggregating child warehouse stock if group warehouse (ERPNext PR #60718 / commit 4f7f2aabc3).</summary>
+    Task<PooledBinDetailsDto> GetPooledBinDetailsAsync(Guid companyId, Guid itemId, Guid warehouseId);
+}

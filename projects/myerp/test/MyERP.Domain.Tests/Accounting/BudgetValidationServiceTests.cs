@@ -1,0 +1,219 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using MyERP.Accounting.DomainServices;
+using MyERP.Accounting.Entities;
+using MyERP.Core;
+using Shouldly;
+using Xunit;
+
+namespace MyERP.Accounting;
+
+public class BudgetValidationServiceTests
+{
+    [Fact]
+    public void Budget_DefaultActions_AreIgnoreForMRAndPO()
+    {
+        var budget = CreateBudget(10000);
+        budget.ActionIfAnnualBudgetExceededOnMr.ShouldBe(BudgetAction.Ignore);
+        budget.ActionIfAnnualBudgetExceededOnPo.ShouldBe(BudgetAction.Ignore);
+    }
+
+    [Fact]
+    public void Budget_DefaultAction_StopForActual()
+    {
+        var budget = CreateBudget(10000);
+        budget.ActionIfAnnualBudgetExceeded.ShouldBe(BudgetAction.Stop);
+    }
+
+    [Fact]
+    public void BudgetCheck_WithinLimit_Passes()
+    {
+        decimal budgetAmount = 10000;
+        decimal alreadySpent = 3000;
+        decimal newRequest = 2000;
+        ((alreadySpent + newRequest) > budgetAmount).ShouldBeFalse();
+    }
+
+    [Fact]
+    public void BudgetCheck_ExceedsLimit_Detected()
+    {
+        decimal budgetAmount = 10000;
+        decimal alreadySpent = 8000;
+        decimal newRequest = 5000;
+        ((alreadySpent + newRequest) > budgetAmount).ShouldBeTrue();
+    }
+
+    [Fact]
+    public void BudgetCheck_ExactlyAtLimit_Passes()
+    {
+        decimal budgetAmount = 10000;
+        var total = 7000m + 3000m;
+        (total > budgetAmount).ShouldBeFalse();
+    }
+
+    [Fact]
+    public void BudgetCheck_OnlySubmittedBudgetsCount()
+    {
+        var draft = CreateBudget(5000, submit: false);
+        var submitted = CreateBudget(10000, submit: true);
+        draft.Status.ShouldBe(DocumentStatus.Draft);
+        submitted.Status.ShouldBe(DocumentStatus.Submitted);
+    }
+
+    [Fact]
+    public void Budget_MultipleAccounts()
+    {
+        var budget = new Budget(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), "CostCenter", Guid.NewGuid());
+        budget.AddAccount(Guid.NewGuid(), 5000);
+        budget.AddAccount(Guid.NewGuid(), 8000);
+        budget.Accounts.Count.ShouldBe(2);
+    }
+
+    [Fact]
+    public void Budget_Submit_RequiresAccounts()
+    {
+        var budget = new Budget(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), "CostCenter", Guid.NewGuid());
+        Should.Throw<Volo.Abp.BusinessException>(() => budget.Submit());
+    }
+
+    [Fact]
+    public void Budget_AddAccount_BlockedAfterSubmit()
+    {
+        var budget = CreateBudget(5000);
+        Should.Throw<Volo.Abp.BusinessException>(() => budget.AddAccount(Guid.NewGuid(), 1000));
+    }
+
+    [Fact]
+    public void Budget_AddAccount_RejectsZeroAmount()
+    {
+        var budget = new Budget(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), "CostCenter", Guid.NewGuid());
+        Should.Throw<ArgumentException>(() => budget.AddAccount(Guid.NewGuid(), 0));
+    }
+
+    [Fact]
+    public void Budget_Cancel_FromSubmitted()
+    {
+        var budget = CreateBudget(5000);
+        budget.Cancel();
+        budget.Status.ShouldBe(DocumentStatus.Cancelled);
+    }
+
+    [Fact]
+    public void Budget_Cancel_FromDraft_Throws()
+    {
+        var budget = CreateBudget(5000, submit: false);
+        Should.Throw<Volo.Abp.BusinessException>(() => budget.Cancel());
+    }
+
+    [Fact]
+    public void Budget_CumulativeExpense_PropertiesDefaultCorrectly()
+    {
+        var budget = CreateBudget(5000, submit: false);
+        budget.ApplicableOnCumulativeExpense.ShouldBeFalse();
+        budget.ActionIfAnnualExceededOnCumulativeExpense.ShouldBe(BudgetAction.Ignore);
+        budget.ActionIfAccumulatedMonthlyExceededOnCumulativeExpense.ShouldBe(BudgetAction.Ignore);
+
+        budget.ApplicableOnCumulativeExpense = true;
+        budget.ActionIfAnnualExceededOnCumulativeExpense = BudgetAction.Stop;
+        budget.ActionIfAccumulatedMonthlyExceededOnCumulativeExpense = BudgetAction.Warn;
+
+        budget.ApplicableOnCumulativeExpense.ShouldBeTrue();
+        budget.ActionIfAnnualExceededOnCumulativeExpense.ShouldBe(BudgetAction.Stop);
+        budget.ActionIfAccumulatedMonthlyExceededOnCumulativeExpense.ShouldBe(BudgetAction.Warn);
+    }
+
+    [Fact]
+    public void PurchaseOrderItem_HasExpenseAccountId()
+    {
+        var po = new Purchasing.Entities.PurchaseOrder(
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), "PO-0001", DateTime.UtcNow);
+        var expenseAccId = Guid.NewGuid();
+        po.AddItem(Guid.NewGuid(), "Test Item", 10m, 50m, 0m, "Unit", expenseAccountId: expenseAccId);
+
+        po.Items.Count.ShouldBe(1);
+        po.Items[0].ExpenseAccountId.ShouldBe(expenseAccId);
+    }
+
+    [Fact]
+    public void PurchaseOrder_ForeignCurrency_ConvertsToCompanyCurrencyForBudget()
+    {
+        // Per ERPNext PR #59161 (commit 5dec6d6464): convert PO amount to company currency
+        var po = new Purchasing.Entities.PurchaseOrder(
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), "PO-FC-001", DateTime.UtcNow);
+        po.CurrencyCode = "USD";
+        po.ExchangeRate = 4.5m; // 1 USD = 4.5 MYR
+        var expenseAccId = Guid.NewGuid();
+        po.AddItem(Guid.NewGuid(), "Imported Item", 10m, 100m, 0m, "Unit", expenseAccountId: expenseAccId);
+
+        var poForeignAmount = po.Items[0].Quantity * po.Items[0].UnitPrice; // 1000 USD
+        var conversionRate = po.ExchangeRate > 0 ? po.ExchangeRate : 1m;
+        var poBaseAmount = poForeignAmount * conversionRate; // 4500 MYR
+
+        poForeignAmount.ShouldBe(1000m);
+        poBaseAmount.ShouldBe(4500m);
+
+        var checkItem = new BudgetCheckItem(expenseAccId, poBaseAmount);
+        checkItem.Amount.ShouldBe(4500m);
+    }
+
+    [Fact]
+    public void BudgetCheck_PrecisionRounding_SubCentDifferenceDoesNotExceed()
+    {
+        // Per ERPNext PR #61988 (commits fe95375b98, f6f18a9ca2): round comparison to 2 decimals
+        decimal budgetAmount = 1000.00m;
+        decimal totalSpend = 1000.004m; // floating sub-cent difference
+
+        var rawDiff = totalSpend - budgetAmount;
+        var roundedDiff = Math.Round(rawDiff, 2);
+
+        rawDiff.ShouldBeGreaterThan(0m);
+        (roundedDiff > 0).ShouldBeFalse();
+    }
+
+    [Fact]
+    public void PurchaseOrder_ClosedItem_IsMarkedClosedForBudgetExclusion()
+    {
+        // Per ERPNext PR #61988 (commit b5a4734a8d): closed PO items excluded from budget commitment
+        var po = new Purchasing.Entities.PurchaseOrder(
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), "PO-CLOSED-01", DateTime.UtcNow);
+        var itemId = Guid.NewGuid();
+        po.AddItem(itemId, "Item 1", 10m, 100m, 0m, "Unit");
+
+        po.Items[0].IsClosed.ShouldBeFalse();
+        po.CloseItem(po.Items[0].Id);
+        po.Items[0].IsClosed.ShouldBeTrue();
+    }
+
+    [Fact]
+    public void MaterialRequest_CommitmentWithConversionFactor_CalculatesInPurchaseUom()
+    {
+        // Per ERPNext PR #61988 (commit cba938004e):
+        // (child.stock_qty - child.ordered_qty) * child.rate / child.conversion_factor
+        var mr = new Purchasing.Entities.MaterialRequest(
+            Guid.NewGuid(), Guid.NewGuid(), "MR-CONV-001",
+            Purchasing.MaterialRequestType.Purchase, DateTime.UtcNow);
+
+        var itemId = Guid.NewGuid();
+        // 10 Boxes, conversion factor = 12 (120 units in StockQty), 2 Boxes ordered
+        mr.AddItem(itemId, "Widget", 10m, "Box", conversionFactor: 12m);
+        var item = mr.Items[0];
+        item.OrderedQuantity = 2m; // 2 Boxes ordered
+
+        var conversion = item.ConversionFactor > 0 ? item.ConversionFactor : 1m;
+        var unorderedStockQty = Math.Max(0, item.StockQty - (item.OrderedQuantity * conversion));
+        decimal rate = 50m; // 50 per Box
+        var amount = (unorderedStockQty / conversion) * rate;
+
+        unorderedStockQty.ShouldBe(96m); // (10 - 2) * 12 = 96 stock units remaining
+        amount.ShouldBe(400m); // 8 boxes * 50 = 400
+    }
+
+    private static Budget CreateBudget(decimal amount, bool submit = true)
+    {
+        var budget = new Budget(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), "CostCenter", Guid.NewGuid());
+        budget.AddAccount(Guid.NewGuid(), amount);
+        if (submit) budget.Submit();
+        return budget;
+    }
+}

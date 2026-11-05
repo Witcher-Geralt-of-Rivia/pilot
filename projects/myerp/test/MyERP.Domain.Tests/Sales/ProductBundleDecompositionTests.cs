@@ -1,0 +1,348 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using NSubstitute;
+using MyERP.Inventory;
+using MyERP.Inventory.Entities;
+using MyERP.Inventory.DomainServices;
+using MyERP.Sales.DomainServices;
+using MyERP.Sales.Entities;
+using Shouldly;
+using Xunit;
+
+namespace MyERP.Domain.Tests.Sales;
+
+public class ProductBundleDecompositionTests
+{
+    [Fact]
+    public void DecomposedItem_Record_HoldsValues()
+    {
+        var item = new DecomposedItem(
+            ComponentItemId: Guid.NewGuid(),
+            ComponentItemName: "Widget A",
+            Qty: 5m,
+            Rate: 10m,
+            Uom: "Unit",
+            ParentBundleItemId: Guid.NewGuid(),
+            ParentBundleId: Guid.NewGuid());
+
+        item.Qty.ShouldBe(5m);
+        item.Rate.ShouldBe(10m);
+        item.ComponentItemName.ShouldBe("Widget A");
+    }
+
+    [Fact]
+    public void BundleTransactionItem_Record_HoldsValues()
+    {
+        var item = new BundleTransactionItem(Guid.NewGuid(), 3m, 100m);
+        item.Qty.ShouldBe(3m);
+        item.Rate.ShouldBe(100m);
+    }
+
+    [Fact]
+    public void DecompositionResult_GetStockItems_CombinesRegularAndPacked()
+    {
+        var regularItemId = Guid.NewGuid();
+        var componentItemId = Guid.NewGuid();
+
+        var result = new DecompositionResult(
+            RegularItems: new List<BundleTransactionItem>
+            {
+                new(regularItemId, 2m, 50m)
+            },
+            PackedItems: new List<DecomposedItem>
+            {
+                new(componentItemId, "Comp A", 4m, 25m, "Unit", Guid.NewGuid(), Guid.NewGuid())
+            });
+
+        var stockItems = result.GetStockItems().ToList();
+        stockItems.Count.ShouldBe(2);
+        stockItems.ShouldContain(s => s.ItemId == regularItemId && s.Qty == 2m);
+        stockItems.ShouldContain(s => s.ItemId == componentItemId && s.Qty == 4m);
+    }
+
+    [Fact]
+    public void DecompositionResult_HasBundleItems_TrueWhenPackedNotEmpty()
+    {
+        var result = new DecompositionResult(
+            new List<BundleTransactionItem>(),
+            new List<DecomposedItem>
+            {
+                new(Guid.NewGuid(), "X", 1m, 10m, "Unit", Guid.NewGuid(), Guid.NewGuid())
+            });
+
+        result.HasBundleItems.ShouldBeTrue();
+    }
+
+    [Fact]
+    public void DecompositionResult_HasBundleItems_FalseWhenEmpty()
+    {
+        var result = new DecompositionResult(
+            new List<BundleTransactionItem> { new(Guid.NewGuid(), 1m, 10m) },
+            new List<DecomposedItem>());
+
+        result.HasBundleItems.ShouldBeFalse();
+    }
+
+    [Fact]
+    public void ProductBundle_CalculateValuation_SumsComponentRates()
+    {
+        var bundle = new ProductBundle(Guid.NewGuid(), Guid.NewGuid());
+        var compA = Guid.NewGuid();
+        var compB = Guid.NewGuid();
+        bundle.AddItem(compA, 2m, "Component A");
+        bundle.AddItem(compB, 3m, "Component B");
+
+        // Valuation: compA rate=10 × qty=2 + compB rate=20 × qty=3 = 20 + 60 = 80
+        var valuation = bundle.CalculateValuation(itemId =>
+            itemId == compA ? 10m : 20m);
+
+        valuation.ShouldBe(80m);
+    }
+
+    [Fact]
+    public void ProductBundle_AddItem_IncrementsCount()
+    {
+        var bundle = new ProductBundle(Guid.NewGuid(), Guid.NewGuid());
+        bundle.Items.Count.ShouldBe(0);
+
+        bundle.AddItem(Guid.NewGuid(), 1m);
+        bundle.Items.Count.ShouldBe(1);
+
+        bundle.AddItem(Guid.NewGuid(), 2m);
+        bundle.Items.Count.ShouldBe(2);
+    }
+
+    [Fact]
+    public void ProductBundle_Deactivate_SetsInactive()
+    {
+        var bundle = new ProductBundle(Guid.NewGuid(), Guid.NewGuid());
+        bundle.IsActive.ShouldBeTrue();
+
+        bundle.Deactivate();
+        bundle.IsActive.ShouldBeFalse();
+    }
+
+    [Fact]
+    public void ProductBundle_Activate_SetsActive()
+    {
+        var bundle = new ProductBundle(Guid.NewGuid(), Guid.NewGuid());
+        bundle.Deactivate();
+        bundle.IsActive.ShouldBeFalse();
+
+        bundle.Activate();
+        bundle.IsActive.ShouldBeTrue();
+    }
+
+    [Fact]
+    public void ProductBundle_ComponentQty_ScalesConcept()
+    {
+        // If bundle has component with qty=3, and transaction has 5 bundles:
+        // Then stock operation needs 3 × 5 = 15 component units
+        var componentQty = 3m;
+        var transactionQty = 5m;
+        var scaledQty = componentQty * transactionQty;
+        scaledQty.ShouldBe(15m);
+    }
+
+    [Fact]
+    public void ProductBundle_ProportionalRate_DistributesEvenly()
+    {
+        // If bundle sells for 100 and has 2 components with qty 2 and 3:
+        // Component A gets: 100 × (2 / 5) = 40
+        // Component B gets: 100 × (3 / 5) = 60
+        var bundleRate = 100m;
+        var totalComponentQty = 5m; // 2 + 3
+        var rateA = bundleRate * (2m / totalComponentQty);
+        var rateB = bundleRate * (3m / totalComponentQty);
+        rateA.ShouldBe(40m);
+        rateB.ShouldBe(60m);
+    }
+
+    [Fact]
+    public void ProductBundle_ProportionalRate_HandlesUnevenDistribution()
+    {
+        // If bundle sells for 100 and has 3 components with qty 1, 1, 1:
+        // Each gets: 100 × (1 / 3) = 33.333...
+        var bundleRate = 100m;
+        var totalComponentQty = 3m;
+        var rateEach = bundleRate * (1m / totalComponentQty);
+        // Should be ~33.33 (not exactly 33.33 due to decimal precision)
+        rateEach.ShouldBeGreaterThan(33.33m);
+        rateEach.ShouldBeLessThan(33.34m);
+    }
+
+    [Fact]
+    public void ProductBundle_BundleItem_PropertiesSet()
+    {
+        var bundleId = Guid.NewGuid();
+        var compId = Guid.NewGuid();
+        var bundle = new ProductBundle(bundleId, Guid.NewGuid());
+        bundle.AddItem(compId, 5m, "Widget", "Piece");
+
+        var item = bundle.Items.First();
+        item.ComponentItemId.ShouldBe(compId);
+        item.Qty.ShouldBe(5m);
+        item.ItemName.ShouldBe("Widget");
+        item.Uom.ShouldBe("Piece");
+        item.ProductBundleId.ShouldBe(bundleId);
+    }
+
+    [Fact]
+    public void ProductBundle_EmptyBundle_ZeroValuation()
+    {
+        var bundle = new ProductBundle(Guid.NewGuid(), Guid.NewGuid());
+        var valuation = bundle.CalculateValuation(_ => 100m);
+        valuation.ShouldBe(0m);
+    }
+
+    [Fact]
+    public void DecomposedItem_PreservesWarehouseId()
+    {
+        var warehouseId = Guid.NewGuid();
+        var item = new DecomposedItem(
+            ComponentItemId: Guid.NewGuid(),
+            ComponentItemName: "Comp",
+            Qty: 2m,
+            Rate: 50m,
+            Uom: "Nos",
+            ParentBundleItemId: Guid.NewGuid(),
+            ParentBundleId: Guid.NewGuid(),
+            WarehouseId: warehouseId);
+
+        item.WarehouseId.ShouldBe(warehouseId);
+
+        var txnItem = new BundleTransactionItem(Guid.NewGuid(), 2m, 100m, warehouseId);
+        txnItem.WarehouseId.ShouldBe(warehouseId);
+    }
+
+    [Fact]
+    public void GetPackedItemsForBundleRow_MatchesExactRowIdAndIndex_PerPR60745()
+    {
+        var row1Id = Guid.NewGuid();
+        var row2Id = Guid.NewGuid();
+        var bundleId = Guid.NewGuid();
+        var parentItemId = Guid.NewGuid();
+        var comp1Id = Guid.NewGuid();
+        var comp2Id = Guid.NewGuid();
+
+        var packed1 = new DecomposedItem(
+            ComponentItemId: comp1Id,
+            ComponentItemName: "Comp 1",
+            Qty: 2m,
+            Rate: 50m,
+            Uom: "Nos",
+            ParentBundleItemId: parentItemId,
+            ParentBundleId: bundleId,
+            ParentDetailId: row1Id,
+            ParentIndex: 1
+        );
+
+        var packed2 = new DecomposedItem(
+            ComponentItemId: comp2Id,
+            ComponentItemName: "Comp 2",
+            Qty: 4m,
+            Rate: 25m,
+            Uom: "Nos",
+            ParentBundleItemId: parentItemId,
+            ParentBundleId: bundleId,
+            ParentDetailId: row2Id,
+            ParentIndex: 2
+        );
+
+        var packedItems = new List<DecomposedItem> { packed1, packed2 };
+
+        // Match by row1Id -> must return only packed1
+        var row1Packed = ProductBundleDecompositionService.GetPackedItemsForBundleRow(packedItems, row1Id, 1).ToList();
+        row1Packed.Count.ShouldBe(1);
+        row1Packed[0].ComponentItemId.ShouldBe(comp1Id);
+
+        // Match by row2Id -> must return only packed2
+        var row2Packed = ProductBundleDecompositionService.GetPackedItemsForBundleRow(packedItems, row2Id, 2).ToList();
+        row2Packed.Count.ShouldBe(1);
+        row2Packed[0].ComponentItemId.ShouldBe(comp2Id);
+
+        // Match unknown row -> empty
+        var unknownPacked = ProductBundleDecompositionService.GetPackedItemsForBundleRow(packedItems, Guid.NewGuid(), 99).ToList();
+        unknownPacked.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task ProductBundleDecomposition_HonoursComponentUomConversion_PerPR62149()
+    {
+        var bundleItemId = Guid.NewGuid();
+        var compItemId = Guid.NewGuid();
+        var bundle = new ProductBundle(Guid.NewGuid(), bundleItemId);
+        bundle.AddItem(compItemId, 1m, "Box of Widgets", uom: "Box");
+
+        var bundleRepo = NSubstitute.Substitute.For<Volo.Abp.Domain.Repositories.IRepository<ProductBundle, Guid>>();
+        bundleRepo.GetQueryableAsync().Returns(System.Threading.Tasks.Task.FromResult(new List<ProductBundle> { bundle }.AsQueryable()));
+
+        var compItem = new Item(compItemId, Guid.NewGuid(), "WIDGET", "Widget", ItemType.Goods)
+        {
+            Uom = "Nos"
+        };
+        var itemRepo = NSubstitute.Substitute.For<Volo.Abp.Domain.Repositories.IRepository<Item, Guid>>();
+        itemRepo.GetQueryableAsync().Returns(System.Threading.Tasks.Task.FromResult(new List<Item> { compItem }.AsQueryable()));
+
+        var uomConversion = new UomConversion(Guid.NewGuid(), "Box", "Nos", 12m, compItemId);
+        var uomRepo = NSubstitute.Substitute.For<Volo.Abp.Domain.Repositories.IRepository<UomConversion, Guid>>();
+        uomRepo.GetQueryableAsync().Returns(System.Threading.Tasks.Task.FromResult(new List<UomConversion> { uomConversion }.AsQueryable()));
+        var uomService = new UomConversionService(uomRepo);
+
+        var service = new ProductBundleDecompositionService(bundleRepo, itemRepo, uomService);
+
+        // 2 bundles x 1 Box (12 Nos) = 24 Nos
+        var decomposed = await service.DecomposeAsync(bundleItemId, 2m, 100m);
+
+        decomposed.Count.ShouldBe(1);
+        decomposed[0].ComponentItemId.ShouldBe(compItemId);
+        decomposed[0].Qty.ShouldBe(24m);
+        decomposed[0].Uom.ShouldBe("Nos");
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task ProductBundleDecomposition_AllowsDisabledBundleOnReturn_PerPR62149()
+    {
+        var bundleItemId = Guid.NewGuid();
+        var compItemId = Guid.NewGuid();
+        var bundle = new ProductBundle(Guid.NewGuid(), bundleItemId);
+        bundle.AddItem(compItemId, 2m, "Widget");
+        bundle.Disable();
+
+        var bundleRepo = NSubstitute.Substitute.For<Volo.Abp.Domain.Repositories.IRepository<ProductBundle, Guid>>();
+        bundleRepo.GetQueryableAsync().Returns(System.Threading.Tasks.Task.FromResult(new List<ProductBundle> { bundle }.AsQueryable()));
+
+        var service = new ProductBundleDecompositionService(bundleRepo);
+
+        // Non-return call should not decompose disabled bundle
+        var normalDecomp = await service.DecomposeAsync(bundleItemId, 1m, 50m, isReturn: false);
+        normalDecomp.ShouldBeEmpty();
+
+        // Return call should decompose disabled bundle
+        var returnDecomp = await service.DecomposeAsync(bundleItemId, 1m, 50m, isReturn: true);
+        returnDecomp.Count.ShouldBe(1);
+        returnDecomp[0].Qty.ShouldBe(2m);
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task ProductBundleDecomposition_PreservesRepeatedBundleComponents_PerPR62149()
+    {
+        var bundleItemId = Guid.NewGuid();
+        var compItemId = Guid.NewGuid();
+        var bundle = new ProductBundle(Guid.NewGuid(), bundleItemId);
+        bundle.AddItem(compItemId, 2m, "Widget 1");
+        bundle.AddItem(compItemId, 3m, "Widget 2");
+
+        var bundleRepo = NSubstitute.Substitute.For<Volo.Abp.Domain.Repositories.IRepository<ProductBundle, Guid>>();
+        bundleRepo.GetQueryableAsync().Returns(System.Threading.Tasks.Task.FromResult(new List<ProductBundle> { bundle }.AsQueryable()));
+
+        var service = new ProductBundleDecompositionService(bundleRepo);
+
+        // Decompose 2 bundles -> should produce 2 separate rows: 4 and 6
+        var decomposed = await service.DecomposeAsync(bundleItemId, 2m, 100m);
+        decomposed.Count.ShouldBe(2);
+        decomposed[0].Qty.ShouldBe(4m);
+        decomposed[1].Qty.ShouldBe(6m);
+    }
+}

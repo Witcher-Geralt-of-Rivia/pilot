@@ -1,0 +1,1459 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Accounting.DomainServices;
+using MyERP.Accounting.Entities;
+using MyERP.Core;
+using MyERP.Core.Entities;
+using MyERP.Permissions;
+using MyERP.Projects.Entities;
+using MyERP.Purchasing.Entities;
+using MyERP.Sales.Entities;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+
+namespace MyERP.Accounting;
+
+[Authorize(MyERPPermissions.Accounts.Default)]
+public class ReportingAppService : ApplicationService, IReportingAppService
+{
+    private readonly IRepository<Account, Guid> _accountRepository;
+    private readonly IRepository<JournalEntryLine, Guid> _journalLineRepository;
+    private readonly IRepository<JournalEntry, Guid> _journalEntryRepository;
+    private readonly AccountBalanceService _balanceService;
+    private readonly IRepository<Customer, Guid> _customerRepository;
+    private readonly IRepository<Supplier, Guid> _supplierRepository;
+    private readonly IRepository<Company, Guid> _companyRepository;
+    private readonly IRepository<FiscalYear, Guid>? _fiscalYearRepository;
+    private readonly IRepository<PaymentLedgerEntry, Guid>? _pleRepository;
+    private readonly IRepository<FinanceBook, Guid>? _financeBookRepository;
+    private readonly IRepository<CostCenter, Guid>? _costCenterRepository;
+    private readonly IRepository<Project, Guid>? _projectRepository;
+
+    public ReportingAppService(
+        IRepository<Account, Guid> accountRepository,
+        IRepository<JournalEntryLine, Guid> journalLineRepository,
+        IRepository<JournalEntry, Guid> journalEntryRepository,
+        AccountBalanceService balanceService,
+        IRepository<Customer, Guid> customerRepository,
+        IRepository<Supplier, Guid> supplierRepository,
+        IRepository<Company, Guid> companyRepository,
+        IRepository<FiscalYear, Guid>? fiscalYearRepository = null,
+        IRepository<PaymentLedgerEntry, Guid>? pleRepository = null,
+        IRepository<FinanceBook, Guid>? financeBookRepository = null,
+        IRepository<CostCenter, Guid>? costCenterRepository = null,
+        IRepository<Project, Guid>? projectRepository = null)
+    {
+        _accountRepository = accountRepository;
+        _journalLineRepository = journalLineRepository;
+        _journalEntryRepository = journalEntryRepository;
+        _balanceService = balanceService;
+        _customerRepository = customerRepository;
+        _supplierRepository = supplierRepository;
+        _companyRepository = companyRepository;
+        _fiscalYearRepository = fiscalYearRepository;
+        _pleRepository = pleRepository;
+        _financeBookRepository = financeBookRepository;
+        _costCenterRepository = costCenterRepository;
+        _projectRepository = projectRepository;
+    }
+
+    public async Task<TrialBalanceReportDto> GetTrialBalanceAsync(TrialBalanceRequestDto input)
+    {
+        var accounts = await _accountRepository.GetListAsync(a => a.CompanyId == input.CompanyId && !a.IsGroup);
+
+        // Use the optimized balance service (leverages closing balance cache + delta GL)
+        var balanceMap = await _balanceService.GetTrialBalanceAsync(input.CompanyId, input.AsOfDate);
+
+        var rows = new List<TrialBalanceRowDto>();
+        foreach (var account in accounts.OrderBy(a => a.AccountCode))
+        {
+            if (!balanceMap.TryGetValue(account.Id, out var balance))
+                continue; // Skip zero-balance accounts
+
+            if (balance.Debit == 0 && balance.Credit == 0)
+                continue;
+
+            var netBalance = balance.Balance;
+
+            rows.Add(new TrialBalanceRowDto
+            {
+                AccountId = account.Id,
+                AccountCode = account.AccountCode,
+                AccountName = account.AccountName,
+                AccountType = account.AccountType.ToString(),
+                IsGroup = false,
+                Level = 0,
+                Debit = Math.Round(balance.Debit, 2),
+                Credit = Math.Round(balance.Credit, 2),
+                ClosingDebit = Math.Round(netBalance > 0 ? netBalance : 0, 2),
+                ClosingCredit = Math.Round(netBalance < 0 ? Math.Abs(netBalance) : 0, 2),
+            });
+        }
+
+        return new TrialBalanceReportDto
+        {
+            AsOfDate = input.AsOfDate,
+            CompanyId = input.CompanyId,
+            Rows = rows,
+            TotalDebit = Math.Round(rows.Sum(r => r.Debit), 2),
+            TotalCredit = Math.Round(rows.Sum(r => r.Credit), 2),
+        };
+    }
+
+    public async Task<ProfitLossReportDto> GetProfitLossAsync(ProfitLossRequestDto input)
+    {
+        var result = await BuildProfitLossForPeriodAsync(
+            input.CompanyId, input.FromDate, input.ToDate, input.FinanceBook, input.IncludeDefaultBookEntries);
+
+        if (input.IncludeComparison)
+        {
+            // Calculate previous period with same duration immediately before
+            var duration = input.ToDate - input.FromDate;
+            var prevTo = input.FromDate.AddDays(-1);
+            var prevFrom = prevTo - duration;
+
+            var prevResult = await BuildProfitLossForPeriodAsync(
+                input.CompanyId, prevFrom, prevTo, input.FinanceBook, input.IncludeDefaultBookEntries);
+
+            // Merge previous period data into rows
+            var prevRevenueMap = prevResult.RevenueRows.ToDictionary(r => r.AccountId, r => r.Amount);
+            var prevExpenseMap = prevResult.ExpenseRows.ToDictionary(r => r.AccountId, r => r.Amount);
+
+            foreach (var row in result.RevenueRows)
+            {
+                row.PreviousPeriodAmount = prevRevenueMap.GetValueOrDefault(row.AccountId, 0m);
+                row.GrowthPercentage = CalculateGrowth(row.Amount, row.PreviousPeriodAmount.Value);
+            }
+            foreach (var row in result.ExpenseRows)
+            {
+                row.PreviousPeriodAmount = prevExpenseMap.GetValueOrDefault(row.AccountId, 0m);
+                row.GrowthPercentage = CalculateGrowth(row.Amount, row.PreviousPeriodAmount.Value);
+            }
+
+            result.PreviousTotalRevenue = prevResult.TotalRevenue;
+            result.PreviousTotalExpense = prevResult.TotalExpense;
+            result.PreviousNetProfitOrLoss = prevResult.NetProfitOrLoss;
+            result.PreviousFromDate = prevFrom;
+            result.PreviousToDate = prevTo;
+        }
+
+        return result;
+    }
+
+    private async Task<ProfitLossReportDto> BuildProfitLossForPeriodAsync(
+        Guid companyId,
+        DateTime fromDate,
+        DateTime toDate,
+        string? financeBook = null,
+        bool includeDefaultBookEntries = false)
+    {
+        var allowedFinanceBooks = await ResolveAllowedFinanceBooksAsync(
+            companyId, financeBook, includeDefaultBookEntries);
+
+        var accounts = await _accountRepository.GetListAsync(
+            a => a.CompanyId == companyId && !a.IsGroup
+                && (a.AccountType == AccountType.Revenue || a.AccountType == AccountType.Expense));
+
+        var journalEntries = await _journalEntryRepository.GetListAsync(
+            je => je.CompanyId == companyId
+                && je.Status == DocumentStatus.Posted
+                && je.PostingDate >= fromDate
+                && je.PostingDate <= toDate);
+
+        var allLines = journalEntries.SelectMany(je => je.Lines)
+            .Where(l =>
+            {
+                var book = l.FinanceBook ?? string.Empty;
+                return allowedFinanceBooks.Contains(book);
+            })
+            .ToList();
+
+        var linesByAccount = allLines.GroupBy(l => l.AccountId)
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        var revenueRows = new List<ProfitLossRowDto>();
+        var expenseRows = new List<ProfitLossRowDto>();
+
+        foreach (var account in accounts.OrderBy(a => a.AccountCode))
+        {
+            var lines = linesByAccount.GetValueOrDefault(account.Id) ?? new List<JournalEntryLine>();
+            var debit = lines.Where(l => l.IsDebit).Sum(l => l.Amount);
+            var credit = lines.Where(l => !l.IsDebit).Sum(l => l.Amount);
+
+            var amount = account.AccountType == AccountType.Revenue
+                ? credit - debit
+                : debit - credit;
+
+            if (amount == 0) continue;
+
+            var row = new ProfitLossRowDto
+            {
+                AccountId = account.Id,
+                AccountCode = account.AccountCode,
+                AccountName = account.AccountName,
+                AccountType = account.AccountType.ToString(),
+                Amount = amount,
+                Level = 0,
+                IsGroup = false,
+            };
+
+            if (account.AccountType == AccountType.Revenue)
+                revenueRows.Add(row);
+            else
+                expenseRows.Add(row);
+        }
+
+        var totalRevenue = Math.Round(revenueRows.Sum(r => r.Amount), 2);
+        var totalExpense = Math.Round(expenseRows.Sum(r => r.Amount), 2);
+        var netProfit = totalRevenue - totalExpense;
+
+        // Base the margin view on the income total row per ERPNext PR #60012 / commits f180489d02, 63040a87d9
+        decimal? totalExpenseMargin = null;
+        decimal? netProfitMargin = null;
+        if (totalRevenue != 0)
+        {
+            foreach (var r in revenueRows)
+            {
+                r.MarginPercentage = Math.Round(r.Amount / totalRevenue * 100m, 2);
+            }
+            foreach (var r in expenseRows)
+            {
+                r.MarginPercentage = Math.Round(r.Amount / totalRevenue * 100m, 2);
+            }
+            totalExpenseMargin = Math.Round(totalExpense / totalRevenue * 100m, 2);
+            netProfitMargin = Math.Round(netProfit / totalRevenue * 100m, 2);
+        }
+
+        return new ProfitLossReportDto
+        {
+            FromDate = fromDate,
+            ToDate = toDate,
+            CompanyId = companyId,
+            RevenueRows = revenueRows,
+            ExpenseRows = expenseRows,
+            TotalRevenue = totalRevenue,
+            TotalExpense = totalExpense,
+            NetProfitOrLoss = netProfit,
+            TotalExpenseMarginPercentage = totalExpenseMargin,
+            NetProfitMarginPercentage = netProfitMargin,
+        };
+    }
+
+    private static decimal? CalculateGrowth(decimal current, decimal previous)
+    {
+        if (previous == 0) return current > 0 ? 100m : current < 0 ? -100m : null;
+        return Math.Round((current - previous) / Math.Abs(previous) * 100m, 1);
+    }
+
+    public async Task<BalanceSheetReportDto> GetBalanceSheetAsync(BalanceSheetRequestDto input)
+    {
+        var accounts = await _accountRepository.GetListAsync(
+            a => a.CompanyId == input.CompanyId && !a.IsGroup
+                && (a.AccountType == AccountType.Asset
+                    || a.AccountType == AccountType.Liability
+                    || a.AccountType == AccountType.Equity));
+
+        var journalEntries = await _journalEntryRepository.GetListAsync(
+            je => je.CompanyId == input.CompanyId
+                && je.Status == DocumentStatus.Posted
+                && je.PostingDate <= input.AsOfDate);
+
+        // Lines are already loaded via AutoInclude — no separate query needed
+        var allLines = journalEntries.SelectMany(je => je.Lines).ToList();
+
+        var linesByAccount = allLines.GroupBy(l => l.AccountId)
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        var assetRows = new List<BalanceSheetRowDto>();
+        var liabilityRows = new List<BalanceSheetRowDto>();
+        var equityRows = new List<BalanceSheetRowDto>();
+
+        foreach (var account in accounts.OrderBy(a => a.AccountCode))
+        {
+            var lines = linesByAccount.GetValueOrDefault(account.Id) ?? new List<JournalEntryLine>();
+            var debit = lines.Where(l => l.IsDebit).Sum(l => l.Amount);
+            var credit = lines.Where(l => !l.IsDebit).Sum(l => l.Amount);
+
+            // Asset: debit - credit (normal debit balance)
+            // Liability & Equity: credit - debit (normal credit balance)
+            var amount = account.AccountType == AccountType.Asset
+                ? debit - credit
+                : credit - debit;
+
+            if (amount == 0) continue;
+
+            var row = new BalanceSheetRowDto
+            {
+                AccountId = account.Id,
+                AccountCode = account.AccountCode,
+                AccountName = account.AccountName,
+                AccountType = account.AccountType.ToString(),
+                Amount = amount,
+                Level = 0,
+                IsGroup = false,
+            };
+
+            switch (account.AccountType)
+            {
+                case AccountType.Asset: assetRows.Add(row); break;
+                case AccountType.Liability: liabilityRows.Add(row); break;
+                case AccountType.Equity: equityRows.Add(row); break;
+            }
+        }
+
+        var totalAssets = Math.Round(assetRows.Sum(r => r.Amount), 2);
+        var totalLiabilities = Math.Round(liabilityRows.Sum(r => r.Amount), 2);
+        var initialEquity = Math.Round(equityRows.Sum(r => r.Amount), 2);
+
+        // Fundamental accounting equation: Assets = Liabilities + Equity + Net Profit
+        // Net Profit = Assets - Liabilities - Equity
+        var totalNetProfit = Math.Round(totalAssets - totalLiabilities - initialEquity, 2);
+
+        // Split into unclosed prior fiscal years vs current fiscal year provisional profit/loss
+        // Per ERPNext PR #60004 / commits 89012ba339, 509e2f1581:
+        // "show profit or loss of unclosed earlier years"
+        decimal unclosedProfit = 0m;
+        decimal currentYearProvisionalProfit = totalNetProfit;
+
+        var fyRepo = _fiscalYearRepository ?? LazyServiceProvider.LazyGetService<IRepository<FiscalYear, Guid>>();
+        if (fyRepo != null)
+        {
+            var fiscalYears = await fyRepo.GetListAsync(f => f.CompanyId == input.CompanyId);
+            var currentFy = fiscalYears.FirstOrDefault(f => f.StartDate <= input.AsOfDate && f.EndDate >= input.AsOfDate);
+
+            if (currentFy != null)
+            {
+                var priorEntries = journalEntries.Where(je => je.PostingDate < currentFy.StartDate).ToList();
+                if (priorEntries.Count > 0)
+                {
+                    var priorLines = priorEntries.SelectMany(je => je.Lines).ToList();
+                    var priorLinesByAccount = priorLines.GroupBy(l => l.AccountId)
+                        .ToDictionary(g => g.Key, g => g.ToList());
+
+                    decimal priorAssets = 0m;
+                    decimal priorLiabilities = 0m;
+                    decimal priorEquity = 0m;
+
+                    foreach (var account in accounts)
+                    {
+                        var lines = priorLinesByAccount.GetValueOrDefault(account.Id) ?? new List<JournalEntryLine>();
+                        var debit = lines.Where(l => l.IsDebit).Sum(l => l.Amount);
+                        var credit = lines.Where(l => !l.IsDebit).Sum(l => l.Amount);
+                        var amt = account.AccountType == AccountType.Asset ? debit - credit : credit - debit;
+
+                        switch (account.AccountType)
+                        {
+                            case AccountType.Asset: priorAssets += amt; break;
+                            case AccountType.Liability: priorLiabilities += amt; break;
+                            case AccountType.Equity: priorEquity += amt; break;
+                        }
+                    }
+
+                    unclosedProfit = Math.Round(priorAssets - priorLiabilities - priorEquity, 2);
+                    currentYearProvisionalProfit = Math.Round(totalNetProfit - unclosedProfit, 2);
+                }
+            }
+        }
+
+        // Add unclosed earlier years profit/loss and provisional profit/loss to equity rows with labels per PR #60004
+        if (unclosedProfit != 0)
+        {
+            equityRows.Add(new BalanceSheetRowDto
+            {
+                AccountId = Guid.Empty,
+                AccountCode = "",
+                AccountName = "Unclosed Fiscal Years Profit / Loss (Credit)",
+                AccountType = AccountType.Equity.ToString(),
+                Amount = unclosedProfit,
+                Level = 0,
+                IsGroup = false
+            });
+        }
+
+        if (currentYearProvisionalProfit != 0 || unclosedProfit != 0)
+        {
+            equityRows.Add(new BalanceSheetRowDto
+            {
+                AccountId = Guid.Empty,
+                AccountCode = "",
+                AccountName = "Provisional Profit / Loss (Credit)",
+                AccountType = AccountType.Equity.ToString(),
+                Amount = currentYearProvisionalProfit,
+                Level = 0,
+                IsGroup = false
+            });
+        }
+
+        return new BalanceSheetReportDto
+        {
+            AsOfDate = input.AsOfDate,
+            CompanyId = input.CompanyId,
+            AssetRows = assetRows,
+            LiabilityRows = liabilityRows,
+            EquityRows = equityRows,
+            TotalAssets = totalAssets,
+            TotalLiabilities = totalLiabilities,
+            TotalEquity = Math.Round(equityRows.Sum(r => r.Amount), 2),
+            ProvisionalProfitLoss = currentYearProvisionalProfit,
+            UnclosedFiscalYearsProfitLoss = unclosedProfit,
+        };
+    }
+
+    public async Task<MonthlyProfitLossReportDto> GetMonthlyProfitLossAsync(MonthlyProfitLossRequestDto input)
+    {
+        var yearStart = new DateTime(input.Year, input.StartMonth, 1);
+        var yearEnd = yearStart.AddMonths(12).AddDays(-1);
+
+        var accounts = await _accountRepository.GetListAsync(
+            a => a.CompanyId == input.CompanyId && !a.IsGroup
+                && (a.AccountType == AccountType.Revenue || a.AccountType == AccountType.Expense));
+
+        var journalEntries = await _journalEntryRepository.GetListAsync(
+            je => je.CompanyId == input.CompanyId
+                && je.Status == DocumentStatus.Posted
+                && je.PostingDate >= yearStart
+                && je.PostingDate <= yearEnd);
+
+        // Flatten with posting date from parent JE
+        var linesWithDate = journalEntries
+            .SelectMany(je => je.Lines.Select(l => new { Line = l, je.PostingDate }))
+            .ToList();
+
+        // Group by account + month index
+        var linesByAccountMonth = linesWithDate
+            .GroupBy(x => new { x.Line.AccountId, MonthIdx = ((x.PostingDate.Year - yearStart.Year) * 12 + x.PostingDate.Month - yearStart.Month) })
+            .Where(g => g.Key.MonthIdx >= 0 && g.Key.MonthIdx < 12)
+            .ToDictionary(g => (g.Key.AccountId, g.Key.MonthIdx), g => g.ToList());
+
+        var revenueRows = new List<MonthlyProfitLossRowDto>();
+        var expenseRows = new List<MonthlyProfitLossRowDto>();
+
+        foreach (var account in accounts.OrderBy(a => a.AccountCode))
+        {
+            var monthlyAmounts = new decimal[12];
+            for (int m = 0; m < 12; m++)
+            {
+                if (!linesByAccountMonth.TryGetValue((account.Id, m), out var lines)) continue;
+
+                var debit = lines.Where(x => x.Line.IsDebit).Sum(x => x.Line.Amount);
+                var credit = lines.Where(x => !x.Line.IsDebit).Sum(x => x.Line.Amount);
+                monthlyAmounts[m] = account.AccountType == AccountType.Revenue
+                    ? credit - debit
+                    : debit - credit;
+            }
+
+            var annualTotal = monthlyAmounts.Sum();
+            if (annualTotal == 0 && monthlyAmounts.All(a => a == 0)) continue;
+
+            var row = new MonthlyProfitLossRowDto
+            {
+                AccountId = account.Id,
+                AccountCode = account.AccountCode,
+                AccountName = account.AccountName,
+                AccountType = account.AccountType.ToString(),
+                MonthlyAmounts = monthlyAmounts,
+                AnnualTotal = annualTotal,
+            };
+
+            if (account.AccountType == AccountType.Revenue)
+                revenueRows.Add(row);
+            else
+                expenseRows.Add(row);
+        }
+
+        var monthlyRevenue = new decimal[12];
+        var monthlyExpense = new decimal[12];
+        var monthlyNetProfit = new decimal[12];
+        var monthLabels = new string[12];
+
+        for (int m = 0; m < 12; m++)
+        {
+            monthlyRevenue[m] = revenueRows.Sum(r => r.MonthlyAmounts[m]);
+            monthlyExpense[m] = expenseRows.Sum(r => r.MonthlyAmounts[m]);
+            monthlyNetProfit[m] = monthlyRevenue[m] - monthlyExpense[m];
+            var monthDate = yearStart.AddMonths(m);
+            monthLabels[m] = monthDate.ToString("MMM yyyy");
+        }
+
+        return new MonthlyProfitLossReportDto
+        {
+            Year = input.Year,
+            CompanyId = input.CompanyId,
+            MonthLabels = monthLabels,
+            RevenueRows = revenueRows,
+            ExpenseRows = expenseRows,
+            MonthlyRevenue = monthlyRevenue,
+            MonthlyExpense = monthlyExpense,
+            MonthlyNetProfit = monthlyNetProfit,
+            AnnualRevenue = monthlyRevenue.Sum(),
+            AnnualExpense = monthlyExpense.Sum(),
+            AnnualNetProfit = monthlyNetProfit.Sum(),
+        };
+    }
+
+    public async Task<PartyTrialBalanceReportDto> GetTrialBalanceForPartyAsync(PartyTrialBalanceRequestDto input)
+    {
+        var company = await _companyRepository.FindAsync(input.CompanyId);
+        var currency = company?.CurrencyCode ?? "MYR";
+
+        var partyType = string.Equals(input.PartyType, "Supplier", StringComparison.OrdinalIgnoreCase)
+            ? "Supplier"
+            : "Customer";
+
+        Dictionary<Guid, string> partyNames;
+        if (partyType == "Customer")
+        {
+            var custQuery = await _customerRepository.GetQueryableAsync();
+            var q = custQuery.Where(c => c.CompanyId == input.CompanyId);
+            if (input.PartyId.HasValue)
+            {
+                q = q.Where(c => c.Id == input.PartyId.Value);
+            }
+            partyNames = q.Select(c => new { c.Id, c.Name }).ToDictionary(c => c.Id, c => c.Name);
+        }
+        else
+        {
+            var suppQuery = await _supplierRepository.GetQueryableAsync();
+            var q = suppQuery.Where(s => s.CompanyId == input.CompanyId);
+            if (input.PartyId.HasValue)
+            {
+                q = q.Where(s => s.Id == input.PartyId.Value);
+            }
+            partyNames = q.Select(s => new { s.Id, s.Name }).ToDictionary(s => s.Id, s => s.Name);
+        }
+
+        // Query posted journal entries for the company up to ToDate (or opening entries)
+        var journalEntries = await _journalEntryRepository.GetListAsync(je =>
+            je.CompanyId == input.CompanyId &&
+            je.Status == DocumentStatus.Posted &&
+            (je.PostingDate <= input.ToDate || (je.IsOpening && je.PostingDate <= input.ToDate)));
+
+        // Opening: PostingDate < FromDate || (IsOpening && PostingDate <= ToDate)
+        var openingLines = journalEntries
+            .Where(je => je.PostingDate < input.FromDate || (je.IsOpening && je.PostingDate <= input.ToDate))
+            .SelectMany(je => je.Lines)
+            .Where(l => string.Equals(l.PartyType, partyType, StringComparison.OrdinalIgnoreCase) && l.PartyId.HasValue);
+
+        if (input.PartyId.HasValue)
+        {
+            openingLines = openingLines.Where(l => l.PartyId == input.PartyId.Value);
+        }
+        if (input.AccountId.HasValue)
+        {
+            openingLines = openingLines.Where(l => l.AccountId == input.AccountId.Value);
+        }
+
+        var openingByParty = openingLines
+            .GroupBy(l => l.PartyId!.Value)
+            .ToDictionary(
+                g => g.Key,
+                g =>
+                {
+                    var dr = Math.Round(g.Where(l => l.IsDebit).Sum(l => l.Amount), 2);
+                    var cr = Math.Round(g.Where(l => !l.IsDebit).Sum(l => l.Amount), 2);
+                    return ToggleDebitCredit(dr, cr);
+                });
+
+        // Balances within period: PostingDate >= FromDate && PostingDate <= ToDate && !IsOpening
+        var periodLines = journalEntries
+            .Where(je => je.PostingDate >= input.FromDate && je.PostingDate <= input.ToDate && !je.IsOpening)
+            .SelectMany(je => je.Lines)
+            .Where(l => string.Equals(l.PartyType, partyType, StringComparison.OrdinalIgnoreCase) && l.PartyId.HasValue);
+
+        if (input.PartyId.HasValue)
+        {
+            periodLines = periodLines.Where(l => l.PartyId == input.PartyId.Value);
+        }
+        if (input.AccountId.HasValue)
+        {
+            periodLines = periodLines.Where(l => l.AccountId == input.AccountId.Value);
+        }
+
+        var periodByParty = periodLines
+            .GroupBy(l => l.PartyId!.Value)
+            .ToDictionary(
+                g => g.Key,
+                g => (
+                    Debit: Math.Round(g.Where(l => l.IsDebit).Sum(l => l.Amount), 2),
+                    Credit: Math.Round(g.Where(l => !l.IsDebit).Sum(l => l.Amount), 2)
+                ));
+
+        // Union parties
+        var allPartyIds = partyNames.Keys
+            .Union(openingByParty.Keys)
+            .Union(periodByParty.Keys)
+            .Distinct()
+            .ToList();
+
+        if (input.PartyId.HasValue)
+        {
+            allPartyIds = allPartyIds.Where(p => p == input.PartyId.Value).ToList();
+        }
+
+        var rows = new List<PartyTrialBalanceRowDto>();
+
+        foreach (var pId in allPartyIds.OrderBy(p => partyNames.GetValueOrDefault(p) ?? p.ToString()))
+        {
+            var partyName = partyNames.GetValueOrDefault(pId) ?? pId.ToString();
+            var (opDrRaw, opCrRaw) = openingByParty.GetValueOrDefault(pId, (0m, 0m));
+            var (pDrRaw, pCrRaw) = periodByParty.GetValueOrDefault(pId, (0m, 0m));
+
+            // Per ERPNext PR #58607 / commit b1c7657dfa:
+            // Round party balances to currency precision so sub-cent remainders do not bypass zero balance exclusion
+            var opDr = Math.Round(opDrRaw, 2);
+            var opCr = Math.Round(opCrRaw, 2);
+            var pDr = Math.Round(pDrRaw, 2);
+            var pCr = Math.Round(pCrRaw, 2);
+            var (clDr, clCr) = ToggleDebitCredit(opDr + pDr, opCr + pCr);
+
+            if (input.ExcludeZeroBalanceParties && clDr == 0 && clCr == 0)
+            {
+                continue;
+            }
+
+            var hasValue = opDr != 0 || opCr != 0 || pDr != 0 || pCr != 0 || clDr != 0 || clCr != 0;
+            if (!input.ShowZeroValues && !hasValue)
+            {
+                continue;
+            }
+
+            rows.Add(new PartyTrialBalanceRowDto
+            {
+                PartyId = pId,
+                PartyName = partyName,
+                PartyType = partyType,
+                OpeningDebit = opDr,
+                OpeningCredit = opCr,
+                Debit = pDr,
+                Credit = pCr,
+                ClosingDebit = clDr,
+                ClosingCredit = clCr,
+                Currency = currency,
+            });
+        }
+
+        return new PartyTrialBalanceReportDto
+        {
+            CompanyId = input.CompanyId,
+            FromDate = input.FromDate,
+            ToDate = input.ToDate,
+            PartyType = partyType,
+            Currency = currency,
+            Rows = rows,
+            TotalOpeningDebit = Math.Round(rows.Sum(r => r.OpeningDebit), 2),
+            TotalOpeningCredit = Math.Round(rows.Sum(r => r.OpeningCredit), 2),
+            TotalDebit = Math.Round(rows.Sum(r => r.Debit), 2),
+            TotalCredit = Math.Round(rows.Sum(r => r.Credit), 2),
+            TotalClosingDebit = Math.Round(rows.Sum(r => r.ClosingDebit), 2),
+            TotalClosingCredit = Math.Round(rows.Sum(r => r.ClosingCredit), 2),
+        };
+    }
+
+    public static (decimal Debit, decimal Credit) ToggleDebitCredit(decimal debit, decimal credit)
+    {
+        if (debit > credit)
+        {
+            return (Math.Round(debit - credit, 2), 0m);
+        }
+        else
+        {
+            return (0m, Math.Round(credit - debit, 2));
+        }
+    }
+
+    // --- Financial Ratios Report (ERPNext accounts/report/financial_ratios) ---
+
+    public async Task<FinancialRatiosReportDto> GetFinancialRatiosAsync(FinancialRatiosRequestDto input)
+    {
+        var currentRatios = await CalculateFinancialRatiosForPeriodAsync(input.CompanyId, input.FromDate, input.ToDate);
+
+        DateTime? prevFrom = null;
+        DateTime? prevTo = null;
+        Dictionary<string, decimal?>? prevRatios = null;
+
+        if (input.IncludeComparison)
+        {
+            var duration = input.ToDate - input.FromDate;
+            prevTo = input.FromDate.AddDays(-1);
+            prevFrom = prevTo.Value - duration;
+
+            prevRatios = await CalculateFinancialRatiosForPeriodAsync(input.CompanyId, prevFrom.Value, prevTo.Value);
+        }
+
+        var rows = BuildFinancialRatioRows(currentRatios, prevRatios);
+
+        return new FinancialRatiosReportDto
+        {
+            CompanyId = input.CompanyId,
+            FromDate = input.FromDate,
+            ToDate = input.ToDate,
+            PreviousFromDate = prevFrom,
+            PreviousToDate = prevTo,
+            Rows = rows,
+        };
+    }
+
+    private async Task<Dictionary<string, decimal?>> CalculateFinancialRatiosForPeriodAsync(
+        Guid companyId, DateTime fromDate, DateTime toDate)
+    {
+        var allCompanyAccounts = await _accountRepository.GetListAsync(a => a.CompanyId == companyId);
+        var accounts = allCompanyAccounts.Where(a => !a.IsGroup).ToList();
+        var accountById = allCompanyAccounts.ToDictionary(a => a.Id);
+
+        var categoryNamesById = new Dictionary<Guid, string>();
+        if (allCompanyAccounts.Any(a => a.AccountCategoryId.HasValue))
+        {
+            var catRepo = LazyServiceProvider?.LazyGetService<IRepository<AccountCategory, Guid>>();
+            if (catRepo != null)
+            {
+                var categories = await catRepo.GetListAsync();
+                categoryNamesById = categories.ToDictionary(c => c.Id, c => c.Name);
+            }
+        }
+
+        // Inherit AccountCategory and AccountSubType from nearest parent group (ERPNext PR #61490 / commit 0ee7a7b67f)
+        string? GetEffectiveCategoryName(Account a)
+        {
+            var cur = a;
+            var visited = new HashSet<Guid>();
+            while (cur != null && visited.Add(cur.Id))
+            {
+                if (cur.AccountCategoryId.HasValue && categoryNamesById.TryGetValue(cur.AccountCategoryId.Value, out var catName) && !string.IsNullOrWhiteSpace(catName))
+                    return catName;
+                if (!cur.ParentAccountId.HasValue || !accountById.TryGetValue(cur.ParentAccountId.Value, out cur))
+                    break;
+            }
+            return null;
+        }
+
+        AccountSubType? GetEffectiveSubType(Account a)
+        {
+            var cur = a;
+            var visited = new HashSet<Guid>();
+            while (cur != null && visited.Add(cur.Id))
+            {
+                if (cur.AccountSubType.HasValue)
+                    return cur.AccountSubType.Value;
+                if (!cur.ParentAccountId.HasValue || !accountById.TryGetValue(cur.ParentAccountId.Value, out cur))
+                    break;
+            }
+            return null;
+        }
+
+        var journalEntries = await _journalEntryRepository.GetListAsync(
+            je => je.CompanyId == companyId
+                && je.Status == DocumentStatus.Posted
+                && je.PostingDate <= toDate);
+
+        var allLines = journalEntries.SelectMany(je => je.Lines).ToList();
+
+        // Lines grouped by account as of toDate
+        var linesUpToClosing = allLines.GroupBy(l => l.AccountId)
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        // Lines within period [fromDate, toDate]
+        var periodEntries = journalEntries.Where(je => je.PostingDate >= fromDate).ToList();
+        var linesInPeriod = periodEntries.SelectMany(je => je.Lines)
+            .GroupBy(l => l.AccountId)
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        // Lines up to opening date (fromDate - 1 day)
+        var openingDate = fromDate.AddDays(-1);
+        var linesUpToOpening = journalEntries.Where(je => je.PostingDate <= openingDate)
+            .SelectMany(je => je.Lines)
+            .GroupBy(l => l.AccountId)
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        // Helper to get closing balance as of toDate
+        decimal GetClosingBalance(Account a)
+        {
+            var lines = linesUpToClosing.GetValueOrDefault(a.Id) ?? new List<JournalEntryLine>();
+            var debit = lines.Where(l => l.IsDebit).Sum(l => l.Amount);
+            var credit = lines.Where(l => !l.IsDebit).Sum(l => l.Amount);
+            return a.AccountType == AccountType.Asset ? debit - credit : credit - debit;
+        }
+
+        // Helper to get opening balance as of fromDate - 1
+        decimal GetOpeningBalance(Account a)
+        {
+            var lines = linesUpToOpening.GetValueOrDefault(a.Id) ?? new List<JournalEntryLine>();
+            var debit = lines.Where(l => l.IsDebit).Sum(l => l.Amount);
+            var credit = lines.Where(l => !l.IsDebit).Sum(l => l.Amount);
+            return a.AccountType == AccountType.Asset ? debit - credit : credit - debit;
+        }
+
+        // Helper to get period flow (Revenue = credit - debit; Expense = debit - credit)
+        decimal GetPeriodAmount(Account a)
+        {
+            var lines = linesInPeriod.GetValueOrDefault(a.Id) ?? new List<JournalEntryLine>();
+            var debit = lines.Where(l => l.IsDebit).Sum(l => l.Amount);
+            var credit = lines.Where(l => !l.IsDebit).Sum(l => l.Amount);
+            return a.AccountType == AccountType.Revenue ? credit - debit : debit - credit;
+        }
+
+        // Account classification — per ERPNext PR #61490 (commit 0ee7a7b67f), AccountCategory wins over AccountSubType when present
+        var currentAssetCategories = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "Cash and Cash Equivalents", "Trade Receivables", "Other Receivables",
+            "Stock Assets", "Short-term Investments", "Other Current Assets"
+        };
+        var fixedAssetCategories = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "Tangible Assets", "Intangible Assets"
+        };
+        var currentLiabilityCategories = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "Trade Payables", "Other Payables", "Short-term Borrowings",
+            "Current Tax Liabilities", "Short-term Provisions", "Other Current Liabilities"
+        };
+        var directExpenseCategories = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "Cost of Goods Sold", "Other Direct Costs"
+        };
+
+        var currentAssetAccounts = accounts.Where(a =>
+        {
+            if (a.AccountType != AccountType.Asset) return false;
+            var cat = GetEffectiveCategoryName(a);
+            if (cat != null) return currentAssetCategories.Contains(cat);
+            var sub = GetEffectiveSubType(a);
+            return sub is AccountSubType.CurrentAsset or AccountSubType.BankAccount or AccountSubType.CashAccount
+                or AccountSubType.AccountsReceivable or AccountSubType.Stock;
+        }).ToList();
+
+        var quickAssetAccounts = accounts.Where(a =>
+        {
+            if (a.AccountType != AccountType.Asset) return false;
+            var cat = GetEffectiveCategoryName(a);
+            if (cat != null)
+            {
+                return string.Equals(cat, "Cash and Cash Equivalents", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(cat, "Trade Receivables", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(cat, "Other Receivables", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(cat, "Short-term Investments", StringComparison.OrdinalIgnoreCase);
+            }
+            var sub = GetEffectiveSubType(a);
+            return sub is AccountSubType.BankAccount or AccountSubType.CashAccount or AccountSubType.AccountsReceivable;
+        }).ToList();
+
+        var fixedAssetAccounts = accounts.Where(a =>
+        {
+            if (a.AccountType != AccountType.Asset) return false;
+            var cat = GetEffectiveCategoryName(a);
+            if (cat != null) return fixedAssetCategories.Contains(cat);
+            var sub = GetEffectiveSubType(a);
+            return sub is AccountSubType.FixedAsset or AccountSubType.AccumulatedDepreciation or AccountSubType.CapitalWorkInProgress;
+        }).ToList();
+
+        var allAssetAccounts = accounts.Where(a => a.AccountType == AccountType.Asset).ToList();
+
+        var currentLiabilityAccounts = accounts.Where(a =>
+        {
+            if (a.AccountType != AccountType.Liability) return false;
+            var cat = GetEffectiveCategoryName(a);
+            if (cat != null) return currentLiabilityCategories.Contains(cat);
+            var sub = GetEffectiveSubType(a);
+            return sub is AccountSubType.CurrentLiability or AccountSubType.AccountsPayable or AccountSubType.TaxPayable;
+        }).ToList();
+
+        var allLiabilityAccounts = accounts.Where(a => a.AccountType == AccountType.Liability).ToList();
+
+        var receivableAccounts = accounts.Where(a => a.AccountType == AccountType.Asset &&
+            GetEffectiveSubType(a) == AccountSubType.AccountsReceivable).ToList();
+
+        var payableAccounts = accounts.Where(a => a.AccountType == AccountType.Liability &&
+            GetEffectiveSubType(a) == AccountSubType.AccountsPayable).ToList();
+
+        var stockAccounts = accounts.Where(a => a.AccountType == AccountType.Asset &&
+            GetEffectiveSubType(a) == AccountSubType.Stock).ToList();
+
+        var revenueAccounts = accounts.Where(a => a.AccountType == AccountType.Revenue).ToList();
+        var expenseAccounts = accounts.Where(a => a.AccountType == AccountType.Expense).ToList();
+        var cogsAccounts = expenseAccounts.Where(a =>
+        {
+            var cat = GetEffectiveCategoryName(a);
+            if (cat != null) return directExpenseCategories.Contains(cat);
+            var sub = GetEffectiveSubType(a);
+            return sub == AccountSubType.CostOfGoodsSold ||
+                a.AccountName.Contains("Cost of Goods", StringComparison.OrdinalIgnoreCase) ||
+                a.AccountName.Contains("COGS", StringComparison.OrdinalIgnoreCase);
+        }).ToList();
+
+        // 1. Balance Sheet totals
+        var currentAssets = currentAssetAccounts.Sum(GetClosingBalance);
+        var quickAssets = quickAssetAccounts.Sum(GetClosingBalance);
+        var fixedAssets = fixedAssetAccounts.Sum(GetClosingBalance);
+        var totalAssets = allAssetAccounts.Sum(GetClosingBalance);
+
+        var currentLiabilities = currentLiabilityAccounts.Sum(GetClosingBalance);
+        var totalLiabilities = allLiabilityAccounts.Sum(GetClosingBalance);
+        var shareholderFund = totalAssets - totalLiabilities;
+
+        // 2. P&L totals for the period
+        var netSales = revenueAccounts.Sum(GetPeriodAmount);
+        var totalExpense = expenseAccounts.Sum(GetPeriodAmount);
+        var cogs = cogsAccounts.Sum(GetPeriodAmount);
+        var netProfit = netSales - totalExpense;
+
+        // 3. Average balances
+        var closingDebtors = receivableAccounts.Sum(GetClosingBalance);
+        var openingDebtors = receivableAccounts.Sum(GetOpeningBalance);
+        var avgDebtors = (closingDebtors + openingDebtors) / 2m;
+
+        var closingCreditors = payableAccounts.Sum(GetClosingBalance);
+        var openingCreditors = payableAccounts.Sum(GetOpeningBalance);
+        var avgCreditors = (closingCreditors + openingCreditors) / 2m;
+
+        var closingStock = stockAccounts.Sum(GetClosingBalance);
+        var openingStock = stockAccounts.Sum(GetOpeningBalance);
+        var avgStock = (closingStock + openingStock) / 2m;
+
+        // 4. Calculate 11 canonical ratios
+        var ratios = new Dictionary<string, decimal?>
+        {
+            // Liquidity
+            ["CurrentRatio"] = SafeDivide(currentAssets, currentLiabilities),
+            ["QuickRatio"] = SafeDivide(quickAssets, currentLiabilities),
+
+            // Solvency & Profitability
+            ["DebtEquityRatio"] = SafeDivide(totalLiabilities, shareholderFund),
+            ["GrossProfitMargin"] = SafeDivide((netSales - cogs) * 100m, netSales),
+            ["NetProfitMargin"] = SafeDivide(netProfit * 100m, netSales),
+            ["ReturnOnAssets"] = SafeDivide(netProfit * 100m, totalAssets),
+            ["ReturnOnEquity"] = SafeDivide(netProfit * 100m, shareholderFund),
+
+            // Turnover
+            ["FixedAssetTurnover"] = SafeDivide(netSales, fixedAssets > 0 ? fixedAssets : totalAssets),
+            ["DebtorTurnover"] = SafeDivide(netSales, avgDebtors > 0 ? avgDebtors : closingDebtors),
+            ["CreditorTurnover"] = SafeDivide(totalExpense > 0 ? totalExpense : cogs, avgCreditors > 0 ? avgCreditors : closingCreditors),
+            ["InventoryTurnover"] = SafeDivide(cogs > 0 ? cogs : totalExpense, avgStock > 0 ? avgStock : closingStock),
+        };
+
+        return ratios;
+    }
+
+    private static decimal? SafeDivide(decimal numerator, decimal denominator, int decimals = 2)
+    {
+        if (denominator == 0) return null;
+        return Math.Round(numerator / denominator, decimals);
+    }
+
+    private static List<FinancialRatioRowDto> BuildFinancialRatioRows(
+        Dictionary<string, decimal?> current,
+        Dictionary<string, decimal?>? previous)
+    {
+        var definitions = new[]
+        {
+            // Category, Key, Name, Formula, Description, Unit
+            ("Liquidity Ratios", "CurrentRatio", "Current Ratio",
+             "Current Assets / Current Liabilities",
+             "Measures ability to pay short-term debt with short-term assets (ideal > 1.5).", "ratio"),
+
+            ("Liquidity Ratios", "QuickRatio", "Quick Ratio (Acid-Test)",
+             "(Bank + Cash + Receivables) / Current Liabilities",
+             "Measures instant liquidity excluding inventory and prepayments (ideal > 1.0).", "ratio"),
+
+            ("Solvency & Profitability", "DebtEquityRatio", "Debt to Equity Ratio",
+             "Total Liabilities / Total Equity",
+             "Proportion of equity and debt used to finance assets.", "ratio"),
+
+            ("Solvency & Profitability", "GrossProfitMargin", "Gross Profit Margin",
+             "((Net Sales - COGS) / Net Sales) * 100",
+             "Percentage of revenue left after paying cost of goods sold.", "%"),
+
+            ("Solvency & Profitability", "NetProfitMargin", "Net Profit Margin",
+             "(Net Profit / Net Sales) * 100",
+             "Percentage of revenue remaining as net profit after all expenses.", "%"),
+
+            ("Solvency & Profitability", "ReturnOnAssets", "Return on Assets (ROA)",
+             "(Net Profit / Total Assets) * 100",
+             "Efficiency at using assets to generate net earnings.", "%"),
+
+            ("Solvency & Profitability", "ReturnOnEquity", "Return on Equity (ROE)",
+             "(Net Profit / Shareholder Equity) * 100",
+             "Profitability generated on shareholder invested capital.", "%"),
+
+            ("Turnover Ratios", "FixedAssetTurnover", "Fixed Asset Turnover",
+             "Net Sales / Fixed Assets",
+             "How efficiently sales are generated from fixed asset investments.", "times"),
+
+            ("Turnover Ratios", "DebtorTurnover", "Debtor (Receivables) Turnover",
+             "Net Sales / Average Receivables",
+             "How quickly customer credit is collected into cash.", "times"),
+
+            ("Turnover Ratios", "CreditorTurnover", "Creditor (Payables) Turnover",
+             "Total Expenses / Average Payables",
+             "Frequency of paying supplier invoices during the period.", "times"),
+
+            ("Turnover Ratios", "InventoryTurnover", "Inventory Turnover",
+             "COGS / Average Inventory",
+             "Number of times inventory is sold and replaced over the period.", "times"),
+        };
+
+        var result = new List<FinancialRatioRowDto>();
+
+        foreach (var (category, key, name, formula, desc, unit) in definitions)
+        {
+            current.TryGetValue(key, out var val);
+            decimal? prevVal = null;
+            if (previous != null)
+                previous.TryGetValue(key, out prevVal);
+
+            decimal? change = null;
+            if (val.HasValue && prevVal.HasValue && prevVal.Value != 0)
+            {
+                change = Math.Round((val.Value - prevVal.Value) / Math.Abs(prevVal.Value) * 100m, 1);
+            }
+
+            result.Add(new FinancialRatioRowDto
+            {
+                Category = category,
+                RatioName = name,
+                Value = val,
+                PreviousValue = prevVal,
+                ChangePercentage = change,
+                Formula = formula,
+                Description = desc,
+                Unit = unit,
+            });
+        }
+
+        return result;
+    }
+
+    public async Task<GeneralPaymentLedgerComparisonReportDto> GetGeneralAndPaymentLedgerComparisonAsync(
+        GeneralPaymentLedgerComparisonRequestDto input)
+    {
+        var accounts = await _accountRepository.GetListAsync(a =>
+            a.CompanyId == input.CompanyId &&
+            !a.IsGroup &&
+            (a.AccountSubType == AccountSubType.AccountsReceivable || a.AccountSubType == AccountSubType.AccountsPayable));
+
+        if (input.AccountId.HasValue)
+        {
+            accounts = accounts.Where(a => a.Id == input.AccountId.Value).ToList();
+        }
+
+        if (accounts.Count == 0)
+        {
+            return new GeneralPaymentLedgerComparisonReportDto
+            {
+                CompanyId = input.CompanyId,
+                PeriodStartDate = input.PeriodStartDate,
+                PeriodEndDate = input.PeriodEndDate
+            };
+        }
+
+        var accountIds = accounts.Select(a => a.Id).ToHashSet();
+        var accountMap = accounts.ToDictionary(a => a.Id);
+
+        var jeQuery = await _journalEntryRepository.GetQueryableAsync();
+        var journalEntries = jeQuery
+            .Where(je => je.CompanyId == input.CompanyId && je.Status == DocumentStatus.Posted)
+            .ToList();
+
+        if (input.PeriodStartDate.HasValue)
+            journalEntries = journalEntries.Where(je => je.PostingDate >= input.PeriodStartDate.Value).ToList();
+        if (input.PeriodEndDate.HasValue)
+            journalEntries = journalEntries.Where(je => je.PostingDate <= input.PeriodEndDate.Value).ToList();
+
+        var glLines = journalEntries
+            .SelectMany(je => je.Lines.Select(line => (JournalEntry: je, Line: line)))
+            .Where(x => accountIds.Contains(x.Line.AccountId) && x.Line.PartyId.HasValue && !string.IsNullOrEmpty(x.Line.PartyType))
+            .ToList();
+
+        if (!string.IsNullOrWhiteSpace(input.PartyType))
+            glLines = glLines.Where(x => string.Equals(x.Line.PartyType, input.PartyType, StringComparison.OrdinalIgnoreCase)).ToList();
+        if (input.PartyId.HasValue)
+            glLines = glLines.Where(x => x.Line.PartyId == input.PartyId.Value).ToList();
+
+        var glGroups = new Dictionary<ComparisonKey, decimal>();
+        var voucherNoLookup = new Dictionary<(string VoucherType, Guid VoucherId), string>();
+
+        foreach (var (je, line) in glLines)
+        {
+            var vType = string.IsNullOrEmpty(je.ReferenceType) ? "JournalEntry" : je.ReferenceType;
+            var vId = string.IsNullOrEmpty(je.ReferenceType) ? je.Id : (je.ReferenceId ?? je.Id);
+            var vNo = je.ReferenceNumber ?? je.EntryNumber ?? je.Id.ToString();
+
+            voucherNoLookup[(vType, vId)] = vNo;
+
+            var againstVType = line.AgainstVoucherType ?? vType;
+            var againstVId = line.AgainstVoucherId ?? vId;
+
+            if (againstVType == vType && againstVId == vId)
+            {
+                voucherNoLookup[(againstVType, againstVId)] = vNo;
+            }
+
+            if (!string.IsNullOrWhiteSpace(input.VoucherType) && !string.Equals(vType, input.VoucherType, StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!string.IsNullOrWhiteSpace(input.VoucherNo) && !string.Equals(vNo, input.VoucherNo, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var netBalance = line.IsDebit ? line.Amount : -line.Amount;
+
+            var key = new ComparisonKey(
+                je.CompanyId,
+                line.AccountId,
+                vType,
+                vId,
+                line.PartyType!,
+                line.PartyId!.Value,
+                againstVType,
+                againstVId);
+
+            glGroups[key] = glGroups.GetValueOrDefault(key, 0m) + netBalance;
+        }
+
+        var pleRepo = _pleRepository ?? LazyServiceProvider.LazyGetService<IRepository<PaymentLedgerEntry, Guid>>();
+        var pleEntries = pleRepo != null
+            ? await pleRepo.GetListAsync(p => p.CompanyId == input.CompanyId && !p.Delinked && accountIds.Contains(p.AccountId))
+            : new List<PaymentLedgerEntry>();
+
+        if (input.PeriodStartDate.HasValue)
+            pleEntries = pleEntries.Where(p => p.PostingDate >= input.PeriodStartDate.Value).ToList();
+        if (input.PeriodEndDate.HasValue)
+            pleEntries = pleEntries.Where(p => p.PostingDate <= input.PeriodEndDate.Value).ToList();
+        if (!string.IsNullOrWhiteSpace(input.PartyType))
+            pleEntries = pleEntries.Where(p => string.Equals(p.PartyType, input.PartyType, StringComparison.OrdinalIgnoreCase)).ToList();
+        if (input.PartyId.HasValue)
+            pleEntries = pleEntries.Where(p => p.PartyId == input.PartyId.Value).ToList();
+        if (!string.IsNullOrWhiteSpace(input.VoucherType))
+            pleEntries = pleEntries.Where(p => string.Equals(p.VoucherType, input.VoucherType, StringComparison.OrdinalIgnoreCase)).ToList();
+
+        var pleGroups = new Dictionary<ComparisonKey, decimal>();
+        foreach (var ple in pleEntries)
+        {
+            var key = new ComparisonKey(
+                ple.CompanyId,
+                ple.AccountId,
+                ple.VoucherType,
+                ple.VoucherId,
+                ple.PartyType,
+                ple.PartyId,
+                ple.AgainstVoucherType,
+                ple.AgainstVoucherId);
+
+            pleGroups[key] = pleGroups.GetValueOrDefault(key, 0m) + ple.Amount;
+        }
+
+        // Fold reconciled allocations per ERPNext PR #60013 / commit 2727084167:
+        // Payment Reconciliation re-points PLE rows to invoices while GL entry remains unallocated against itself.
+        // Count PLE rows whose against voucher has no GL counterpart under the voucher's unallocated GL row.
+        var glKeys = glGroups.Keys.ToHashSet();
+        var foldedPle = new Dictionary<ComparisonKey, decimal>();
+
+        foreach (var (pleKey, pleAmount) in pleGroups)
+        {
+            var effectiveKey = pleKey;
+            var unallocatedKey = pleKey with { AgainstVoucherType = pleKey.VoucherType, AgainstVoucherId = pleKey.VoucherId };
+
+            if (!glKeys.Contains(pleKey) && glKeys.Contains(unallocatedKey))
+            {
+                effectiveKey = unallocatedKey;
+            }
+
+            foldedPle[effectiveKey] = foldedPle.GetValueOrDefault(effectiveKey, 0m) + pleAmount;
+        }
+
+        var allKeys = glGroups.Keys.Union(foldedPle.Keys).ToList();
+
+        var customerIds = allKeys.Where(k => k.PartyType == "Customer").Select(k => k.PartyId).Distinct().ToList();
+        var supplierIds = allKeys.Where(k => k.PartyType == "Supplier").Select(k => k.PartyId).Distinct().ToList();
+
+        var customerMap = customerIds.Count > 0
+            ? (await _customerRepository.GetListAsync(c => customerIds.Contains(c.Id))).ToDictionary(c => c.Id, c => c.Name)
+            : new Dictionary<Guid, string>();
+        var supplierMap = supplierIds.Count > 0
+            ? (await _supplierRepository.GetListAsync(s => supplierIds.Contains(s.Id))).ToDictionary(s => s.Id, s => s.Name)
+            : new Dictionary<Guid, string>();
+
+        var rows = new List<GeneralPaymentLedgerComparisonRowDto>();
+
+        foreach (var key in allKeys)
+        {
+            var glBalance = Math.Round(glGroups.GetValueOrDefault(key, 0m), 2);
+            var plBalance = Math.Round(foldedPle.GetValueOrDefault(key, 0m), 2);
+
+            if (Math.Abs(glBalance - plBalance) <= 0.005m)
+                continue;
+
+            var acc = accountMap.GetValueOrDefault(key.AccountId);
+            var vNo = voucherNoLookup.GetValueOrDefault((key.VoucherType, key.VoucherId)) ?? key.VoucherId.ToString();
+            var againstVNo = voucherNoLookup.GetValueOrDefault((key.AgainstVoucherType, key.AgainstVoucherId)) ??
+                (key.AgainstVoucherId == key.VoucherId ? vNo : key.AgainstVoucherId.ToString());
+
+            if (!string.IsNullOrWhiteSpace(input.VoucherNo) && !string.Equals(vNo, input.VoucherNo, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            string? partyName = key.PartyType switch
+            {
+                "Customer" => customerMap.GetValueOrDefault(key.PartyId),
+                "Supplier" => supplierMap.GetValueOrDefault(key.PartyId),
+                _ => null
+            };
+
+            rows.Add(new GeneralPaymentLedgerComparisonRowDto
+            {
+                CompanyId = key.CompanyId,
+                AccountId = key.AccountId,
+                AccountCode = acc?.AccountCode ?? string.Empty,
+                AccountName = acc?.AccountName ?? string.Empty,
+                VoucherType = key.VoucherType,
+                VoucherId = key.VoucherId,
+                VoucherNo = vNo,
+                PartyType = key.PartyType,
+                PartyId = key.PartyId,
+                PartyName = partyName,
+                AgainstVoucherType = key.AgainstVoucherType,
+                AgainstVoucherId = key.AgainstVoucherId,
+                AgainstVoucherNo = againstVNo,
+                GLBalance = glBalance,
+                PLBalance = plBalance
+            });
+        }
+
+        rows = rows
+            .OrderBy(r => r.AccountCode)
+            .ThenBy(r => r.VoucherType)
+            .ThenBy(r => r.VoucherNo)
+            .ThenBy(r => r.AgainstVoucherNo)
+            .ToList();
+
+        return new GeneralPaymentLedgerComparisonReportDto
+        {
+            CompanyId = input.CompanyId,
+            PeriodStartDate = input.PeriodStartDate,
+            PeriodEndDate = input.PeriodEndDate,
+            Rows = rows,
+            TotalGLBalance = Math.Round(rows.Sum(r => r.GLBalance), 2),
+            TotalPLBalance = Math.Round(rows.Sum(r => r.PLBalance), 2),
+            TotalDifference = Math.Round(rows.Sum(r => r.Difference), 2)
+        };
+    }
+
+    public async Task<ProfitabilityAnalysisReportDto> GetProfitabilityAnalysisAsync(
+        ProfitabilityAnalysisRequestDto input)
+    {
+        var allowedFinanceBooks = await ResolveAllowedFinanceBooksAsync(
+            input.CompanyId, input.FinanceBook, input.IncludeDefaultBookEntries);
+
+        var accounts = await _accountRepository.GetListAsync(a =>
+            a.CompanyId == input.CompanyId &&
+            !a.IsGroup &&
+            (a.AccountType == AccountType.Revenue || a.AccountType == AccountType.Expense));
+
+        var accountMap = accounts.ToDictionary(a => a.Id);
+        var targetAccountIds = accountMap.Keys.ToHashSet();
+
+        var journalEntries = await _journalEntryRepository.GetListAsync(je =>
+            je.CompanyId == input.CompanyId &&
+            je.Status == DocumentStatus.Posted &&
+            je.PostingDate >= input.FromDate &&
+            je.PostingDate <= input.ToDate);
+
+        var isProject = string.Equals(input.BasedOn, "Project", StringComparison.OrdinalIgnoreCase);
+
+        var lines = journalEntries
+            .SelectMany(je => je.Lines)
+            .Where(l => targetAccountIds.Contains(l.AccountId))
+            .Where(l =>
+            {
+                var book = l.FinanceBook ?? string.Empty;
+                return allowedFinanceBooks.Contains(book);
+            })
+            .ToList();
+
+        var directIncomeByDim = new Dictionary<Guid, decimal>();
+        var directExpenseByDim = new Dictionary<Guid, decimal>();
+
+        foreach (var line in lines)
+        {
+            var dimId = isProject ? line.ProjectId : line.CostCenterId;
+            if (!dimId.HasValue)
+                continue;
+
+            var acc = accountMap[line.AccountId];
+            if (acc.AccountType == AccountType.Revenue)
+            {
+                var inc = !line.IsDebit ? line.Amount : -line.Amount;
+                directIncomeByDim[dimId.Value] = directIncomeByDim.GetValueOrDefault(dimId.Value, 0m) + inc;
+            }
+            else if (acc.AccountType == AccountType.Expense)
+            {
+                var exp = line.IsDebit ? line.Amount : -line.Amount;
+                directExpenseByDim[dimId.Value] = directExpenseByDim.GetValueOrDefault(dimId.Value, 0m) + exp;
+            }
+        }
+
+        var rows = new List<ProfitabilityAnalysisRowDto>();
+
+        if (isProject)
+        {
+            var projectRepo = _projectRepository ?? LazyServiceProvider.LazyGetService<IRepository<Project, Guid>>();
+            var projects = projectRepo != null
+                ? await projectRepo.GetListAsync(p => p.CompanyId == input.CompanyId)
+                : new List<Project>();
+
+            foreach (var proj in projects.OrderBy(p => p.ProjectName))
+            {
+                var inc = Math.Round(directIncomeByDim.GetValueOrDefault(proj.Id, 0m), 2);
+                var exp = Math.Round(directExpenseByDim.GetValueOrDefault(proj.Id, 0m), 2);
+
+                if (!input.ShowZeroValues && inc == 0m && exp == 0m)
+                    continue;
+
+                rows.Add(new ProfitabilityAnalysisRowDto
+                {
+                    DimensionId = proj.Id,
+                    DimensionName = proj.ProjectName,
+                    DimensionCode = proj.ProjectNumber,
+                    Income = inc,
+                    Expense = exp,
+                    GrossProfitOrLoss = inc - exp,
+                    IsGroup = false,
+                    Level = 0
+                });
+            }
+        }
+        else
+        {
+            var ccRepo = _costCenterRepository ?? LazyServiceProvider.LazyGetService<IRepository<CostCenter, Guid>>();
+            var costCenters = ccRepo != null
+                ? await ccRepo.GetListAsync(c => c.CompanyId == input.CompanyId && c.IsActive)
+                : new List<CostCenter>();
+
+            var ccMap = costCenters.ToDictionary(c => c.Id);
+            var childrenMap = costCenters
+                .Where(c => c.ParentId.HasValue)
+                .GroupBy(c => c.ParentId!.Value)
+                .ToDictionary(g => g.Key, g => g.Select(c => c.Id).ToList());
+
+            (decimal Income, decimal Expense) Accumulate(Guid ccId)
+            {
+                var inc = directIncomeByDim.GetValueOrDefault(ccId, 0m);
+                var exp = directExpenseByDim.GetValueOrDefault(ccId, 0m);
+
+                if (childrenMap.TryGetValue(ccId, out var childIds))
+                {
+                    foreach (var childId in childIds)
+                    {
+                        var childTot = Accumulate(childId);
+                        inc += childTot.Income;
+                        exp += childTot.Expense;
+                    }
+                }
+
+                return (inc, exp);
+            }
+
+            int GetLevel(Guid ccId)
+            {
+                int lvl = 0;
+                var curr = ccMap.GetValueOrDefault(ccId);
+                while (curr?.ParentId != null && ccMap.ContainsKey(curr.ParentId.Value))
+                {
+                    lvl++;
+                    curr = ccMap[curr.ParentId.Value];
+                }
+                return lvl;
+            }
+
+            foreach (var cc in costCenters.OrderBy(c => c.Name))
+            {
+                var (totInc, totExp) = Accumulate(cc.Id);
+                totInc = Math.Round(totInc, 2);
+                totExp = Math.Round(totExp, 2);
+
+                if (!input.ShowZeroValues && totInc == 0m && totExp == 0m)
+                    continue;
+
+                rows.Add(new ProfitabilityAnalysisRowDto
+                {
+                    DimensionId = cc.Id,
+                    DimensionName = cc.Name,
+                    DimensionCode = cc.CostCenterNumber,
+                    ParentDimensionId = cc.ParentId,
+                    IsGroup = cc.IsGroup,
+                    Level = GetLevel(cc.Id),
+                    Income = totInc,
+                    Expense = totExp,
+                    GrossProfitOrLoss = totInc - totExp
+                });
+            }
+        }
+
+        var totalIncome = Math.Round(directIncomeByDim.Values.Sum(), 2);
+        var totalExpense = Math.Round(directExpenseByDim.Values.Sum(), 2);
+        var totalGrossProfit = totalIncome - totalExpense;
+
+        return new ProfitabilityAnalysisReportDto
+        {
+            CompanyId = input.CompanyId,
+            FromDate = input.FromDate,
+            ToDate = input.ToDate,
+            BasedOn = input.BasedOn,
+            FinanceBook = input.FinanceBook,
+            IncludeDefaultBookEntries = input.IncludeDefaultBookEntries,
+            Rows = rows,
+            TotalIncome = totalIncome,
+            TotalExpense = totalExpense,
+            TotalGrossProfitOrLoss = totalGrossProfit
+        };
+    }
+
+    private async Task<HashSet<string>> ResolveAllowedFinanceBooksAsync(
+        Guid companyId,
+        string? financeBook,
+        bool includeDefaultBookEntries)
+    {
+        var allowed = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { string.Empty };
+
+        if (!string.IsNullOrWhiteSpace(financeBook))
+        {
+            allowed.Add(financeBook.Trim());
+        }
+
+        if (includeDefaultBookEntries)
+        {
+            var defaultBook = await GetDefaultFinanceBookNameAsync(companyId);
+            if (!string.IsNullOrWhiteSpace(defaultBook))
+            {
+                if (!string.IsNullOrWhiteSpace(financeBook) &&
+                    !string.Equals(financeBook.Trim(), defaultBook, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new UserFriendlyException("To use a different finance book, please uncheck 'Include Default FB Entries'");
+                }
+                allowed.Add(defaultBook);
+            }
+        }
+
+        return allowed;
+    }
+
+    private async Task<string?> GetDefaultFinanceBookNameAsync(Guid companyId)
+    {
+        var repo = _financeBookRepository ?? LazyServiceProvider.LazyGetService<IRepository<FinanceBook, Guid>>();
+        if (repo == null) return null;
+
+        var list = await repo.GetListAsync(fb => fb.CompanyId == companyId && fb.IsDefault);
+        return list.FirstOrDefault()?.Name;
+    }
+
+    private sealed record ComparisonKey(
+        Guid CompanyId,
+        Guid AccountId,
+        string VoucherType,
+        Guid VoucherId,
+        string PartyType,
+        Guid PartyId,
+        string AgainstVoucherType,
+        Guid AgainstVoucherId);
+}
+
+

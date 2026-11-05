@@ -1,0 +1,449 @@
+import { Component, inject, OnInit } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { ReactiveFormsModule, FormBuilder, FormArray, Validators } from '@angular/forms';
+import { Router, ActivatedRoute, RouterModule } from '@angular/router';
+import { PageModule } from '@abp/ng.components/page';
+import { LocalizationPipe } from '@abp/ng.core';
+import { ManufacturingService } from '../../proxy/controllers/manufacturing.service';
+import { ToasterService } from '@abp/ng.theme.shared';
+import { CompanyContextService } from '../../shared/services/company-context.service';
+import type { ItemDto } from '../../proxy/inventory/models';
+
+import { AutoValidationDirective } from '../../shared/directives/auto-validation.directive';
+import { SaveShortcutDirective } from '../../shared/directives/save-shortcut.directive';
+import { ItemPickerComponent } from '../../shared/components/item-picker/item-picker.component';
+
+@Component({
+  selector: 'app-bom-form',
+  standalone: true,
+  imports: [AutoValidationDirective, SaveShortcutDirective, CommonModule, ReactiveFormsModule, RouterModule, PageModule, LocalizationPipe, ItemPickerComponent],
+  template: `
+    <abp-page [title]="isEditMode ? 'EditBOM' : ('NewBOM' | abpLocalization)">
+      <form [formGroup]="form" (ngSubmit)="save()" (appSaveShortcut)="save()">
+        <div class="card mb-3">
+          <div class="card-body">
+            <div class="row">
+              <div class="col-md-4 mb-3">
+                <label class="form-label">{{ 'Item' | abpLocalization }} *</label>
+                <app-item-picker formControlName="itemId" [companyId]="form.get('companyId')?.value || null"
+                  (itemSelected)="onParentItemSelected($event)"></app-item-picker>
+              </div>
+              <div class="col-md-4 mb-3">
+                <label class="form-label">{{ 'ItemName' | abpLocalization }}</label>
+                <input type="text" class="form-control" formControlName="itemName" />
+              </div>
+              <div class="col-md-2 mb-3">
+                <label class="form-label">{{ 'Quantity' | abpLocalization }} *</label>
+                <input type="number" class="form-control" formControlName="quantity" min="0.01" step="0.01" />
+              </div>
+              <div class="col-md-2 mb-3">
+                <label class="form-label">{{ 'IsActive' | abpLocalization }}</label>
+                <div class="form-check mt-2">
+                  <input type="checkbox" class="form-check-input" formControlName="isActive" id="bomActive" />
+                  <label class="form-check-label" for="bomActive">{{ 'Active' | abpLocalization }}</label>
+                </div>
+                <div class="form-check mt-1">
+                  <input type="checkbox" class="form-check-input" formControlName="isPhantomBom" id="bomPhantom" />
+                  <label class="form-check-label" for="bomPhantom">{{ 'IsPhantomBom' | abpLocalization }}</label>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card mb-3">
+          <div class="card-header d-flex justify-content-between align-items-center">
+            <h6 class="card-title mb-0"><i class="fa fa-list me-2"></i>{{ 'Materials' | abpLocalization }}</h6>
+            <button type="button" class="btn btn-sm btn-outline-primary" (click)="addMaterial()">
+              <i class="fa fa-plus me-1"></i>{{ 'AddItem' | abpLocalization }}
+            </button>
+          </div>
+          <div class="card-body p-0">
+            <table class="table table-sm mb-0">
+              <thead>
+                <tr>
+                  <th class="ps-3">{{ 'Item' | abpLocalization }}</th>
+                  <th>{{ 'Description' | abpLocalization }}</th>
+                  <th class="text-end">{{ 'Quantity' | abpLocalization }}</th>
+                  <th class="text-end">{{ 'Rate' | abpLocalization }}</th>
+                  <th class="text-end">{{ 'Amount' | abpLocalization }}</th>
+                  <th class="text-center" style="width: 160px">{{ 'SubAssembly' | abpLocalization }}</th>
+                  <th class="pe-3"></th>
+                </tr>
+              </thead>
+              <tbody formArrayName="materials">
+                @for (mat of materials.controls; track $index; let i = $index) {
+                  <tr [formGroupName]="i">
+                    <td class="ps-3">
+                      <app-item-picker formControlName="itemId" [companyId]="form.get('companyId')?.value || null"
+                        (itemSelected)="onMaterialItemSelected(i, $event)"></app-item-picker>
+                    </td>
+                    <td><input class="form-control form-control-sm" formControlName="description" /></td>
+                    <td><input type="number" class="form-control form-control-sm text-end" formControlName="qty" min="0.01" step="0.01" /></td>
+                    <td><input type="number" class="form-control form-control-sm text-end" formControlName="rate" min="0" step="0.01" /></td>
+                    <td class="text-end font-monospace">{{ (mat.get('qty')?.value * mat.get('rate')?.value) | number:'1.2-2' }}</td>
+                    <td class="text-center">
+                      <div class="form-check form-check-inline form-switch mb-0" [title]="'SetRateBasedOnSubAssemblyBOM' | abpLocalization">
+                        <input class="form-check-input" type="checkbox" formControlName="setRateOfSubAssemblyItemBasedOnBom" id="subRate_{{i}}" />
+                        <label class="form-check-label small" for="subRate_{{i}}">{{ 'SetRateBasedOnSubAssemblyBOM' | abpLocalization }}</label>
+                      </div>
+                    </td>
+                    <td class="pe-3"><button type="button" class="btn btn-sm btn-outline-danger" (click)="removeMaterial(i)"><i class="fa fa-trash"></i></button></td>
+                  </tr>
+                }
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Operations Section -->
+        <div class="card mb-3">
+          <div class="card-header d-flex justify-content-between align-items-center">
+            <h6 class="mb-0"><i class="fa fa-gears me-2"></i>{{ 'Operations' | abpLocalization }}</h6>
+            <button type="button" class="btn btn-sm btn-outline-primary" (click)="addOperation()">
+              <i class="fa fa-plus me-1"></i>{{ 'AddOperation' | abpLocalization }}
+            </button>
+          </div>
+          @if (operations.length > 0) {
+          <div class="card-body p-0">
+            <table class="table table-sm table-hover mb-0">
+              <thead class="table-light">
+                <tr>
+                  <th style="width:60px">{{ 'Sequence' | abpLocalization }}</th>
+                  <th>{{ 'Operation' | abpLocalization }}</th>
+                  <th style="width:100px">{{ 'Time' | abpLocalization }} (min)</th>
+                  <th style="width:100px">{{ 'HourRate' | abpLocalization }}</th>
+                  <th style="width:90px">{{ 'BatchSize' | abpLocalization }}</th>
+                  <th style="width:100px" class="text-end">{{ 'Cost' | abpLocalization }}</th>
+                  <th style="width:50px"></th>
+                </tr>
+              </thead>
+              <tbody>
+                @for (op of operations.controls; track $index; let i = $index) {
+                  <tr [formGroup]="$any(op)">
+                    <td><input type="number" class="form-control form-control-sm" formControlName="sequenceId" min="1" /></td>
+                    <td><input type="text" class="form-control form-control-sm" formControlName="description" [placeholder]="'OperationName' | abpLocalization" /></td>
+                    <td><input type="number" class="form-control form-control-sm" formControlName="timeInMins" min="0" step="0.5" (change)="recalcOpCost(i)" /></td>
+                    <td><input type="number" class="form-control form-control-sm" formControlName="workstationHourRate" min="0" step="1" (change)="recalcOpCost(i)" /></td>
+                    <td><input type="number" class="form-control form-control-sm" formControlName="batchSize" min="0" /></td>
+                    <td class="text-end font-monospace">{{ getOpCost(i) | number:'1.2-2' }}</td>
+                    <td><button type="button" class="btn btn-sm btn-outline-danger" (click)="removeOperation(i)"><i class="fa fa-trash"></i></button></td>
+                  </tr>
+                }
+              </tbody>
+            </table>
+          </div>
+          }
+        </div>
+
+        @if (operations.length === 0 && !form.get('isPhantomBom')?.value) {
+          <div class="card mb-3">
+            <div class="card-header">
+              <h6 class="mb-0"><i class="fa fa-calculator me-2"></i>{{ 'FinishedGoodsBasedOperatingCost' | abpLocalization }}</h6>
+            </div>
+            <div class="card-body">
+              <div class="row align-items-center">
+                <div class="col-md-5">
+                  <div class="form-check">
+                    <input type="checkbox" class="form-check-input" formControlName="fgBasedOperatingCost" id="fgBasedOpCost" />
+                    <label class="form-check-label" for="fgBasedOpCost">{{ 'FinishedGoodsBasedOperatingCost' | abpLocalization }}</label>
+                  </div>
+                </div>
+                @if (form.get('fgBasedOperatingCost')?.value) {
+                  <div class="col-md-4">
+                    <label class="form-label">{{ 'OperatingCostPerBomQuantity' | abpLocalization }}</label>
+                    <input type="number" class="form-control form-control-sm text-end" formControlName="operatingCostPerBomQuantity" min="0" step="0.01" />
+                  </div>
+                }
+              </div>
+            </div>
+          </div>
+        }
+
+        <!-- Secondary Items Section (Co-Products, By-Products, Scrap) -->
+        <div class="card mb-3">
+          <div class="card-header d-flex justify-content-between align-items-center">
+            <h6 class="mb-0"><i class="fas fa-recycle me-2"></i>{{ 'SecondaryItems' | abpLocalization }}</h6>
+            <button type="button" class="btn btn-sm btn-outline-primary" (click)="addSecondaryItem()">
+              <i class="fa fa-plus me-1"></i>{{ 'AddSecondaryItem' | abpLocalization }}
+            </button>
+          </div>
+          @if (secondaryItems.length > 0) {
+          <div class="card-body p-0">
+            <table class="table table-sm table-hover mb-0">
+              <thead class="table-light">
+                <tr>
+                  <th class="ps-3" style="min-width: 200px">{{ 'Item' | abpLocalization }}</th>
+                  <th style="width: 140px">{{ 'Type' | abpLocalization }}</th>
+                  <th style="width: 200px">{{ 'ValuationType' | abpLocalization }}</th>
+                  <th style="width: 100px" class="text-end">{{ 'Quantity' | abpLocalization }}</th>
+                  <th style="width: 110px" class="text-end">{{ 'CostAllocation' | abpLocalization }} %</th>
+                  <th style="width: 100px" class="text-end">{{ 'Rate' | abpLocalization }}</th>
+                  <th style="width: 50px" class="pe-3"></th>
+                </tr>
+              </thead>
+              <tbody formArrayName="secondaryItems">
+                @for (si of secondaryItems.controls; track $index; let i = $index) {
+                  <tr [formGroupName]="i">
+                    <td class="ps-3">
+                      <app-item-picker formControlName="itemId" [companyId]="form.get('companyId')?.value || null"
+                        (itemSelected)="onSecondaryItemSelected(i, $event)"></app-item-picker>
+                    </td>
+                    <td>
+                      <select class="form-select form-select-sm" formControlName="secondaryItemType">
+                        <option [ngValue]="0">{{ 'CoProduct' | abpLocalization }}</option>
+                        <option [ngValue]="1">{{ 'ByProduct' | abpLocalization }}</option>
+                        <option [ngValue]="2">{{ 'Scrap' | abpLocalization }}</option>
+                      </select>
+                    </td>
+                    <td>
+                      <select class="form-select form-select-sm" formControlName="valuationType" (change)="onSecondaryValuationTypeChange(i)">
+                        <option [ngValue]="0">{{ 'ValuationRate' | abpLocalization }}</option>
+                        <option [ngValue]="1">{{ 'PercentageOfComponentCost' | abpLocalization }}</option>
+                        <option [ngValue]="2">{{ 'Manual' | abpLocalization }}</option>
+                      </select>
+                    </td>
+                    <td><input type="number" class="form-control form-control-sm text-end" formControlName="quantity" min="0.01" step="0.01" /></td>
+                    <td>
+                      <input type="number" class="form-control form-control-sm text-end" formControlName="costAllocationPercentage" min="0" max="100" step="0.1"
+                        [readonly]="si.get('valuationType')?.value !== 1" />
+                    </td>
+                    <td><input type="number" class="form-control form-control-sm text-end" formControlName="rate" min="0" step="0.01" [readonly]="si.get('valuationType')?.value !== 2" /></td>
+                    <td class="pe-3"><button type="button" class="btn btn-sm btn-outline-danger" (click)="removeSecondaryItem(i)"><i class="fa fa-trash"></i></button></td>
+                  </tr>
+                }
+              </tbody>
+            </table>
+          </div>
+          }
+        </div>
+
+        <div class="d-flex justify-content-between align-items-center mb-3">
+          <div class="fw-bold">{{ 'TotalCost' | abpLocalization }}: {{ totalCost | number:'1.2-2' }}
+            <span class="text-muted ms-2">({{ 'Material' | abpLocalization }}: {{ materialCost | number:'1.2-2' }} + {{ 'Operations' | abpLocalization }}: {{ operatingCost | number:'1.2-2' }})</span>
+          </div>
+          <div class="d-flex gap-2">
+            <button type="button" class="btn btn-outline-secondary" routerLink="/manufacturing/bom"><i class="fa fa-times me-1"></i>{{ 'Cancel' | abpLocalization }}</button>
+            <button type="submit" class="btn btn-primary"><i class="fa fa-save me-1"></i>{{ 'Save' | abpLocalization }}</button>
+          </div>
+        </div>
+      </form>
+    </abp-page>
+  `,
+})
+export class BomFormComponent implements OnInit {
+  private fb = inject(FormBuilder);
+  private router = inject(Router);
+  private route = inject(ActivatedRoute);
+  private manufacturingService = inject(ManufacturingService);
+  private toaster = inject(ToasterService);
+  private companyContext = inject(CompanyContextService);
+
+  isEditMode = false;
+  entityId: string | null = null;
+
+  form = this.fb.group({
+    companyId: ['', Validators.required],
+    itemId: ['', Validators.required],
+    itemName: [''],
+    quantity: [1, [Validators.required, Validators.min(0.01)]],
+    isActive: [true],
+    isPhantomBom: [false],
+    fgBasedOperatingCost: [false],
+    operatingCostPerBomQuantity: [0, [Validators.min(0)]],
+    materials: this.fb.array([]),
+    operations: this.fb.array([]),
+    secondaryItems: this.fb.array([]),
+  });
+
+  get materials(): FormArray { return this.form.get('materials') as FormArray; }
+  get operations(): FormArray { return this.form.get('operations') as FormArray; }
+  get secondaryItems(): FormArray { return this.form.get('secondaryItems') as FormArray; }
+
+  get materialCost(): number {
+    return this.materials.controls.reduce((sum, c) =>
+      sum + (c.get('qty')?.value ?? 0) * (c.get('rate')?.value ?? 0), 0);
+  }
+
+  get operatingCost(): number {
+    if (this.operations.length > 0) {
+      return this.operations.controls.reduce((sum, _, i) => sum + this.getOpCost(i), 0);
+    }
+    if (this.form.get('fgBasedOperatingCost')?.value && !this.form.get('isPhantomBom')?.value) {
+      return (Number(this.form.get('quantity')?.value ?? 0)) * (Number(this.form.get('operatingCostPerBomQuantity')?.value ?? 0));
+    }
+    return 0;
+  }
+
+  get totalCost(): number { return this.materialCost + this.operatingCost; }
+
+  ngOnInit(): void {
+    // Auto-fill company from context
+    const cid = this.companyContext.currentCompanyId();
+    if (cid) this.form.patchValue({ companyId: cid });
+
+    this.entityId = this.route.snapshot.paramMap.get('id');
+    this.isEditMode = !!this.entityId;
+    if (this.isEditMode) {
+      this.manufacturingService.getBom(this.entityId!).subscribe(bom => {
+        this.form.patchValue({
+          itemId: bom.itemId,
+          itemName: bom.itemName,
+          quantity: bom.quantity,
+          isActive: bom.isActive,
+          isPhantomBom: bom.isPhantomBom ?? false,
+          fgBasedOperatingCost: bom.fgBasedOperatingCost ?? false,
+          operatingCostPerBomQuantity: bom.operatingCostPerBomQuantity ?? 0,
+        });
+        (bom.items ?? []).forEach((item: any) => this.addMaterial(item));
+        (bom.operations ?? []).forEach((op: any) => this.addOperation(op));
+        (bom.secondaryItems ?? []).forEach((si: any) => this.addSecondaryItem(si));
+      });
+    }
+  }
+
+  onParentItemSelected(item: ItemDto | null): void {
+    if (item && !this.form.get('itemName')?.value) {
+      this.form.patchValue({ itemName: item.itemName ?? item.itemCode ?? '' });
+    }
+  }
+
+  onMaterialItemSelected(index: number, item: ItemDto | null): void {
+    if (!item) return;
+    const row = this.materials.at(index);
+    if (!row.get('description')?.value) {
+      row.patchValue({ description: item.itemName ?? item.itemCode ?? '' });
+    }
+  }
+
+  addMaterial(item?: any): void {
+    this.materials.push(this.fb.group({
+      itemId: [item?.itemId ?? '', Validators.required],
+      description: [item?.itemName ?? ''],
+      qty: [item?.quantity ?? 1, [Validators.required, Validators.min(0.01)]],
+      rate: [item?.rate ?? 0, [Validators.required, Validators.min(0)]],
+      subBomId: [item?.subBomId ?? null],
+      setRateOfSubAssemblyItemBasedOnBom: [item?.setRateOfSubAssemblyItemBasedOnBom ?? true],
+      doNotExplode: [item?.doNotExplode ?? false],
+    }));
+  }
+
+  removeMaterial(index: number): void { this.materials.removeAt(index); }
+
+  addOperation(op?: any): void {
+    const nextSeq = this.operations.length > 0
+      ? Math.max(...this.operations.controls.map(c => c.get('sequenceId')?.value ?? 0)) + 10
+      : 10;
+    this.operations.push(this.fb.group({
+      operationId: [op?.operationId ?? ''],
+      sequenceId: [op?.sequenceId ?? nextSeq, [Validators.required, Validators.min(1)]],
+      description: [op?.description ?? ''],
+      timeInMins: [op?.timeInMins ?? 0, [Validators.required, Validators.min(0)]],
+      workstationHourRate: [op?.workstationHourRate ?? 0, Validators.min(0)],
+      batchSize: [op?.batchSize ?? 0],
+      fixedTime: [op?.fixedTime ?? 0],
+      isSubcontracted: [op?.isSubcontracted ?? false],
+    }));
+  }
+
+  removeOperation(index: number): void { this.operations.removeAt(index); }
+
+  addSecondaryItem(si?: any): void {
+    this.secondaryItems.push(this.fb.group({
+      itemId: [si?.itemId ?? '', Validators.required],
+      itemName: [si?.itemName ?? ''],
+      secondaryItemType: [si?.secondaryItemType ?? 0, Validators.required],
+      valuationType: [si?.valuationType ?? 0, Validators.required],
+      quantity: [si?.quantity ?? 1, [Validators.required, Validators.min(0.01)]],
+      costAllocationPercentage: [si?.costAllocationPercentage ?? 0, [Validators.min(0), Validators.max(100)]],
+      rate: [si?.rate ?? 0, [Validators.min(0)]],
+      processLossPercentage: [si?.processLossPercentage ?? 0, [Validators.min(0), Validators.max(99.99)]],
+      stockUom: [si?.stockUom ?? 'Unit'],
+      warehouseId: [si?.warehouseId ?? null],
+    }));
+  }
+
+  removeSecondaryItem(index: number): void {
+    this.secondaryItems.removeAt(index);
+  }
+
+  onSecondaryValuationTypeChange(index: number): void {
+    const row = this.secondaryItems.at(index);
+    const valType = Number(row.get('valuationType')?.value);
+    // Per ERPNext PR #59021 / bom.js: cost allocation % only applies to PercentageOfComponentCost (1)
+    if (valType !== 1) {
+      row.patchValue({ costAllocationPercentage: 0 });
+    }
+  }
+
+  onSecondaryItemSelected(index: number, item: ItemDto | null): void {
+    if (!item) return;
+    const row = this.secondaryItems.at(index);
+    row.patchValue({
+      itemName: item.itemName ?? item.itemCode ?? '',
+      stockUom: item.uom ?? 'Unit',
+      rate: item.standardBuyingPrice ?? 0,
+    });
+  }
+
+  getOpCost(index: number): number {
+    const op = this.operations.at(index);
+    const time = op.get('timeInMins')?.value ?? 0;
+    const rate = op.get('workstationHourRate')?.value ?? 0;
+    return (time / 60) * rate;
+  }
+
+  recalcOpCost(_index: number): void { /* Triggers template re-render via getter */ }
+
+  save(): void {
+    if (this.form.invalid) { this.form.markAllAsTouched(); return; }
+    const raw = this.form.getRawValue();
+    const payload = {
+      ...raw,
+      withOperations: this.operations.length > 0,
+      isPhantomBom: !!raw.isPhantomBom,
+      fgBasedOperatingCost: this.operations.length === 0 && !raw.isPhantomBom ? !!raw.fgBasedOperatingCost : false,
+      operatingCostPerBomQuantity: Number(raw.operatingCostPerBomQuantity ?? 0),
+      // Map BOM material 'qty'→'quantity' and 'description'→'itemName' to match CreateBomItemDto
+      items: this.materials.controls.map(c => {
+        const v = c.getRawValue();
+        return {
+          itemId: v.itemId,
+          itemName: v.description || '',
+          quantity: v.qty ?? 0,
+          rate: v.rate ?? 0,
+          uom: 'Unit',
+          subBomId: v.subBomId || null,
+          setRateOfSubAssemblyItemBasedOnBom: v.setRateOfSubAssemblyItemBasedOnBom ?? true,
+          doNotExplode: v.doNotExplode ?? false,
+        };
+      }),
+      operations: this.operations.controls.map(c => c.getRawValue()),
+      secondaryItems: this.secondaryItems.controls.map(c => {
+        const v = c.getRawValue();
+        const valType = Number(v.valuationType ?? 0);
+        return {
+          itemId: v.itemId,
+          itemName: v.itemName || '',
+          secondaryItemType: Number(v.secondaryItemType ?? 0),
+          valuationType: valType,
+          quantity: Number(v.quantity ?? 1),
+          rate: Number(v.rate ?? 0),
+          costAllocationPercentage: valType === 1 ? Number(v.costAllocationPercentage ?? 0) : 0,
+          processLossPercentage: Number(v.processLossPercentage ?? 0),
+          stockUom: v.stockUom || 'Unit',
+          warehouseId: v.warehouseId || null,
+        };
+      }),
+    };
+    const req = this.isEditMode
+      ? this.manufacturingService.updateBom(this.entityId!, payload as any)
+      : this.manufacturingService.createBom(payload as any);
+    req.subscribe({
+      next: () => { this.form.markAsPristine(); this.toaster.success('::SuccessfullySaved'); this.router.navigate(['/manufacturing/bom']); },
+      error: () => this.toaster.error('::SaveFailed'),
+    });
+  }
+
+  hasUnsavedChanges(): boolean { return this.form.dirty; }
+}

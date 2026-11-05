@@ -1,0 +1,149 @@
+//-----------------------------------------------------------------------
+// <copyright file="Item.cs" company="AccountGo">
+// Copyright (c) 2015-2026 Marvin Perez and AccountGo contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+// <author>Marvin Perez</author>
+// <date>1/11/2015 9:48:38 AM</date>
+// </copyright>
+//-----------------------------------------------------------------------
+
+using Core.Domain.Financials;
+using Core.Domain.Purchases;
+using Core.Domain.Sales;
+using Core.Domain.TaxSystem;
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace Core.Domain.Items
+{
+    [Table("Item")]
+    public partial class Item : BaseEntity, ICompanyOwned
+    {
+        public Item()
+        {
+            SalesInvoiceLines = new HashSet<SalesInvoiceLine>();
+            PurchaseOrderLines = new HashSet<PurchaseOrderLine>();
+            PurchaseReceiptLines = new HashSet<PurchaseReceiptLine>();
+            PurchaseInvoiceLines = new HashSet<PurchaseInvoiceLine>();
+            InventoryControlJournals = new HashSet<InventoryControlJournal>();
+            InventoryAdjustments = new HashSet<InventoryAdjustment>();
+        }
+
+        public int CompanyId { get; set; }
+
+        public int? ItemCategoryId { get; set; }
+        public int? SmallestMeasurementId { get; set; }
+        public int? SellMeasurementId { get; set; }        
+        public int? PurchaseMeasurementId { get; set; }
+        public int? PreferredVendorId { get; set; }
+        public int? ItemTaxGroupId { get; set; }
+        public int? SalesAccountId { get; set; }
+        public int? InventoryAccountId { get; set; }        
+        public int? CostOfGoodsSoldAccountId { get; set; }
+        public int? InventoryAdjustmentAccountId { get; set; }
+        public string No { get; set; }
+        public string Code { get; set; }
+        public string Description { get; set; }
+        public string PurchaseDescription { get; set; }
+        public string SellDescription { get; set; }
+        public decimal? Cost { get; set; }
+        public decimal? Price { get; set; }
+        public decimal QuantityOnHand { get; set; }
+        public decimal AverageCost { get; set; }
+        /// <summary>The inventory ledger value, retained exactly to the cent across rounded issues.</summary>
+        public decimal StockValue { get; set; }
+        /// <summary>When it was archived: hidden when picking an item for a line, past lines untouched. Null while active.</summary>
+        public DateTime? ArchivedAt { get; set; }
+        public virtual ItemCategory ItemCategory { get; set; }
+        public virtual ItemTaxGroup ItemTaxGroup { get; set; }
+        public virtual Vendor PreferredVendor { get; set; }
+        public virtual Account InventoryAccount { get; set; }
+        public virtual Account SalesAccount { get; set; }
+        public virtual Account CostOfGoodsSoldAccount { get; set; }
+        public virtual Account InventoryAdjustmentAccount { get; set; }
+        public virtual Measurement SmallestMeasurement { get; set; }
+        public virtual Measurement SellMeasurement { get; set; }
+        public virtual Measurement PurchaseMeasurement { get; set; }
+
+        public virtual ICollection<SalesInvoiceLine> SalesInvoiceLines { get; set; }
+        public virtual ICollection<PurchaseOrderLine> PurchaseOrderLines { get; set; }
+        public virtual ICollection<PurchaseReceiptLine> PurchaseReceiptLines { get; set; }
+        public virtual ICollection<PurchaseInvoiceLine> PurchaseInvoiceLines { get; set; }
+        public virtual ICollection<InventoryControlJournal> InventoryControlJournals { get; set; }
+        public virtual ICollection<InventoryAdjustment> InventoryAdjustments { get; set; }
+
+        #region Not Mapped
+        [NotMapped]
+        public decimal ItemTaxAmountOutput { get { return ComputeItemTaxAmountOutput(); } }
+        private decimal ComputeItemTaxAmountOutput()
+        {
+            decimal totalItemTaxAmount = 0;            
+            foreach (var itemTaxGroup in ItemTaxGroup.ItemTaxGroupTax)
+            {
+                decimal salesPrice = (Price.Value / (1 + (itemTaxGroup.Tax.Rate / 100)));
+                var taxAmount = salesPrice * (itemTaxGroup.Tax.Rate / 100);
+                totalItemTaxAmount += taxAmount;
+            }
+            return totalItemTaxAmount;
+        }
+
+        [NotMapped]
+        public decimal ItemTaxAmountInput { get { return ComputeItemTaxAmountInput(); } }
+        private decimal ComputeItemTaxAmountInput()
+        {
+            decimal totalItemTaxAmount = 0;
+            foreach (var itemTaxGroup in ItemTaxGroup.ItemTaxGroupTax)
+            {
+                var taxAmount = Cost.Value * (itemTaxGroup.Tax.Rate / 100);
+                totalItemTaxAmount += taxAmount;
+            }
+            return totalItemTaxAmount;
+        }
+        #endregion
+
+        private decimal _discountedPrice = 0;
+        private decimal _discount = 0;
+        public void AddDiscount(decimal discount)
+        {
+            _discount = discount;
+        }
+
+        public decimal ComputeDiscountedPrice()
+        {
+            _discountedPrice = Price.Value;
+            if (_discount != 0)
+            {
+                _discountedPrice = Price.Value - ((_discount / 100) * Price.Value);
+            }
+            return _discountedPrice;
+        }
+        public decimal ComputeQuantityOnHand()
+        {
+            decimal inQty = 0;
+            decimal outQty = 0;
+            var invControlJOurnals = InventoryControlJournals.GetEnumerator();
+            while (invControlJOurnals.MoveNext())
+            {
+                inQty += invControlJOurnals.Current.INQty.GetValueOrDefault();
+                outQty += invControlJOurnals.Current.OUTQty.HasValue ? invControlJOurnals.Current.OUTQty.Value : 0;
+            }
+            return inQty - outQty;
+        }
+
+        public bool GLAccountsValidated()
+        {
+            // For service items, only sales account is required as there is no physical inventory or COGS
+            if (this.ItemCategory != null && this.ItemCategory.ItemType == ItemTypes.Service)
+            {
+                return this.SalesAccount != null || this.SalesAccountId.HasValue;
+            }
+
+            // For inventory / manufactured / purchased items, all 4 accounts are required
+            return (this.CostOfGoodsSoldAccount != null || this.CostOfGoodsSoldAccountId.HasValue)
+                && (this.InventoryAccount != null || this.InventoryAccountId.HasValue)
+                && (this.InventoryAdjustmentAccount != null || this.InventoryAdjustmentAccountId.HasValue)
+                && (this.SalesAccount != null || this.SalesAccountId.HasValue);
+        }
+    }
+}

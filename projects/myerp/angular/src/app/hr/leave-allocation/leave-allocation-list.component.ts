@@ -1,0 +1,115 @@
+import { Component, signal, inject, OnInit } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { FormsModule } from '@angular/forms';
+import { RouterModule } from '@angular/router';
+import { PageModule } from '@abp/ng.components/page';
+import { LocalizationPipe } from '@abp/ng.core';
+import { LeaveAllocationService } from '../../proxy/human-resources/leave-allocation.service';
+import type { LeaveAllocationDto, BulkLeaveAllocationDto } from '../../proxy/human-resources/models';
+import { LeaveService } from '../../proxy/human-resources/leave.service';
+import { EmployeeService } from '../../proxy/human-resources/employee.service';
+import { LoadingOverlayComponent } from '../../shared/components/loading-overlay/loading-overlay.component';
+import { PaginationComponent, type PageEvent } from '../../shared/components/pagination/pagination.component';
+import { Confirmation, ConfirmationService, ToasterService } from '@abp/ng.theme.shared';
+
+@Component({
+  standalone: true,
+  selector: 'app-leave-allocation-list',
+  imports: [CommonModule, FormsModule, RouterModule, PageModule, LocalizationPipe, LoadingOverlayComponent, PaginationComponent],
+  templateUrl: './leave-allocation-list.component.html',
+})
+export class LeaveAllocationListComponent implements OnInit {
+  private service = inject(LeaveAllocationService);
+  private leaveService = inject(LeaveService);
+  private employeeService = inject(EmployeeService);
+  private confirmation = inject(ConfirmationService);
+  private toaster = inject(ToasterService);
+
+  items = signal<LeaveAllocationDto[]>([]);
+  totalCount = signal(0);
+  isLoading = signal(false);
+  showBulkForm = signal(false);
+  pageSize = 10;
+  currentPage = 0;
+
+  // Lookup maps for names
+  employeeNames = signal<Record<string, string>>({});
+  leaveTypeNames = signal<Record<string, string>>({});
+
+  // Bulk allocation form
+  bulkForm: BulkLeaveAllocationDto = {
+    companyId: '',
+    leaveTypeId: '',
+    fromDate: new Date().getFullYear() + '-01-01',
+    toDate: new Date().getFullYear() + '-12-31',
+    totalLeavesPerEmployee: 12,
+  };
+
+  leaveTypes = signal<any[]>([]);
+
+  ngOnInit() {
+    this.loadData();
+    this.leaveService.getLeaveTypes().subscribe(types => {
+      this.leaveTypes.set(types as any[]);
+      const map: Record<string, string> = {};
+      (types as any[]).forEach((t: any) => { map[t.id] = t.name ?? t.leaveName ?? t.id; });
+      this.leaveTypeNames.set(map);
+    });
+    this.employeeService.getList({ skipCount: 0, maxResultCount: 500, sorting: '' }).subscribe(res => {
+      const map: Record<string, string> = {};
+      (res.items ?? []).forEach((e: any) => { map[e.id] = `${e.firstName ?? ''} ${e.lastName ?? ''}`.trim() || e.employeeId || e.id; });
+      this.employeeNames.set(map);
+    });
+  }
+
+  loadData() {
+    this.isLoading.set(true);
+    this.service.getList({ skipCount: this.currentPage * this.pageSize, maxResultCount: this.pageSize }).subscribe({
+      next: res => {
+        this.items.set(res.items ?? []);
+        this.totalCount.set(res.totalCount ?? 0);
+        this.isLoading.set(false);
+      },
+      error: () => this.isLoading.set(false),
+    });
+  }
+
+  onPageChange(event: PageEvent): void {
+    this.currentPage = event.pageIndex;
+    this.loadData();
+  }
+
+  toggleBulkForm() {
+    this.showBulkForm.set(!this.showBulkForm());
+  }
+
+  bulkAllocate() {
+    if (!this.bulkForm.companyId || !this.bulkForm.leaveTypeId) return;
+    this.service.bulkAllocate(this.bulkForm).subscribe({
+      next: count => {
+        this.loadData();
+        this.showBulkForm.set(false);
+      },
+    });
+  }
+
+  deleteAllocation(id: string) {
+    this.confirmation.warn('::DeleteConfirmation', '::AreYouSure').subscribe(status => {
+      if (status !== Confirmation.Status.confirm) return;
+      this.service.delete(id).subscribe({
+        next: () => this.loadData(),
+        error: (err: any) => this.toaster.error(err?.error?.error?.message || '::DeleteFailed'),
+      });
+    });
+  }
+
+  getEmployeeName(id: string | undefined): string {
+    if (!id) return '—';
+    return this.employeeNames()[id] ?? id.substring(0, 8) + '...';
+  }
+
+  getLeaveTypeName(id: string | undefined): string {
+    if (!id) return '—';
+    return this.leaveTypeNames()[id] ?? id.substring(0, 8) + '...';
+  }
+}

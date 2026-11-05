@@ -1,0 +1,258 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Core;
+using MyERP.Core.DomainServices;
+using MyERP.Inventory.Entities;
+using MyERP.Manufacturing.Entities;
+using MyERP.Permissions;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+
+namespace MyERP.Manufacturing;
+
+[Authorize(MyERPPermissions.SalesForecasts.Default)]
+public class SalesForecastAppService : ApplicationService, ISalesForecastAppService
+{
+    private readonly IRepository<SalesForecast, Guid> _repository;
+    private readonly IRepository<Item, Guid> _itemRepository;
+    private readonly IRepository<Warehouse, Guid> _warehouseRepository;
+    private readonly IRepository<MasterProductionSchedule, Guid> _mpsRepository;
+    private readonly IDocumentNumberGenerator _numberGenerator;
+
+    public SalesForecastAppService(
+        IRepository<SalesForecast, Guid> repository,
+        IRepository<Item, Guid> itemRepository,
+        IRepository<Warehouse, Guid> warehouseRepository,
+        IRepository<MasterProductionSchedule, Guid> mpsRepository,
+        IDocumentNumberGenerator numberGenerator)
+    {
+        _repository = repository;
+        _itemRepository = itemRepository;
+        _warehouseRepository = warehouseRepository;
+        _mpsRepository = mpsRepository;
+        _numberGenerator = numberGenerator;
+    }
+
+    public async Task<SalesForecastDto> GetAsync(Guid id)
+    {
+        var forecast = await _repository.GetAsync(id, includeDetails: true);
+        return ToDto(forecast);
+    }
+
+    public async Task<PagedResultDto<SalesForecastDto>> GetListAsync(MyERP.Shared.CompanyFilteredPagedRequestDto input)
+    {
+        var query = await _repository.GetQueryableAsync();
+        if (input.CompanyId.HasValue)
+            query = query.Where(f => f.CompanyId == input.CompanyId.Value);
+
+        var totalCount = query.Count();
+        var items = query.OrderByDescending(f => f.CreationTime).Skip(input.SkipCount).Take(input.MaxResultCount).ToList();
+        return new PagedResultDto<SalesForecastDto>(totalCount, items.Select(ToDto).ToList());
+    }
+
+    [Authorize(MyERPPermissions.SalesForecasts.Create)]
+    public async Task<SalesForecastDto> CreateAsync(CreateSalesForecastDto input)
+    {
+        if (input.DemandNumber <= 0)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.SalesForecastDemandNumberMustBeGreaterThanZero);
+        }
+
+        if (input.SelectedItemIds == null || input.SelectedItemIds.Count == 0)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.DocumentMustHaveItems);
+        }
+
+        await ValidateParentWarehouseAsync(input.ParentWarehouseId, input.CompanyId);
+        await ValidateStockItemsAsync(input.SelectedItemIds);
+
+        var number = await _numberGenerator.GenerateAsync("SF", input.CompanyId);
+        var forecast = new SalesForecast(GuidGenerator.Create(), input.CompanyId, number, input.FromDate, input.ParentWarehouseId, CurrentTenant.Id)
+        {
+            Frequency = input.Frequency,
+            DemandNumber = input.DemandNumber,
+        };
+        forecast.SetSelectedItems(input.SelectedItemIds);
+        await _repository.InsertAsync(forecast);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "SalesForecast", forecast.Id,
+            "Created", forecast.CompanyId,
+            forecast.ForecastNumber, "Draft", "Draft", CurrentUser.Id,
+            $"Sales forecast {forecast.ForecastNumber} created with {forecast.SelectedItems.Count} items", CurrentTenant.Id));
+
+        return ToDto(forecast);
+    }
+
+    [Authorize(MyERPPermissions.SalesForecasts.Edit)]
+    public async Task<SalesForecastDto> UpdateAsync(Guid id, UpdateSalesForecastDto input)
+    {
+        var forecast = await _repository.GetAsync(id, includeDetails: true);
+        if (forecast.Status != DocumentStatus.Draft)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        }
+
+        if (input.DemandNumber <= 0)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.SalesForecastDemandNumberMustBeGreaterThanZero);
+        }
+
+        if (input.SelectedItemIds == null || input.SelectedItemIds.Count == 0)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.DocumentMustHaveItems);
+        }
+
+        await ValidateParentWarehouseAsync(input.ParentWarehouseId, forecast.CompanyId);
+        await ValidateStockItemsAsync(input.SelectedItemIds);
+
+        forecast.FromDate = input.FromDate;
+        forecast.ParentWarehouseId = input.ParentWarehouseId;
+        forecast.Frequency = input.Frequency;
+        forecast.DemandNumber = input.DemandNumber;
+        forecast.SetSelectedItems(input.SelectedItemIds);
+        await _repository.UpdateAsync(forecast);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "SalesForecast", forecast.Id,
+            "Updated", forecast.CompanyId,
+            forecast.ForecastNumber, "Draft", "Draft", CurrentUser.Id,
+            $"Sales forecast {forecast.ForecastNumber} updated", CurrentTenant.Id));
+
+        return ToDto(forecast);
+    }
+
+    [Authorize(MyERPPermissions.SalesForecasts.Delete)]
+    public async Task DeleteAsync(Guid id) => await _repository.DeleteAsync(id);
+
+    /// <summary>Projects one demand row per selected item per period. Per ERPNext generate_demand().</summary>
+    [Authorize(MyERPPermissions.SalesForecasts.Edit)]
+    public async Task<SalesForecastDto> GenerateDemandAsync(Guid id)
+    {
+        var forecast = await _repository.GetAsync(id, includeDetails: true);
+
+        var itemIds = forecast.SelectedItems.Select(s => s.ItemId).ToList();
+        var itemQuery = await _itemRepository.GetQueryableAsync();
+        var itemDetails = itemQuery.Where(i => itemIds.Contains(i.Id))
+            .ToDictionary(i => i.Id, i => (i.ItemName, i.Uom));
+
+        forecast.GenerateDemand(itemDetails);
+        await _repository.UpdateAsync(forecast);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "SalesForecast", forecast.Id,
+            "DemandGenerated", forecast.CompanyId,
+            forecast.ForecastNumber, "Draft", "Draft", CurrentUser.Id,
+            $"Demand generated for sales forecast {forecast.ForecastNumber} ({forecast.Items.Count} projected entries)", CurrentTenant.Id));
+
+        return ToDto(forecast);
+    }
+
+    [Authorize(MyERPPermissions.SalesForecasts.Submit)]
+    public async Task<SalesForecastDto> SubmitAsync(Guid id)
+    {
+        var forecast = await _repository.GetAsync(id, includeDetails: true);
+        forecast.Submit();
+        await _repository.UpdateAsync(forecast);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "SalesForecast", forecast.Id,
+            "Submitted", forecast.CompanyId,
+            forecast.ForecastNumber, "Draft", "Submitted", CurrentUser.Id,
+            $"Sales forecast {forecast.ForecastNumber} submitted", CurrentTenant.Id));
+
+        return ToDto(forecast);
+    }
+
+    [Authorize(MyERPPermissions.SalesForecasts.Cancel)]
+    public async Task<SalesForecastDto> CancelAsync(Guid id)
+    {
+        var forecast = await _repository.GetAsync(id, includeDetails: true);
+        forecast.Cancel();
+        await _repository.UpdateAsync(forecast);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "SalesForecast", forecast.Id,
+            "Cancelled", forecast.CompanyId,
+            forecast.ForecastNumber, "Submitted", "Cancelled", CurrentUser.Id,
+            $"Sales forecast {forecast.ForecastNumber} cancelled", CurrentTenant.Id));
+
+        return ToDto(forecast);
+    }
+
+    /// <summary>Creates a Master Production Schedule from this forecast. Per ERPNext create_mps (get_mapped_doc).</summary>
+    [Authorize(MyERPPermissions.MasterProductionSchedules.Create)]
+    public async Task<Guid> CreateMpsAsync(Guid id)
+    {
+        var forecast = await _repository.GetAsync(id, includeDetails: true);
+        if (forecast.Status != DocumentStatus.Submitted)
+            throw new BusinessException(MyERPDomainErrorCodes.DocumentMustBeSubmittedForConversion);
+
+        if (forecast.ForecastStatus != SalesForecastStatus.Planned)
+            throw new BusinessException(MyERPDomainErrorCodes.SalesForecastAlreadyUsedForMps);
+
+        var mpsQuery = await _mpsRepository.GetQueryableAsync();
+        if (mpsQuery.Any(m => m.SalesForecastId == forecast.Id))
+            throw new BusinessException(MyERPDomainErrorCodes.SalesForecastAlreadyUsedForMps);
+
+        var number = await _numberGenerator.GenerateAsync("MPS", forecast.CompanyId);
+        var mps = new MasterProductionSchedule(GuidGenerator.Create(), forecast.CompanyId, number,
+            Clock.Now, forecast.FromDate, CurrentTenant.Id)
+        {
+            ParentWarehouseId = forecast.ParentWarehouseId,
+            SalesForecastId = forecast.Id,
+        };
+        await _mpsRepository.InsertAsync(mps);
+
+        forecast.MarkMpsGenerated();
+        await _repository.UpdateAsync(forecast);
+
+        return mps.Id;
+    }
+
+    private async Task ValidateParentWarehouseAsync(Guid warehouseId, Guid companyId)
+    {
+        var warehouse = await _warehouseRepository.FindAsync(warehouseId);
+        if (warehouse == null || warehouse.CompanyId != companyId || !warehouse.IsGroup)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.SalesForecastParentWarehouseInvalid)
+                .WithData("warehouse", warehouse?.Name ?? warehouseId.ToString())
+                .WithData("company", companyId);
+        }
+    }
+
+    private async Task ValidateStockItemsAsync(IEnumerable<Guid> itemIds)
+    {
+        var ids = itemIds.Distinct().ToList();
+        if (ids.Count == 0) return;
+
+        var itemQuery = await _itemRepository.GetQueryableAsync();
+        var nonStockItems = itemQuery
+            .Where(i => ids.Contains(i.Id) && !i.MaintainStock)
+            .Select(i => i.ItemName)
+            .ToList();
+
+        if (nonStockItems.Count > 0)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.SalesForecastOnlyStockItemsAllowed)
+                .WithData("items", string.Join(", ", nonStockItems));
+        }
+    }
+
+    private SalesForecastDto ToDto(SalesForecast forecast)
+    {
+        var dto = ObjectMapper.Map<SalesForecast, SalesForecastDto>(forecast);
+        dto.SelectedItemIds = forecast.SelectedItems.Select(s => s.ItemId).ToList();
+        return dto;
+    }
+}

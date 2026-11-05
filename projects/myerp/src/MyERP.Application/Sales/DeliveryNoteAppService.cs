@@ -1,0 +1,1668 @@
+using System;
+using System.Collections.Generic;
+using Microsoft.Extensions.Logging;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Accounting.DomainServices;
+using MyERP.Core;
+using MyERP.Core.DomainServices;
+using MyERP.Core.Entities;
+using MyERP.Inventory.DomainServices;
+using MyERP.Permissions;
+using MyERP.Sales.DomainServices;
+using MyERP.Sales.Entities;
+using MyERP.Shared;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Settings;
+
+namespace MyERP.Sales;
+
+[Authorize(MyERPPermissions.DeliveryNotes.Default)]
+public class DeliveryNoteAppService : ApplicationService, IDeliveryNoteAppService
+{
+    private readonly IRepository<DeliveryNote, Guid> _repository;
+    private readonly IRepository<SalesOrder, Guid> _salesOrderRepository;
+    private readonly IRepository<DocumentActivityLog, Guid> _activityLogRepository;
+    private readonly IDocumentNumberGenerator _numberGenerator;
+    private readonly StockValuationService _valuationService;
+    private readonly BinService _binService;
+    private readonly DocumentPostingOrchestrator _postingOrchestrator;
+    private readonly AutoReorderService _autoReorderService;
+    private readonly QualityInspectionEnforcementService _qiEnforcement;
+    private readonly BatchExpiryValidationService _batchValidation;
+    private readonly ItemTransactionValidationService _itemValidation;
+    private readonly CreditLimitService _creditLimitService;
+    private readonly SalesTeamService? _salesTeamService;
+    private SalesTeamService SalesTeamService =>
+        _salesTeamService ?? LazyServiceProvider.LazyGetRequiredService<SalesTeamService>();
+
+    public DeliveryNoteAppService(
+        IRepository<DeliveryNote, Guid> repository,
+        IRepository<SalesOrder, Guid> salesOrderRepository,
+        IRepository<DocumentActivityLog, Guid> activityLogRepository,
+        IDocumentNumberGenerator numberGenerator,
+        StockValuationService valuationService,
+        BinService binService,
+        DocumentPostingOrchestrator postingOrchestrator,
+        AutoReorderService autoReorderService,
+        QualityInspectionEnforcementService qiEnforcement,
+        BatchExpiryValidationService batchValidation,
+        ItemTransactionValidationService itemValidation,
+        CreditLimitService creditLimitService,
+        SalesTeamService? salesTeamService = null)
+    {
+        _salesTeamService = salesTeamService;
+        _repository = repository;
+        _salesOrderRepository = salesOrderRepository;
+        _activityLogRepository = activityLogRepository;
+        _numberGenerator = numberGenerator;
+        _valuationService = valuationService;
+        _binService = binService;
+        _postingOrchestrator = postingOrchestrator;
+        _autoReorderService = autoReorderService;
+        _qiEnforcement = qiEnforcement;
+        _batchValidation = batchValidation;
+        _itemValidation = itemValidation;
+        _creditLimitService = creditLimitService;
+    }
+
+    public async Task<DeliveryNoteDto> GetAsync(Guid id)
+    {
+        var dn = await _repository.GetAsync(id);
+        var dto = ObjectMapper.Map<DeliveryNote, DeliveryNoteDto>(dn);
+
+        // Resolve customer name
+        var customerRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.Customer, Guid>>();
+        var customer = await customerRepo.FindAsync(dn.CustomerId);
+        if (customer != null)
+            dto.CustomerName = customer.Name;
+
+        await AttachSalesTeamAsync(dto);
+        return dto;
+    }
+
+    public async Task<PagedResultDto<DeliveryNoteDto>> GetListAsync(CompanyFilteredPagedRequestDto input)
+    {
+        var query = await _repository.GetQueryableAsync();
+
+        if (input.CompanyId.HasValue)
+            query = query.Where(x => x.CompanyId == input.CompanyId.Value);
+
+        if (!string.IsNullOrWhiteSpace(input.Filter))
+        {
+            var filter = input.Filter; query = query.Where(x => x.DeliveryNumber.Contains(filter));
+        }
+
+        if (!string.IsNullOrWhiteSpace(input.Status) && Enum.TryParse<Core.DocumentStatus>(input.Status, true, out var status))
+            query = query.Where(x => x.Status == status);
+
+        if (input.FromDate.HasValue)
+            query = query.Where(x => x.PostingDate >= input.FromDate.Value);
+
+        if (input.ToDate.HasValue)
+            query = query.Where(x => x.PostingDate <= input.ToDate.Value);
+
+        var totalCount = query.Count();
+        var sorted = SortingHelper.ApplySorting(query, input.Sorting,
+            q => q.OrderByDescending(x => x.PostingDate),
+            ("deliveryNumber", x => x.DeliveryNumber),
+            ("postingDate", x => x.PostingDate),
+            ("grandTotal", x => x.GrandTotal),
+            ("status", x => x.Status));
+        var list = sorted
+            .Skip(input.SkipCount)
+            .Take(input.MaxResultCount)
+            .ToList();
+
+        var dtos = list.Select(x => ObjectMapper.Map<DeliveryNote, DeliveryNoteDto>(x)).ToList();
+
+        // Batch-resolve customer names
+        var customerIds = list.Select(x => x.CustomerId).Distinct().ToList();
+        var customerRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.Customer, Guid>>();
+        var custQuery = await customerRepo.GetQueryableAsync();
+        var customerNames = custQuery.Where(c => customerIds.Contains(c.Id))
+            .Select(c => new { c.Id, c.Name }).ToList()
+            .ToDictionary(c => c.Id, c => c.Name);
+        foreach (var dto in dtos)
+            dto.CustomerName = customerNames.GetValueOrDefault(dto.CustomerId);
+
+        return new PagedResultDto<DeliveryNoteDto>(totalCount, dtos);
+    }
+
+    [Authorize(MyERPPermissions.DeliveryNotes.Create)]
+    public async Task<DeliveryNoteDto> CreateAsync(CreateDeliveryNoteDto input)
+    {
+        // Input validation
+        Check.NotDefaultOrNull<Guid>(input.CompanyId, nameof(input.CompanyId));
+        Check.NotDefaultOrNull<Guid>(input.CustomerId, nameof(input.CustomerId));
+        Check.NotDefaultOrNull<Guid>(input.WarehouseId, nameof(input.WarehouseId));
+        if (input.Items == null || input.Items.Count == 0)
+            throw new Volo.Abp.BusinessException("MyERP:01007")
+                .WithData("documentType", "Delivery Note");
+
+        // Validate all items are active
+        var itemIds = input.Items.Select(i => i.ItemId).ToList();
+        await _itemValidation.ValidateItemsForTransactionAsync(itemIds);
+        await _itemValidation.ValidateItemUomsForTransactionAsync(input.CompanyId, input.Items.Select(i => (i.ItemId, (string?)i.Uom)));
+
+        // ERPNext validate_party_frozen_disabled: no delivery to a disabled customer
+        var partyCustomer = await LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.Customer, Guid>>().FindAsync(input.CustomerId);
+        if (partyCustomer != null)
+        {
+            var partyValidation = LazyServiceProvider.LazyGetRequiredService<Core.DomainServices.PartyValidationService>();
+            await partyValidation.ValidatePartyForTransactionAsync("Customer", isDisabled: !partyCustomer.IsActive, isFrozen: partyCustomer.IsFrozen, partyCustomer.Name, input.CompanyId);
+            partyValidation.ValidateCustomerNotBlocked(partyCustomer.OnHold, partyCustomer.ReleaseDate, partyCustomer.Name, input.PostingDate);
+        }
+
+        var whRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Inventory.Entities.Warehouse, Guid>>();
+        var warehouse = await whRepo.FindAsync(input.WarehouseId);
+        if (warehouse != null && warehouse.CompanyId != input.CompanyId)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                .WithData("warehouseCompany", warehouse.CompanyId)
+                .WithData("deliveryNoteCompany", input.CompanyId);
+        }
+
+        // Gotcha #233 & #710: Paired reference field validation for SO references
+        if (input.Items.Any(i => i.SalesOrderItemId.HasValue) && !input.SalesOrderId.HasValue)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Delivery Note item references a Sales Order item, but no Sales Order is specified on the Delivery Note.");
+        }
+
+        if (input.SalesOrderId.HasValue)
+        {
+            var soRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.SalesOrder, Guid>>();
+            var so = await soRepo.FindAsync(input.SalesOrderId.Value);
+            if (so != null)
+            {
+                if (so.CompanyId != input.CompanyId)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                        .WithData("salesOrderCompany", so.CompanyId)
+                        .WithData("deliveryNoteCompany", input.CompanyId);
+                }
+
+                // ERPNext check_sales_order_on_hold_or_close: no delivery against a closed Sales Order (returns exempt).
+                if (!input.IsReturn && so.Status == Core.DocumentStatus.Closed)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.LinkedSalesOrderClosed)
+                        .WithData("salesOrderNumber", so.OrderNumber);
+                }
+
+                var soItemIds = so.Items.Select(i => i.Id).ToHashSet();
+                var invalidSoItem = input.Items.FirstOrDefault(i => i.SalesOrderItemId.HasValue && !soItemIds.Contains(i.SalesOrderItemId.Value));
+                if (invalidSoItem != null)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                        .WithData("detail", $"Sales Order item {invalidSoItem.SalesOrderItemId} does not belong to Sales Order {input.SalesOrderId}.");
+                }
+            }
+        }
+
+        var linkedSoItemIds = input.Items
+            .Where(i => i.SalesOrderItemId.HasValue)
+            .Select(i => i.SalesOrderItemId!.Value)
+            .Distinct()
+            .ToList();
+        if (linkedSoItemIds.Count > 0)
+        {
+            var soRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.SalesOrder, Guid>>();
+            var soQuery = await soRepo.GetQueryableAsync();
+            var crossCompanySo = soQuery
+                .Where(so => so.Items.Any(i => linkedSoItemIds.Contains(i.Id)) && so.CompanyId != input.CompanyId)
+                .FirstOrDefault();
+            if (crossCompanySo != null)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("salesOrderCompany", crossCompanySo.CompanyId)
+                    .WithData("deliveryNoteCompany", input.CompanyId);
+            }
+        }
+
+        if (input.IsReturn && input.ReturnAgainstId.HasValue)
+        {
+            var returnAgainstDn = await _repository.FindAsync(input.ReturnAgainstId.Value);
+            if (returnAgainstDn != null && returnAgainstDn.CompanyId != input.CompanyId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("originalDeliveryNoteCompany", returnAgainstDn.CompanyId)
+                    .WithData("deliveryNoteCompany", input.CompanyId);
+            }
+        }
+
+        var companyRestriction = LazyServiceProvider.LazyGetRequiredService<Core.DomainServices.CompanyRestrictionValidationService>();
+        await companyRestriction.ValidateTransactionCompanyAsync(
+            "DeliveryNote", input.CompanyId,
+            itemIds: itemIds,
+            customerIds: new[] { input.CustomerId },
+            warehouseIds: new[] { input.WarehouseId });
+
+        var deliveryNumber = await _numberGenerator.GenerateAsync("DeliveryNote", input.CompanyId);
+
+        var dn = new DeliveryNote(
+            GuidGenerator.Create(),
+            input.CompanyId,
+            input.CustomerId,
+            input.WarehouseId,
+            deliveryNumber,
+            input.PostingDate,
+            CurrentTenant.Id);
+
+        dn.SalesOrderId = input.SalesOrderId;
+        dn.PickListId = input.PickListId;
+        dn.ContactPersonId = input.ContactPersonId;
+        dn.ShippingContactPersonId = input.ShippingContactPersonId;
+        dn.ShippingAddress = input.ShippingAddress;
+        dn.Transporter = input.Transporter;
+        dn.TrackingNumber = input.TrackingNumber;
+        dn.IsReturn = input.IsReturn;
+        dn.ReturnAgainstId = input.ReturnAgainstId;
+        dn.Notes = input.Notes;
+
+        // Auto-fill addresses and contacts from linked SO or customer
+        if (input.SalesOrderId.HasValue)
+        {
+            var soRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.SalesOrder, Guid>>();
+            var so = await soRepo.FindAsync(input.SalesOrderId.Value);
+            if (so != null)
+            {
+                dn.BillingAddressId = so.BillingAddressId;
+                dn.ShippingAddressId = so.ShippingAddressId;
+                dn.ContactPersonId ??= so.ContactPersonId;
+                dn.ShippingContactPersonId ??= so.ShippingContactPersonId;
+            }
+        }
+        else
+        {
+            var partyDefaults = LazyServiceProvider.LazyGetRequiredService<Core.DomainServices.PartyDefaultsService>();
+            var shipping = await partyDefaults.GetShippingAddressAsync("Customer", input.CustomerId);
+            if (shipping != null) dn.ShippingAddressId = shipping.Id;
+            var billing = await partyDefaults.GetPrimaryAddressAsync("Customer", input.CustomerId);
+            if (billing != null) dn.BillingAddressId = billing.Id;
+        }
+
+        // Add items + resolve UOM conversion
+        var uomService = LazyServiceProvider.LazyGetRequiredService<Inventory.DomainServices.UomConversionService>();
+        var itemRepoForUom = LazyServiceProvider.LazyGetRequiredService<IRepository<Inventory.Entities.Item, Guid>>();
+
+        DeliveryNote? originalDnForReturn = null;
+        if (dn.IsReturn && dn.ReturnAgainstId.HasValue)
+        {
+            originalDnForReturn = await _repository.FindAsync(dn.ReturnAgainstId.Value);
+        }
+
+        foreach (var item in input.Items)
+        {
+            var soItemId = item.SalesOrderItemId;
+            if (!soItemId.HasValue && originalDnForReturn != null)
+            {
+                var origItem = originalDnForReturn.Items.FirstOrDefault(oi => oi.ItemId == item.ItemId);
+                if (origItem?.SalesOrderItemId.HasValue == true)
+                {
+                    soItemId = origItem.SalesOrderItemId;
+                }
+            }
+
+            var qty = dn.IsReturn ? -Math.Abs(item.Quantity) : item.Quantity;
+            dn.AddItem(item.ItemId, item.Description, qty, item.UnitPrice,
+                item.TaxAmount, item.Uom, soItemId, item.PickListItemId);
+            var lastItem = dn.Items[^1];
+            var itemEntity = await itemRepoForUom.FindAsync(item.ItemId);
+            if (itemEntity != null)
+            {
+                lastItem.StockUom = itemEntity.Uom;
+                if (item.ConversionFactor.HasValue && item.ConversionFactor.Value > 0)
+                {
+                    lastItem.ConversionFactor = item.ConversionFactor.Value;
+                }
+                else if (!string.Equals(lastItem.Uom, itemEntity.Uom, StringComparison.OrdinalIgnoreCase))
+                {
+                    lastItem.ConversionFactor = await uomService.GetConversionFactorAsync(
+                        item.ItemId, lastItem.Uom, itemEntity.Uom);
+                }
+            }
+        }
+
+        await _repository.InsertAsync(dn, autoSave: true);
+
+        if (input.SalesTeam != null && input.SalesTeam.Count > 0)
+        {
+            var eligibleAmount = await SalesTeamService.CalculateEligibleAmountAsync(
+                dn.Items.Select(i => (i.ItemId, i.LineTotal)), dn.ExchangeRate);
+            var inputs = input.SalesTeam.Select(s => new SalesTeamAllocationInput
+            {
+                SalesPersonId = s.SalesPersonId,
+                AllocatedPercentage = s.AllocatedPercentage,
+                CommissionRate = s.CommissionRate
+            });
+            await SalesTeamService.SetSalesTeamAsync("DeliveryNote", dn.Id, eligibleAmount, inputs, dn.IsReturn, dn.ReturnAgainstId);
+        }
+        else if (dn.IsReturn && dn.ReturnAgainstId.HasValue)
+        {
+            var eligibleAmount = await SalesTeamService.CalculateEligibleAmountAsync(
+                dn.Items.Select(i => (i.ItemId, i.LineTotal)), dn.ExchangeRate);
+            await SalesTeamService.CopySalesTeamFromSourceAsync("DeliveryNote", dn.ReturnAgainstId.Value, "DeliveryNote", dn.Id, eligibleAmount);
+        }
+        else if (dn.SalesOrderId.HasValue)
+        {
+            var eligibleAmount = await SalesTeamService.CalculateEligibleAmountAsync(
+                dn.Items.Select(i => (i.ItemId, i.LineTotal)), dn.ExchangeRate);
+            await SalesTeamService.CopySalesTeamFromSourceAsync("SalesOrder", dn.SalesOrderId.Value, "DeliveryNote", dn.Id, eligibleAmount);
+        }
+
+        var dto = ObjectMapper.Map<DeliveryNote, DeliveryNoteDto>(dn);
+        await AttachSalesTeamAsync(dto);
+        return dto;
+    }
+
+    [Authorize(MyERPPermissions.DeliveryNotes.Edit)]
+    public async Task<DeliveryNoteDto> UpdateAsync(Guid id, CreateDeliveryNoteDto input)
+    {
+        var dn = await _repository.GetAsync(id);
+        if (dn.Status != Core.DocumentStatus.Draft)
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("detail", "Only Draft delivery notes can be edited");
+
+        var updateWhRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Inventory.Entities.Warehouse, Guid>>();
+        var warehouse = await updateWhRepo.FindAsync(dn.WarehouseId);
+        if (warehouse != null && warehouse.CompanyId != dn.CompanyId)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                .WithData("warehouseCompany", warehouse.CompanyId)
+                .WithData("deliveryNoteCompany", dn.CompanyId);
+        }
+
+        var soId = input.SalesOrderId ?? dn.SalesOrderId;
+
+        // Gotcha #233 & #710: Paired reference field validation for SO references
+        if (input.Items.Any(i => i.SalesOrderItemId.HasValue) && !soId.HasValue)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Delivery Note item references a Sales Order item, but no Sales Order is specified on the Delivery Note.");
+        }
+
+        if (soId.HasValue)
+        {
+            var soRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.SalesOrder, Guid>>();
+            var so = await soRepo.FindAsync(soId.Value);
+            if (so != null)
+            {
+                if (so.CompanyId != dn.CompanyId)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                        .WithData("salesOrderCompany", so.CompanyId)
+                        .WithData("deliveryNoteCompany", dn.CompanyId);
+                }
+
+                // ERPNext check_sales_order_on_hold_or_close: no delivery against a closed Sales Order (returns exempt).
+                if (!dn.IsReturn && so.Status == Core.DocumentStatus.Closed)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.LinkedSalesOrderClosed)
+                        .WithData("salesOrderNumber", so.OrderNumber);
+                }
+
+                var soItemIds = so.Items.Select(i => i.Id).ToHashSet();
+                var invalidSoItem = input.Items.FirstOrDefault(i => i.SalesOrderItemId.HasValue && !soItemIds.Contains(i.SalesOrderItemId.Value));
+                if (invalidSoItem != null)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                        .WithData("detail", $"Sales Order item {invalidSoItem.SalesOrderItemId} does not belong to Sales Order {soId}.");
+                }
+            }
+        }
+
+        var updateSoItemIds = input.Items
+            .Where(i => i.SalesOrderItemId.HasValue)
+            .Select(i => i.SalesOrderItemId!.Value)
+            .Distinct()
+            .ToList();
+        if (updateSoItemIds.Count > 0)
+        {
+            var soRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.SalesOrder, Guid>>();
+            var soQuery = await soRepo.GetQueryableAsync();
+            var crossCompanySo = soQuery
+                .Where(so => so.Items.Any(i => updateSoItemIds.Contains(i.Id)) && so.CompanyId != dn.CompanyId)
+                .FirstOrDefault();
+            if (crossCompanySo != null)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("salesOrderCompany", crossCompanySo.CompanyId)
+                    .WithData("deliveryNoteCompany", dn.CompanyId);
+            }
+        }
+
+        var returnAgainstId = input.ReturnAgainstId ?? dn.ReturnAgainstId;
+        if ((input.IsReturn || dn.IsReturn) && returnAgainstId.HasValue)
+        {
+            var returnAgainstDn = await _repository.FindAsync(returnAgainstId.Value);
+            if (returnAgainstDn != null && returnAgainstDn.CompanyId != dn.CompanyId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("originalDeliveryNoteCompany", returnAgainstDn.CompanyId)
+                    .WithData("deliveryNoteCompany", dn.CompanyId);
+            }
+        }
+
+        var updateItemIds = input.Items.Select(i => i.ItemId).ToList();
+        await _itemValidation.ValidateItemsForTransactionAsync(updateItemIds);
+        await _itemValidation.ValidateItemUomsForTransactionAsync(dn.CompanyId, input.Items.Select(i => (i.ItemId, (string?)i.Uom)));
+
+        var updateCompanyRestriction = LazyServiceProvider.LazyGetRequiredService<Core.DomainServices.CompanyRestrictionValidationService>();
+        await updateCompanyRestriction.ValidateTransactionCompanyAsync(
+            "DeliveryNote", dn.CompanyId,
+            itemIds: updateItemIds,
+            customerIds: new[] { dn.CustomerId },
+            warehouseIds: new[] { dn.WarehouseId });
+
+        dn.PostingDate = input.PostingDate;
+        dn.SalesOrderId = input.SalesOrderId;
+        dn.PickListId = input.PickListId ?? dn.PickListId;
+        dn.IsReturn = input.IsReturn;
+        dn.ReturnAgainstId = input.ReturnAgainstId;
+        dn.ContactPersonId = input.ContactPersonId;
+        dn.ShippingContactPersonId = input.ShippingContactPersonId;
+        dn.ShippingAddress = input.ShippingAddress;
+        dn.Transporter = input.Transporter;
+        dn.TrackingNumber = input.TrackingNumber;
+        dn.Notes = input.Notes;
+
+        dn.ClearItems();
+        foreach (var item in input.Items)
+        {
+            var qty = dn.IsReturn ? -Math.Abs(item.Quantity) : item.Quantity;
+            dn.AddItem(item.ItemId, item.Description, qty, item.UnitPrice, item.TaxAmount, item.Uom, item.SalesOrderItemId, item.PickListItemId);
+        }
+
+        await _repository.UpdateAsync(dn, autoSave: true);
+
+        if (input.SalesTeam != null && input.SalesTeam.Count > 0)
+        {
+            var eligibleAmount = await SalesTeamService.CalculateEligibleAmountAsync(
+                dn.Items.Select(i => (i.ItemId, i.LineTotal)), dn.ExchangeRate);
+            var inputs = input.SalesTeam.Select(s => new SalesTeamAllocationInput
+            {
+                SalesPersonId = s.SalesPersonId,
+                AllocatedPercentage = s.AllocatedPercentage,
+                CommissionRate = s.CommissionRate
+            });
+            await SalesTeamService.SetSalesTeamAsync("DeliveryNote", dn.Id, eligibleAmount, inputs, dn.IsReturn, dn.ReturnAgainstId);
+        }
+
+        var dto = ObjectMapper.Map<DeliveryNote, DeliveryNoteDto>(dn);
+        await AttachSalesTeamAsync(dto);
+        return dto;
+    }
+
+    [Authorize(MyERPPermissions.DeliveryNotes.Submit)]
+    public async Task<DeliveryNoteDto> SubmitAsync(Guid id)
+    {
+        var dn = await _repository.GetAsync(id);
+
+        var customer = await LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.Customer, Guid>>().FindAsync(dn.CustomerId);
+        if (customer != null)
+        {
+            var partyValidation = LazyServiceProvider.LazyGetRequiredService<Core.DomainServices.PartyValidationService>();
+            await partyValidation.ValidatePartyForTransactionAsync("Customer", isDisabled: !customer.IsActive, isFrozen: customer.IsFrozen, customer.Name, dn.CompanyId);
+            partyValidation.ValidateCustomerNotBlocked(customer.OnHold, customer.ReleaseDate, customer.Name, dn.PostingDate);
+        }
+
+        // Authorization control: high-value transaction approval check
+        var authControl = LazyServiceProvider.LazyGetRequiredService<MyERP.Core.DomainServices.AuthorizationControlService>();
+        var userRoles = (CurrentUser.Roles ?? Array.Empty<string>()).ToArray();
+        await authControl.ValidateApprovingAuthorityAsync(
+            "DeliveryNote", dn.CompanyId,
+            CurrentUser.Id ?? Guid.Empty, userRoles, dn.GrandTotal);
+
+        // Enforce Quality Inspection requirement (per item flags)
+        var itemIds = dn.Items.Select(i => i.ItemId).ToArray();
+        await _qiEnforcement.ValidateForDeliveryNoteAsync(dn.Id, itemIds, dn.TenantId);
+
+        // Validate batch expiry (block expired batches on stock-out)
+        // Per batch-serial-number rules: Sales Returns (positive qty on DN) are exempt —
+        // a customer returning expired goods must be accepted back into stock.
+        if (!dn.IsReturn)
+        {
+            var batchItems = dn.Items
+                .Where(i => i.BatchId.HasValue)
+                .Select(i => new BatchValidationItem(i.ItemId, i.BatchId, i.Description))
+                .ToList();
+            if (batchItems.Any())
+            {
+                await _batchValidation.ValidateForStockOutAsync(batchItems, dn.PostingDate);
+            }
+        }
+
+        // Mandatory SO linkage (Selling Settings or Customer flag)
+        if (!dn.IsReturn)
+        {
+            // ERPNext DeliveryNote.so_required reads Selling Settings only; the customer flag
+            // only exempts Sales Invoices.
+            var soRequired = await SettingProvider.IsTrueAsync(MyERP.Settings.MyERPSettings.Selling.SoRequired);
+            if (soRequired)
+            {
+                var unlinkedItem = dn.Items.FirstOrDefault(i => !i.SalesOrderItemId.HasValue && !dn.SalesOrderId.HasValue);
+                if (unlinkedItem != null)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.SalesOrderLinkRequired)
+                        .WithData("itemDescription", unlinkedItem.Description);
+                }
+            }
+        }
+
+        // Credit limit enforcement at DN submit (ERPNext commit b462209445: applies to standalone and SO-linked non-return DNs)
+        if (!dn.IsReturn)
+        {
+            var dnUserRoles = (CurrentUser.Roles ?? Array.Empty<string>()).ToArray();
+            await _creditLimitService.ValidateCreditLimitAsync(dn.CustomerId, dn.GrandTotal, dn.CompanyId, dnUserRoles);
+        }
+
+        // Over-delivery validation + SO status guard (domain service)
+        if (!dn.IsReturn && dn.SalesOrderId.HasValue)
+        {
+            // Selling price validation at DN submit (Warn mode)
+            var valuationSvc = LazyServiceProvider.LazyGetRequiredService<Inventory.DomainServices.StockValuationService>();
+            var dnItemData = dn.Items
+                .Select(i => (i.ItemId, i.UnitPrice, i.Description))
+                .ToList().AsReadOnly();
+            await SalesInvoiceManager.ValidateSellingPriceAsync(dnItemData,
+                async itemId => (await valuationSvc.GetCurrentBalanceAsync(itemId, dn.WarehouseId)).ValuationRate,
+                action: "Warn");
+
+            var dnManager = LazyServiceProvider.LazyGetRequiredService<DeliveryNoteManager>();
+            await dnManager.ValidateAgainstSalesOrderAsync(dn);
+
+            // Maintain same rate throughout the sales cycle (Selling Settings)
+            if (await SettingProvider.IsTrueAsync(MyERP.Settings.MyERPSettings.Selling.MaintainSameRate))
+            {
+                var so = await _salesOrderRepository.GetAsync(dn.SalesOrderId.Value);
+                var rateAction = await SettingProvider.GetOrNullAsync(MyERP.Settings.MyERPSettings.Selling.MaintainSameRateAction) ?? "Stop";
+                var overrideRole = await SettingProvider.GetOrNullAsync(MyERP.Settings.MyERPSettings.Selling.RoleToOverrideStopAction);
+                var canOverride = !string.IsNullOrEmpty(overrideRole)
+                    && (CurrentUser.Roles ?? Array.Empty<string>()).Contains(overrideRole);
+
+                var rateLines = dn.Items
+                    .Where(i => so.Items.Any(soi => soi.ItemId == i.ItemId))
+                    .Select(i => (i.Description,
+                        i.UnitPrice,
+                        so.Items.First(soi => soi.ItemId == i.ItemId).UnitPrice,
+                        "Sales Order"));
+
+                var transactionValidation = LazyServiceProvider
+                    .LazyGetRequiredService<MyERP.Core.DomainServices.TransactionValidationService>();
+                transactionValidation.ValidateMaintainSameRate(rateLines, rateAction, canOverride);
+            }
+        }
+
+        if (dn.IsReturn && dn.ReturnAgainstId.HasValue)
+        {
+            var dnManager = LazyServiceProvider.LazyGetRequiredService<DeliveryNoteManager>();
+            await dnManager.ValidateReturnAsync(dn);
+        }
+
+        dn.Submit();
+
+        if (dn.IsReturn)
+        {
+            if (dn.ReturnAgainstId.HasValue)
+            {
+                // Per ERPNext PR #58953 / commit be8208e7cb & PR #58869 / commit f864333afa: update original DN returned_qty & recalculate billing
+                var originalDn = await _repository.FindAsync(dn.ReturnAgainstId.Value);
+                if (originalDn != null)
+                {
+                    foreach (var returnItem in dn.Items)
+                    {
+                        var origItem = originalDn.Items.FirstOrDefault(i =>
+                            (returnItem.SalesOrderItemId.HasValue && i.SalesOrderItemId == returnItem.SalesOrderItemId) ||
+                            (!returnItem.SalesOrderItemId.HasValue && i.ItemId == returnItem.ItemId));
+                        if (origItem != null)
+                        {
+                            var returnFactor = returnItem.ConversionFactor > 0 ? returnItem.ConversionFactor : 1m;
+                            var origFactor = origItem.ConversionFactor > 0 ? origItem.ConversionFactor : 1m;
+                            var returnedInOrigUom = (Math.Abs(returnItem.Quantity) * returnFactor) / origFactor;
+
+                            origItem.ReturnedQty += returnedInOrigUom;
+                        }
+                    }
+                    originalDn.UpdateBillingStatus();
+                    await _repository.UpdateAsync(originalDn, autoSave: true);
+                }
+            }
+
+            // RETURN: Stock comes BACK to warehouse (positive SLE, positive Bin)
+            var returnItemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<MyERP.Inventory.Entities.Item, Guid>>();
+            var returnBundleService = LazyServiceProvider.LazyGetRequiredService<ProductBundleDecompositionService>();
+            var returnItemIds = dn.Items.Select(i => i.ItemId).Distinct();
+            var returnBundleItemIds = await returnBundleService.GetBundleItemIdsAsync(returnItemIds, isReturn: true);
+            DeliveryNote? origDnForRates = dn.ReturnAgainstId.HasValue ? await _repository.FindAsync(dn.ReturnAgainstId.Value) : null;
+
+            foreach (var item in dn.Items)
+            {
+                if (returnBundleItemIds.Contains(item.ItemId))
+                {
+                    // Decompose returned product bundle into components (allowing disabled bundles per PR #62149 / commit ffcf97c223)
+                    Guid? returnBundleVersionId = null;
+                    if (origDnForRates?.SalesOrderId.HasValue == true && item.SalesOrderItemId.HasValue)
+                    {
+                        var soRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesOrder, Guid>>();
+                        var origSo = await soRepo.FindAsync(origDnForRates.SalesOrderId.Value);
+                        returnBundleVersionId = origSo?.Items.FirstOrDefault(i => i.Id == item.SalesOrderItemId.Value)?.ProductBundleId;
+                    }
+
+                    var components = await returnBundleService.DecomposeAsync(
+                        item.ItemId, item.Quantity, item.UnitPrice, isReturn: true,
+                        productBundleId: returnBundleVersionId);
+                    foreach (var comp in components)
+                    {
+                        var compEntity = await returnItemRepo.FindAsync(comp.ComponentItemId);
+                        if (compEntity != null && !compEntity.MaintainStock)
+                            continue;
+
+                        var compReturnWarehouseId = item.WarehouseId ?? dn.WarehouseId;
+                        var compReturnStockQty = Math.Abs(comp.Qty);
+
+                        var balance = await _valuationService.GetCurrentBalanceAsync(comp.ComponentItemId, compReturnWarehouseId);
+                        var compIncomingRate = balance.ValuationRate > 0
+                            ? balance.ValuationRate
+                            : (compEntity?.StandardBuyingPrice ?? 0m);
+
+                        await _valuationService.CreateLedgerEntryAsync(
+                            dn.CompanyId, comp.ComponentItemId, compReturnWarehouseId,
+                            dn.PostingDate, compReturnStockQty, compIncomingRate,
+                            voucherType: "DeliveryNote", voucherId: dn.Id,
+                            tenantId: dn.TenantId);
+
+                        await _binService.ApplyStockMovementAsync(
+                            comp.ComponentItemId, compReturnWarehouseId,
+                            compReturnStockQty, compReturnStockQty * compIncomingRate, dn.TenantId);
+                    }
+                    continue;
+                }
+
+                // Skip non-stock items
+                var itemEntity = await returnItemRepo.FindAsync(item.ItemId);
+                if (itemEntity != null && !itemEntity.MaintainStock)
+                    continue;
+
+                var returnWarehouseId = item.WarehouseId ?? dn.WarehouseId;
+                // Use StockQty for SLE (returns in stock UOM)
+                var returnStockQty = Math.Abs(item.StockQty);
+
+                // Per ERPNext PR #60614 (commit 86a28694b9 & 0f0c78053a):
+                // A return linked to original delivery uses original delivery incoming rate.
+                // A standalone return uses current warehouse valuation rate (fallback to item valuation rate / standard buying price).
+                decimal incomingRate = 0m;
+                if (origDnForRates != null)
+                {
+                    var origItem = origDnForRates.Items.FirstOrDefault(i =>
+                        (item.SalesOrderItemId.HasValue && i.SalesOrderItemId == item.SalesOrderItemId) ||
+                        (!item.SalesOrderItemId.HasValue && i.ItemId == item.ItemId));
+                    if (origItem != null && origItem.ValuationRate > 0)
+                    {
+                        incomingRate = origItem.ValuationRate;
+                    }
+                }
+
+                if (incomingRate <= 0)
+                {
+                    var balance = await _valuationService.GetCurrentBalanceAsync(item.ItemId, returnWarehouseId);
+                    incomingRate = balance.ValuationRate > 0
+                        ? balance.ValuationRate
+                        : (itemEntity?.StandardBuyingPrice ?? 0m);
+                }
+
+                item.ValuationRate = incomingRate;
+
+                await _valuationService.CreateLedgerEntryAsync(
+                    dn.CompanyId, item.ItemId, returnWarehouseId,
+                    dn.PostingDate, returnStockQty, incomingRate,
+                    voucherType: "DeliveryNote", voucherId: dn.Id,
+                    tenantId: dn.TenantId, batchId: item.BatchId);
+
+                await _binService.ApplyStockMovementAsync(
+                    item.ItemId, returnWarehouseId,
+                    returnStockQty, returnStockQty * incomingRate, dn.TenantId);
+                // No reserved qty release on returns — stock wasn't reserved for a return
+            }
+
+            // Calculate StockCostTotal for reverse COGS GL posting
+            dn.StockCostTotal = dn.Items
+                .Where(i => i.ValuationRate > 0)
+                .Sum(i => Math.Abs(i.StockQty) * i.ValuationRate);
+
+            // Reverse GL: DR Stock, CR COGS (opposite of normal DN)
+            var warehouseAccountService = LazyServiceProvider
+                .LazyGetRequiredService<WarehouseAccountService>();
+            var returnStockAccountId = await warehouseAccountService
+                .ResolveStockAccountAsync(dn.WarehouseId, dn.CompanyId);
+            await _postingOrchestrator.PostDeliveryNoteAsync(dn, returnStockAccountId);
+
+            // Reduce linked SO DeliveredQty (return reverses prior delivery — with concurrency retry)
+            if (dn.SalesOrderId.HasValue)
+            {
+                await UpdateSoFulfillmentWithRetryAsync(dn.SalesOrderId.Value, dn.Items, isReversal: false, isReturn: true);
+            }
+
+            // Auto-create Credit Note (negative Sales Invoice) for the return
+            // Per ERPNext: DN return → auto-creates Credit Note SI with is_return=true
+            // Per DO-NOT: "Allow returns with positive qty (must always be negative)"
+            try
+            {
+                var numberGen = LazyServiceProvider.LazyGetRequiredService<MyERP.Core.DomainServices.IDocumentNumberGenerator>();
+                var siRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesInvoice, Guid>>();
+                var creditNoteNumber = await numberGen.GenerateAsync("SalesInvoice", dn.CompanyId);
+
+                var originalDn = dn.ReturnAgainstId.HasValue ? await _repository.FindAsync(dn.ReturnAgainstId.Value) : null;
+                Guid? originalInvoiceId = null;
+                if (originalDn != null)
+                {
+                    var origInv = await siRepo.FindAsync(i => i.DeliveryNoteId == originalDn.Id && i.Status != Core.DocumentStatus.Cancelled);
+                    originalInvoiceId = origInv?.Id;
+                }
+
+                var creditNote = new SalesInvoice(
+                    GuidGenerator.Create(), dn.CompanyId, dn.CustomerId,
+                    creditNoteNumber, dn.PostingDate, dn.TenantId);
+                creditNote.IsReturn = true;
+                creditNote.ReturnAgainstId = originalInvoiceId;
+                creditNote.DeliveryNoteId = dn.Id;
+                creditNote.Notes = $"Credit Note for Return {dn.DeliveryNumber}";
+
+                foreach (var item in dn.Items)
+                {
+                    // Return items have negative qty — per DO-NOT rule
+                    var qty = -Math.Abs(item.Quantity);
+                    creditNote.AddItem(item.ItemId, item.Description ?? "", qty, item.UnitPrice, item.TaxAmount);
+                }
+
+                creditNote.Submit();
+                await siRepo.InsertAsync(creditNote, autoSave: true);
+
+                // Submit() is a status-only transition (Draft -> Submitted); the actual GL
+                // journal entry only gets built by Post(), which this auto-generated credit
+                // note never reached — it sat in "Submitted" with the stock reversed but the
+                // customer's AR/COGS never reversed, and no error surfaced since nothing threw.
+                creditNote.Post();
+                var glService = LazyServiceProvider
+                    .LazyGetRequiredService<Accounting.DomainServices.GlRepostService>();
+                await glService.RebuildSalesInvoiceGlAsync(creditNote);
+                await siRepo.UpdateAsync(creditNote, autoSave: true);
+            }
+            catch (Exception ex)
+            {
+                // Non-blocking: credit note failure should not rollback stock return
+                Logger.LogWarning(ex, "Auto credit note creation failed for DN return {DnId}", dn.Id);
+            }
+        }
+        else
+        {
+            // NORMAL DELIVERY: Stock goes OUT (negative SLE, negative Bin)
+            // Product Bundle decomposition: bundle items deliver COMPONENT stock, not parent
+            var itemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<MyERP.Inventory.Entities.Item, Guid>>();
+            var bundleService = LazyServiceProvider.LazyGetRequiredService<ProductBundleDecompositionService>();
+
+            // Stock Reservation Entry warehouse validation — must run BEFORE the stock-out loop
+            // below, since it resolves/corrects item.WarehouseId and everything after this point
+            // (SLE, Bin, and the SRE consumption further down) reads that field. Per ERPNext
+            // validate_against_stock_reservation_entries: auto-set from the reserved warehouse
+            // when the DN item's own warehouse is unset; hard error when it's set but doesn't
+            // match any reservation for that item — delivering from the wrong warehouse would
+            // otherwise silently strand the reservation (ConsumeOnDeliveryAsync filters by
+            // warehouse, so a mismatched delivery consumes nothing).
+            if (dn.SalesOrderId.HasValue)
+            {
+                var sreManagerForWarehouse = LazyServiceProvider.LazyGetRequiredService<StockReservationManager>();
+                foreach (var item in dn.Items)
+                {
+                    var resolvedWarehouseId = await sreManagerForWarehouse.ValidateOrResolveWarehouseAsync(
+                        item.ItemId, dn.SalesOrderId.Value, item.WarehouseId ?? dn.WarehouseId);
+                    if (resolvedWarehouseId.HasValue)
+                    {
+                        item.WarehouseId = resolvedWarehouseId;
+                    }
+                }
+            }
+
+            // Identify which DN items are bundles
+            var allItemIds = dn.Items.Select(i => i.ItemId).Distinct();
+            var bundleItemIds = await bundleService.GetBundleItemIdsAsync(allItemIds, isReturn: dn.IsReturn);
+
+            // Packing Slip completeness gate: once ANY submitted Packing Slip exists for this
+            // DN, every non-bundle item must be fully packed before the DN can submit. Per
+            // ERPNext: "once you start packing, you must pack EVERYTHING." Product Bundle items
+            // are exempt — they're treated as already-packed since they expand into packed
+            // items, not tracked the same way a standalone DN item's PackedQty is.
+            var packingSlipRepoForGate = LazyServiceProvider
+                .LazyGetRequiredService<IRepository<Sales.Entities.PackingSlip, Guid>>();
+            var packingSlipGateQuery = await packingSlipRepoForGate.GetQueryableAsync();
+            var hasSubmittedPackingSlip = packingSlipGateQuery.Any(ps =>
+                ps.DeliveryNoteId == dn.Id && ps.Status == Core.DocumentStatus.Submitted);
+            if (hasSubmittedPackingSlip)
+            {
+                var underPackedItem = dn.Items.FirstOrDefault(i =>
+                    !bundleItemIds.Contains(i.ItemId) && i.PackedQty < Math.Abs(i.Quantity));
+                if (underPackedItem != null)
+                {
+                    throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.DeliveryNoteNotFullyPacked)
+                        .WithData("itemDescription", underPackedItem.Description)
+                        .WithData("packedQty", underPackedItem.PackedQty)
+                        .WithData("qty", underPackedItem.Quantity);
+                }
+            }
+
+            foreach (var item in dn.Items)
+            {
+                if (bundleItemIds.Contains(item.ItemId))
+                {
+                    // Bundle item: decompose into components and deliver each component
+                    Guid? bundleVersionId = null;
+                    if (dn.SalesOrderId.HasValue && item.SalesOrderItemId.HasValue)
+                    {
+                        var soRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesOrder, Guid>>();
+                        var so = await soRepo.FindAsync(dn.SalesOrderId.Value);
+                        bundleVersionId = so?.Items.FirstOrDefault(i => i.Id == item.SalesOrderItemId.Value)?.ProductBundleId;
+                    }
+
+                    var components = await bundleService.DecomposeAsync(
+                        item.ItemId, item.Quantity, item.UnitPrice,
+                        productBundleId: bundleVersionId);
+
+                    // Capture component valuation rates BEFORE stock removal (Bug #4 fix)
+                    decimal bundleCostTotal = 0;
+                    foreach (var comp in components)
+                    {
+                        var compEntity = await itemRepo.FindAsync(comp.ComponentItemId);
+                        if (compEntity != null && !compEntity.MaintainStock)
+                            continue;
+
+                        // Get valuation rate BEFORE consuming stock
+                        var compBalance = await _valuationService.GetCurrentBalanceAsync(comp.ComponentItemId, dn.WarehouseId);
+                        var compValuationRate = compBalance.ValuationRate;
+                        bundleCostTotal += compValuationRate * comp.Qty;
+
+                        await _valuationService.CreateLedgerEntryAsync(
+                            dn.CompanyId, comp.ComponentItemId, dn.WarehouseId,
+                            dn.PostingDate, -comp.Qty, compValuationRate,
+                            voucherType: "DeliveryNote", voucherId: dn.Id,
+                            tenantId: dn.TenantId);
+
+                        // Bin value uses valuation rate (Bug #3 fix — was using selling price)
+                        await _binService.ApplyStockMovementAsync(
+                            comp.ComponentItemId, dn.WarehouseId,
+                            -comp.Qty, -(comp.Qty * compValuationRate), dn.TenantId);
+
+                        await _binService.UpdateReservedQtyAsync(
+                            comp.ComponentItemId, dn.WarehouseId, -comp.Qty, dn.TenantId);
+                    }
+
+                    // Valuation for bundle = sum of component valuations captured before removal
+                    item.ValuationRate = item.Quantity > 0 ? bundleCostTotal / item.Quantity : 0;
+                }
+                else
+                {
+                    // Regular item: stock operations on the item itself
+                    var itemEntity = await itemRepo.FindAsync(item.ItemId);
+                    if (itemEntity != null && !itemEntity.MaintainStock)
+                        continue;
+
+                    // Per ERPNext: each DN item can have its own warehouse
+                    var itemWarehouseId = item.WarehouseId ?? dn.WarehouseId;
+
+                    var balance = await _valuationService.GetCurrentBalanceAsync(item.ItemId, itemWarehouseId);
+                    item.ValuationRate = balance.ValuationRate;
+
+                    await _valuationService.CreateLedgerEntryAsync(
+                        dn.CompanyId, item.ItemId, itemWarehouseId,
+                        dn.PostingDate, -item.StockQty, item.ValuationRate,
+                        voucherType: "DeliveryNote", voucherId: dn.Id,
+                        tenantId: dn.TenantId, batchId: item.BatchId);
+
+                    await _binService.ApplyStockMovementAsync(
+                        item.ItemId, itemWarehouseId,
+                        -item.StockQty, -(item.StockQty * item.ValuationRate), dn.TenantId);
+
+                    await _binService.UpdateReservedQtyAsync(
+                        item.ItemId, itemWarehouseId, -item.StockQty, dn.TenantId);
+                }
+            }
+
+            // Calculate StockCostTotal for COGS GL posting (Bug #2 fix)
+            // Per ERPNext: GL entry uses actual consumed stock cost, NOT selling price
+            dn.StockCostTotal = dn.Items
+                .Where(i => i.ValuationRate > 0)
+                .Sum(i => i.StockQty * i.ValuationRate);
+
+            // Consume Stock Reservation Entries (FIFO by creation date)
+            // Per ERPNext: update_stock_reservation_entries on DN submit
+            // Updates SRE.DeliveredQty for each item+warehouse
+            if (dn.SalesOrderId.HasValue)
+            {
+                var sreManager = LazyServiceProvider.LazyGetRequiredService<StockReservationManager>();
+                foreach (var item in dn.Items)
+                {
+                    var itemEntity = await itemRepo.FindAsync(item.ItemId);
+                    if (itemEntity == null || !itemEntity.MaintainStock) continue;
+
+                    await sreManager.ConsumeOnDeliveryAsync(
+                        item.ItemId, item.WarehouseId ?? dn.WarehouseId, item.StockQty, dn.SalesOrderId, item.BatchId);
+                }
+            }
+
+            // GL posting (perpetual inventory): DR COGS, CR Stock
+            // Per ERPNext BaseStockGLComposer: uses warehouse-specific stock account for CR
+            var warehouseAccountService = LazyServiceProvider
+                .LazyGetRequiredService<WarehouseAccountService>();
+            var stockAccountId = await warehouseAccountService
+                .ResolveStockAccountAsync(dn.WarehouseId, dn.CompanyId);
+            await _postingOrchestrator.PostDeliveryNoteAsync(dn, stockAccountId);
+
+            // Update linked Sales Order fulfillment tracking (with concurrency retry)
+            if (dn.SalesOrderId.HasValue)
+            {
+                await UpdateSoFulfillmentWithRetryAsync(dn.SalesOrderId.Value, dn.Items, isReversal: false);
+
+                // Update Delivery Schedule entries (record progressive delivery)
+                await UpdateDeliveryScheduleAsync(dn.SalesOrderId.Value, dn.Items);
+            }
+
+            // Update linked Pick List delivery tracking (per ERPNext status updater & commit e3c6082498: DN Item + decomposed bundles -> Pick List Item delivered_qty)
+            await SyncPickListDeliveryQtyAsync(dn, isCancel: false);
+
+            // Check auto-reorder for items that had stock reduced
+            foreach (var item in dn.Items)
+            {
+                var mrId = await _autoReorderService.CheckSingleItemAsync(
+                    item.ItemId, dn.WarehouseId, dn.CompanyId, dn.TenantId);
+
+                // Notify when auto-reorder creates a Material Request
+                if (mrId.HasValue && CurrentUser.Id.HasValue)
+                {
+                    try
+                    {
+                        var notifSvc = LazyServiceProvider
+                            .LazyGetRequiredService<Notification.DomainServices.BusinessNotificationService>();
+                        await notifSvc.NotifyAutoReorderAsync(
+                            CurrentUser.Id.Value, item.Description, item.Quantity, mrId.Value, dn.TenantId);
+                    }
+                    catch (Exception ex) { Logger.LogWarning(ex, "Auto-reorder notification failed"); }
+                }
+            }
+
+            // Low-stock alert for procurement staff, distinct from AutoReorderService above (which
+            // auto-creates a Material Request) — StockAlertNotificationService had zero callers
+            // anywhere despite its own doc comment saying it should fire here (DN submit).
+            var stockAlert = LazyServiceProvider
+                .LazyGetRequiredService<Inventory.DomainServices.StockAlertNotificationService>();
+            await stockAlert.CheckMultipleAndNotifyAsync(
+                dn.Items.Select(i => i.ItemId), dn.WarehouseId, dn.CompanyId, dn.TenantId);
+        }
+
+        await _repository.UpdateAsync(dn, autoSave: true);
+
+        // Audit trail
+        await _activityLogRepository.InsertAsync(new DocumentActivityLog(
+            GuidGenerator.Create(), "DeliveryNote", dn.Id, "Submitted",
+            dn.CompanyId, dn.DeliveryNumber, "Draft", "Submitted",
+            CurrentUser.Id, tenantId: dn.TenantId));
+
+        return ObjectMapper.Map<DeliveryNote, DeliveryNoteDto>(dn);
+    }
+
+    [Authorize(MyERPPermissions.DeliveryNotes.Cancel)]
+    public async Task<DeliveryNoteDto> CancelAsync(Guid id)
+    {
+        var dn = await _repository.GetAsync(id);
+
+        // Validate posting period is not frozen/closed
+        await _postingOrchestrator.ValidatePostingPeriodAsync(dn.CompanyId, dn.PostingDate, "DeliveryNote");
+
+        // Repost Guard: cannot cancel while an active valuation repost is in progress (gotcha #6183)
+        var repostGuard = LazyServiceProvider.LazyGetRequiredService<Inventory.DomainServices.StockRepostGuardService>();
+        await repostGuard.ValidateCanCancelVoucherAsync("DeliveryNote", dn.Id);
+
+        // Guard: cannot cancel if submitted Sales Invoices are linked to this DN's items.
+        // Matched via SalesInvoiceItem.DeliveryNoteItemId — the real, direct DN→SI link (per
+        // ERPNext check_next_docstatus: "SI Item WHERE delivery_note = self.name"). Matching via
+        // a shared SalesOrderItemId instead (the previous check) was wrong two ways: a false
+        // positive when two different DNs partially deliver the same SO item and only one is
+        // billed, and a false negative for any SI billed directly from a DN with no SO in the
+        // chain at all (SalesOrderItemId null on both sides, so the shared-SO-item match never
+        // fires even though a real SI→DN link exists).
+        var dnItemIds = dn.Items.Select(di => di.Id).ToHashSet();
+        var siRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.SalesInvoice, Guid>>();
+        var siQuery = await siRepo.GetQueryableAsync();
+        var hasSubmittedSI = siQuery.Any(si =>
+            si.Items.Any(i => i.DeliveryNoteItemId.HasValue && dnItemIds.Contains(i.DeliveryNoteItemId.Value))
+            && si.Status != Core.DocumentStatus.Draft
+            && si.Status != Core.DocumentStatus.Cancelled);
+        if (hasSubmittedSI)
+        {
+            throw new Volo.Abp.BusinessException("MyERP:01010")
+                .WithData("documentType", "Delivery Note")
+                .WithData("dependent", "Sales Invoice");
+        }
+
+        // Guard: cannot cancel if a submitted Installation Note references this DN.
+        // Per ERPNext check_next_docstatus: "Installation Note Item WHERE prevdoc_docname =
+        // self.name AND docstatus = 1" — a parent-level link (Installation Note doesn't row-link
+        // like SI does), so this checks InstallationNote.DeliveryNoteId directly.
+        var installationNoteRepo = LazyServiceProvider
+            .LazyGetRequiredService<IRepository<Sales.Entities.InstallationNote, Guid>>();
+        var installationNoteQuery = await installationNoteRepo.GetQueryableAsync();
+        var hasSubmittedInstallationNote = installationNoteQuery.Any(iNote =>
+            iNote.DeliveryNoteId == dn.Id
+            && iNote.Status != Core.DocumentStatus.Draft
+            && iNote.Status != Core.DocumentStatus.Cancelled);
+        if (hasSubmittedInstallationNote)
+        {
+            throw new Volo.Abp.BusinessException("MyERP:01010")
+                .WithData("documentType", "Delivery Note")
+                .WithData("dependent", "Installation Note");
+        }
+
+        dn.Cancel();
+
+        // Cancel/clean up linked Packing Slips (per ERPNext packing.py cancel_packing_slips, gotcha #6238)
+        var packingSlipRepo = LazyServiceProvider
+            .LazyGetRequiredService<IRepository<Sales.Entities.PackingSlip, Guid>>();
+        var packingSlipQuery = await packingSlipRepo.GetQueryableAsync();
+        var linkedPackingSlips = packingSlipQuery
+            .Where(ps => ps.DeliveryNoteId == dn.Id && ps.Status != Core.DocumentStatus.Cancelled)
+            .ToList();
+        foreach (var ps in linkedPackingSlips)
+        {
+            if (ps.Status == Core.DocumentStatus.Draft)
+            {
+                await packingSlipRepo.DeleteAsync(ps, autoSave: true);
+            }
+            else if (ps.Status == Core.DocumentStatus.Submitted)
+            {
+                ps.Cancel();
+                await packingSlipRepo.UpdateAsync(ps, autoSave: true);
+            }
+        }
+
+        // Reverse the posted GL Journal Entry (DR COGS / CR Stock on submit)
+        await _postingOrchestrator.ReverseGlForDocumentAsync("DeliveryNote", dn.Id);
+
+        // Reverse SLE + Bin for each item (in stock UOM), at the same cost basis and
+        // warehouse Submit posted at — not the sale price / header warehouse (round-76 fix:
+        // reversing at UnitPrice instead of the persisted ValuationRate corrupted the
+        // warehouse's moving-average valuation rate on every cancelled DN).
+        var bundleService = LazyServiceProvider.LazyGetRequiredService<ProductBundleDecompositionService>();
+        var bundleItemIds = await bundleService.GetBundleItemIdsAsync(dn.Items.Select(i => i.ItemId).ToList());
+        var cancelItemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<MyERP.Inventory.Entities.Item, Guid>>();
+
+        foreach (var item in dn.Items)
+        {
+            if (bundleItemIds.Contains(item.ItemId))
+            {
+                // Product Bundle: reverse components that were affected on submit
+                var components = await bundleService.DecomposeAsync(item.ItemId, item.Quantity, item.UnitPrice, isReturn: dn.IsReturn);
+                foreach (var comp in components)
+                {
+                    var compEntity = await cancelItemRepo.FindAsync(comp.ComponentItemId);
+                    if (compEntity != null && !compEntity.MaintainStock)
+                        continue;
+
+                    var compBalance = await _valuationService.GetCurrentBalanceAsync(comp.ComponentItemId, dn.WarehouseId);
+                    var compValuationRate = compBalance.ValuationRate;
+                    var compQtyChange = dn.IsReturn ? -Math.Abs(comp.Qty) : Math.Abs(comp.Qty);
+
+                    await _valuationService.CreateLedgerEntryAsync(
+                        dn.CompanyId, comp.ComponentItemId, dn.WarehouseId,
+                        dn.PostingDate, compQtyChange, compValuationRate,
+                        voucherType: "DeliveryNote", voucherId: dn.Id,
+                        tenantId: dn.TenantId);
+
+                    await _binService.ApplyStockMovementAsync(
+                        comp.ComponentItemId, dn.WarehouseId,
+                        compQtyChange, compQtyChange * compValuationRate, dn.TenantId);
+
+                    if (!dn.IsReturn)
+                    {
+                        await _binService.UpdateReservedQtyAsync(
+                            comp.ComponentItemId, dn.WarehouseId, comp.Qty, dn.TenantId);
+
+                        var sreManager = LazyServiceProvider
+                            .LazyGetRequiredService<Inventory.DomainServices.StockReservationManager>();
+                        await sreManager.RestoreOnCancelDeliveryAsync(
+                            comp.ComponentItemId, dn.WarehouseId, comp.Qty, dn.SalesOrderId);
+                    }
+                }
+            }
+            else
+            {
+                // Regular item: stock operations on the item itself
+                // Mirror Submit's skip: a non-stock item never got an SLE/Bin posting to reverse.
+                var itemEntity = await cancelItemRepo.FindAsync(item.ItemId);
+                if (itemEntity != null && !itemEntity.MaintainStock)
+                    continue;
+
+                var stockQtyChange = dn.IsReturn ? -Math.Abs(item.StockQty) : Math.Abs(item.StockQty);
+                var itemWarehouseId = item.WarehouseId ?? dn.WarehouseId;
+
+                await _valuationService.CreateLedgerEntryAsync(
+                    dn.CompanyId, item.ItemId, itemWarehouseId,
+                    dn.PostingDate, stockQtyChange, item.ValuationRate,
+                    voucherType: "DeliveryNote", voucherId: dn.Id,
+                    tenantId: dn.TenantId, batchId: item.BatchId);
+
+                await _binService.ApplyStockMovementAsync(
+                    item.ItemId, itemWarehouseId,
+                    stockQtyChange, stockQtyChange * item.ValuationRate, dn.TenantId);
+
+                if (!dn.IsReturn)
+                {
+                    // Re-reserve qty in stock UOM (returns never held reservations)
+                    await _binService.UpdateReservedQtyAsync(
+                        item.ItemId, itemWarehouseId, Math.Abs(item.StockQty), dn.TenantId);
+
+                    // Restore StockReservationEntry DeliveredQty (per ERPNext PR #58613 / commit 7ecfa6b356)
+                    var sreManager = LazyServiceProvider
+                        .LazyGetRequiredService<Inventory.DomainServices.StockReservationManager>();
+                    await sreManager.RestoreOnCancelDeliveryAsync(
+                        item.ItemId, itemWarehouseId, Math.Abs(item.StockQty), dn.SalesOrderId, item.BatchId);
+                }
+            }
+        }
+
+        // Reverse linked Sales Order fulfillment tracking
+        if (dn.SalesOrderId.HasValue)
+        {
+            await UpdateSoFulfillmentWithRetryAsync(dn.SalesOrderId.Value, dn.Items, isReversal: true, isReturn: dn.IsReturn);
+            await ReverseDeliveryScheduleAsync(dn.SalesOrderId.Value, dn.Items);
+        }
+
+        // Update linked Pick List delivery tracking (Gotcha #427 & commit e3c6082498: decrement DeliveredQty on cancel for plain and bundle rows)
+        await SyncPickListDeliveryQtyAsync(dn, isCancel: true);
+
+        // Per ERPNext PR #58953 / commit be8208e7cb & PR #58869 / commit f864333afa: revert original DN returned_qty & recalculate billing when return is cancelled
+        if (dn.IsReturn && dn.ReturnAgainstId.HasValue)
+        {
+            var originalDn = await _repository.FindAsync(dn.ReturnAgainstId.Value);
+            if (originalDn != null)
+            {
+                foreach (var returnItem in dn.Items)
+                {
+                    var origItem = originalDn.Items.FirstOrDefault(i =>
+                        (returnItem.SalesOrderItemId.HasValue && i.SalesOrderItemId == returnItem.SalesOrderItemId) ||
+                        (!returnItem.SalesOrderItemId.HasValue && i.ItemId == returnItem.ItemId));
+                    if (origItem != null)
+                    {
+                        var returnFactor = returnItem.ConversionFactor > 0 ? returnItem.ConversionFactor : 1m;
+                        var origFactor = origItem.ConversionFactor > 0 ? origItem.ConversionFactor : 1m;
+                        var returnedInOrigUom = (Math.Abs(returnItem.Quantity) * returnFactor) / origFactor;
+
+                        origItem.ReturnedQty = Math.Max(0, origItem.ReturnedQty - returnedInOrigUom);
+                    }
+                }
+                originalDn.UpdateBillingStatus();
+                await _repository.UpdateAsync(originalDn, autoSave: true);
+            }
+        }
+
+        await _repository.UpdateAsync(dn, autoSave: true);
+
+        // Audit trail
+        await _activityLogRepository.InsertAsync(new DocumentActivityLog(
+            GuidGenerator.Create(), "DeliveryNote", dn.Id, "Cancelled",
+            dn.CompanyId, dn.DeliveryNumber, "Submitted", "Cancelled",
+            CurrentUser.Id, tenantId: dn.TenantId));
+
+        return ObjectMapper.Map<DeliveryNote, DeliveryNoteDto>(dn);
+    }
+
+    /// <summary>
+    /// Amend a cancelled Delivery Note — creates a new draft copy.
+    /// </summary>
+    [Authorize(MyERPPermissions.DeliveryNotes.Create)]
+    public async Task<DeliveryNoteDto> AmendAsync(Guid id)
+    {
+        var original = await _repository.GetAsync(id);
+        var amendService = LazyServiceProvider.LazyGetRequiredService<Core.DomainServices.DocumentAmendmentService>();
+
+        amendService.ValidateCanAmend(original.Status);
+        var newNumber = amendService.GenerateAmendedNumber(original.DeliveryNumber, original.AmendmentIndex + 1);
+
+        var amended = new DeliveryNote(
+            GuidGenerator.Create(), original.CompanyId, original.CustomerId,
+            original.WarehouseId, newNumber, DateTime.UtcNow.Date, CurrentTenant.Id);
+
+        amended.AmendedFromId = original.Id;
+        amended.AmendmentIndex = original.AmendmentIndex + 1;
+        amended.SalesOrderId = original.SalesOrderId;
+        amended.Notes = original.Notes;
+
+        foreach (var item in original.Items)
+        {
+            amended.AddItem(item.ItemId, item.Description, item.Quantity, item.UnitPrice, item.TaxAmount, item.Uom, item.SalesOrderItemId);
+        }
+
+        await _repository.InsertAsync(amended, autoSave: true);
+        return ObjectMapper.Map<DeliveryNote, DeliveryNoteDto>(amended);
+    }
+
+    [Authorize(MyERPPermissions.DeliveryNotes.Edit)]
+    public async Task<DeliveryNoteDto> CloseAsync(Guid id)
+    {
+        var dn = await _repository.GetAsync(id);
+        dn.Close();
+        await _repository.UpdateAsync(dn, autoSave: true);
+        return ObjectMapper.Map<DeliveryNote, DeliveryNoteDto>(dn);
+    }
+
+    [Authorize(MyERPPermissions.DeliveryNotes.Edit)]
+    public async Task<DeliveryNoteDto> ReopenAsync(Guid id)
+    {
+        var dn = await _repository.GetAsync(id);
+        dn.Reopen();
+        await _repository.UpdateAsync(dn, autoSave: true);
+        return ObjectMapper.Map<DeliveryNote, DeliveryNoteDto>(dn);
+    }
+
+    [Authorize(MyERPPermissions.DeliveryNotes.Edit)]
+    public async Task<DeliveryNoteDto> CloseItemAsync(Guid id, Guid itemId)
+    {
+        var dn = await _repository.GetAsync(id);
+        var item = dn.Items.FirstOrDefault(i => i.Id == itemId);
+        if (item == null)
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.ItemNotFound);
+
+        dn.CloseItem(itemId);
+        await _repository.UpdateAsync(dn, autoSave: true);
+        return ObjectMapper.Map<DeliveryNote, DeliveryNoteDto>(dn);
+    }
+
+    [Authorize(MyERPPermissions.DeliveryNotes.Edit)]
+    public async Task<DeliveryNoteDto> ReopenItemAsync(Guid id, Guid itemId)
+    {
+        var dn = await _repository.GetAsync(id);
+        var item = dn.Items.FirstOrDefault(i => i.Id == itemId);
+        if (item == null)
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.ItemNotFound);
+
+        dn.ReopenItem(itemId);
+        await _repository.UpdateAsync(dn, autoSave: true);
+        return ObjectMapper.Map<DeliveryNote, DeliveryNoteDto>(dn);
+    }
+
+    private async Task UpdateSoFulfillmentWithRetryAsync(
+        Guid salesOrderId,
+        IReadOnlyCollection<DeliveryNoteItem> dnItems,
+        bool isReversal,
+        bool isReturn = false)
+    {
+        for (int attempt = 1; attempt <= 3; attempt++)
+        {
+            try
+            {
+                var so = await _salesOrderRepository.GetAsync(salesOrderId);
+                foreach (var dnItem in dnItems)
+                {
+                    if (!dnItem.SalesOrderItemId.HasValue) continue;
+                    var soItem = so.Items.FirstOrDefault(i => i.Id == dnItem.SalesOrderItemId.Value);
+                    if (soItem == null) continue;
+
+                    var dnFactor = dnItem.ConversionFactor > 0 ? dnItem.ConversionFactor : 1m;
+                    var soFactor = soItem.ConversionFactor > 0 ? soItem.ConversionFactor : 1m;
+                    var qty = (Math.Abs(dnItem.Quantity) * dnFactor) / soFactor;
+
+                    if (isReturn)
+                    {
+                        if (isReversal) // cancelling a return DN
+                        {
+                            soItem.ReturnedQty = Math.Max(0, soItem.ReturnedQty - qty);
+                            soItem.DeliveredQty += qty;
+                        }
+                        else // posting a return DN
+                        {
+                            soItem.ReturnedQty += qty;
+                            soItem.DeliveredQty = Math.Max(0, soItem.DeliveredQty - qty);
+                        }
+                    }
+                    else
+                    {
+                        if (isReversal) // cancelling a regular DN
+                        {
+                            soItem.DeliveredQty = Math.Max(0, soItem.DeliveredQty - qty);
+                        }
+                        else // posting a regular DN
+                        {
+                            soItem.DeliveredQty += qty;
+                        }
+                    }
+                }
+                so.UpdateFulfillmentStatus();
+                await _salesOrderRepository.UpdateAsync(so, autoSave: true);
+                return;
+            }
+            catch (Volo.Abp.Data.AbpDbConcurrencyException) when (attempt < 3)
+            {
+                Logger.LogWarning("Concurrency conflict updating SO {SoId} DeliveredQty (attempt {Attempt}/3)", salesOrderId, attempt);
+                await Task.Delay(attempt * 10);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Updates Delivery Schedule entries to record progressive delivery against scheduled dates.
+    /// Per ERPNext: uses FIFO allocation (earliest scheduled date filled first).
+    /// Per gotcha #108: frequency-based split deliveries with whole-number enforcement.
+    /// </summary>
+    private async Task UpdateDeliveryScheduleAsync(Guid salesOrderId, IReadOnlyCollection<DeliveryNoteItem> dnItems)
+    {
+        var scheduleRepo = LazyServiceProvider
+            .LazyGetRequiredService<IRepository<DeliveryScheduleEntry, Guid>>();
+
+        var scheduleQueryable = await scheduleRepo.GetQueryableAsync();
+        var scheduleEntries = scheduleQueryable
+            .Where(e => e.SalesOrderId == salesOrderId)
+            .OrderBy(e => e.ScheduledDate)
+            .ToList();
+
+        if (!scheduleEntries.Any()) return;
+
+        // FIFO allocation: allocate delivered qty to earliest pending schedule entries
+        foreach (var dnItem in dnItems)
+        {
+            if (!dnItem.SalesOrderItemId.HasValue) continue;
+
+            var itemSchedules = scheduleEntries
+                .Where(e => e.SalesOrderItemId == dnItem.SalesOrderItemId.Value && !e.IsFullyDelivered)
+                .ToList();
+
+            var remainingToAllocate = Math.Abs(dnItem.Quantity);
+
+            foreach (var schedule in itemSchedules)
+            {
+                if (remainingToAllocate <= 0) break;
+
+                var allocatable = Math.Min(remainingToAllocate, schedule.PendingQty);
+                schedule.RecordDelivery(allocatable);
+                remainingToAllocate -= allocatable;
+            }
+        }
+
+        // Persist updated schedule entries
+        foreach (var entry in scheduleEntries.Where(e => e.DeliveredQty > 0))
+        {
+            await scheduleRepo.UpdateAsync(entry);
+        }
+    }
+
+    /// <summary>
+    /// Reverses delivery schedule entries on DN cancellation.
+    /// Uses LIFO for reversal: reduces DeliveredQty on latest-date entries first,
+    /// which is the inverse of the FIFO allocation used during delivery.
+    /// </summary>
+    private async Task ReverseDeliveryScheduleAsync(Guid salesOrderId, IReadOnlyCollection<DeliveryNoteItem> dnItems)
+    {
+        var scheduleRepo = LazyServiceProvider
+            .LazyGetRequiredService<IRepository<DeliveryScheduleEntry, Guid>>();
+
+        var scheduleQueryable = await scheduleRepo.GetQueryableAsync();
+        var scheduleEntries = scheduleQueryable
+            .Where(e => e.SalesOrderId == salesOrderId)
+            .OrderByDescending(e => e.ScheduledDate) // LIFO: latest first for reversal
+            .ToList();
+
+        if (!scheduleEntries.Any()) return;
+
+        var modified = new HashSet<Guid>();
+
+        foreach (var dnItem in dnItems)
+        {
+            if (!dnItem.SalesOrderItemId.HasValue) continue;
+
+            var itemSchedules = scheduleEntries
+                .Where(e => e.SalesOrderItemId == dnItem.SalesOrderItemId.Value && e.DeliveredQty > 0)
+                .ToList();
+
+            var remainingToReverse = Math.Abs(dnItem.Quantity);
+
+            foreach (var schedule in itemSchedules)
+            {
+                if (remainingToReverse <= 0) break;
+
+                var reversible = Math.Min(remainingToReverse, schedule.DeliveredQty);
+                schedule.DeliveredQty = Math.Max(0, schedule.DeliveredQty - reversible);
+                remainingToReverse -= reversible;
+                modified.Add(schedule.Id);
+            }
+        }
+
+        foreach (var entry in scheduleEntries.Where(e => modified.Contains(e.Id)))
+        {
+            await scheduleRepo.UpdateAsync(entry);
+        }
+    }
+
+    [Authorize(MyERPPermissions.DeliveryNotes.Submit)]
+    public async Task<BulkOperationResultDto> BulkSubmitAsync(List<Guid> ids)
+    {
+        var results = new BulkOperationResultDto();
+        foreach (var id in ids)
+        {
+            try
+            {
+                await SubmitAsync(id);
+                results.Succeeded++;
+            }
+            catch (Exception ex)
+            {
+                results.Failed++;
+                results.Errors.Add(new BulkOperationError { Id = id, Message = ex.Message });
+            }
+        }
+        return results;
+    }
+
+    /// <summary>
+    /// Recalculates billing status and PerBilled of Delivery Notes left open by returns.
+    /// Per ERPNext PR #58953 / patch recalculate_returned_delivery_note_billing_status:
+    /// Returning the uninvoiced qty of a Delivery Note recalculates the original Delivery Note's
+    /// billing status so completed notes become Completed (100%) and unbilled notes stay To Bill (0%).
+    /// </summary>
+    [Authorize(MyERPPermissions.DeliveryNotes.Default)]
+    public async Task<int> RecalculateReturnedDeliveryNotesBillingStatusAsync()
+    {
+        var query = await _repository.GetQueryableAsync();
+        var candidateDns = query
+            .Where(dn => dn.Status == Core.DocumentStatus.Submitted
+                      && !dn.IsReturn
+                      && dn.Items.Any(i => i.ReturnedQty > 0))
+            .ToList();
+
+        var updatedCount = 0;
+        foreach (var dn in candidateDns)
+        {
+            dn.UpdateBillingStatus();
+            await _repository.UpdateAsync(dn, autoSave: true);
+            updatedCount++;
+        }
+
+        return updatedCount;
+    }
+[Authorize(MyERPPermissions.DeliveryNotes.Edit)]
+    public async Task<DeliveryNoteDto> UpdateSalesTeamAsync(Guid id, List<SalesTeamAllocationInputDto> input)
+    {
+        var dn = await _repository.GetAsync(id);
+        if (dn.Status == Core.DocumentStatus.Cancelled)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Cannot update sales team on a cancelled Delivery Note.");
+        }
+
+        var eligibleAmount = await SalesTeamService.CalculateEligibleAmountAsync(
+            dn.Items.Select(i => (i.ItemId, i.LineTotal)), dn.ExchangeRate);
+        var inputs = input.Select(s => new SalesTeamAllocationInput
+        {
+            SalesPersonId = s.SalesPersonId,
+            AllocatedPercentage = s.AllocatedPercentage,
+            CommissionRate = s.CommissionRate
+        });
+        await SalesTeamService.SetSalesTeamAsync("DeliveryNote", dn.Id, eligibleAmount, inputs, dn.IsReturn, dn.ReturnAgainstId);
+
+        var dto = ObjectMapper.Map<DeliveryNote, DeliveryNoteDto>(dn);
+        await AttachSalesTeamAsync(dto);
+        return dto;
+    }
+
+    private async Task AttachSalesTeamAsync(DeliveryNoteDto dto)
+    {
+        var teamRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesTeamEntry, Guid>>();
+        var teamQuery = await teamRepo.GetQueryableAsync();
+        var entries = teamQuery.Where(e => e.ParentType == "DeliveryNote" && e.ParentId == dto.Id).ToList();
+        if (entries.Count == 0) return;
+
+        var spRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesPerson, Guid>>();
+        var spQuery = await spRepo.GetQueryableAsync();
+        var spIds = entries.Select(e => e.SalesPersonId).Distinct().ToList();
+        var spNames = spQuery.Where(sp => spIds.Contains(sp.Id))
+            .Select(sp => new { sp.Id, sp.Name }).ToList()
+            .ToDictionary(sp => sp.Id, sp => sp.Name);
+
+        dto.SalesTeam = entries.Select(e => new SalesTeamEntryDto
+        {
+            SalesPersonId = e.SalesPersonId,
+            SalesPersonName = spNames.GetValueOrDefault(e.SalesPersonId),
+            AllocatedPercentage = e.AllocatedPercentage,
+            AllocatedAmount = e.AllocatedAmount,
+            CommissionRate = e.CommissionRate,
+            Incentives = e.Incentives,
+        }).ToList();
+        dto.TotalCommission = entries.Sum(e => e.Incentives);
+    }
+
+    private async Task SyncPickListDeliveryQtyAsync(DeliveryNote dn, bool isCancel)
+    {
+        if (dn.IsReturn) return;
+
+        var itemsWithPickList = dn.Items.Where(i => i.PickListItemId.HasValue).ToList();
+        var bundleCandidates = dn.PickListId.HasValue
+            ? dn.Items.Where(i => !i.PickListItemId.HasValue && i.SalesOrderItemId.HasValue).ToList()
+            : new List<DeliveryNoteItem>();
+
+        if (itemsWithPickList.Count == 0 && bundleCandidates.Count == 0)
+            return;
+
+        var plRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Inventory.Entities.PickList, Guid>>();
+        var plQuery = await plRepo.WithDetailsAsync(p => p.Items);
+        var pickListItemIds = itemsWithPickList.Select(i => i.PickListItemId!.Value).ToHashSet();
+        var targetPickListId = dn.PickListId;
+
+        var pickLists = plQuery
+            .Where(p => (targetPickListId.HasValue && p.Id == targetPickListId.Value)
+                     || p.Items.Any(pi => pickListItemIds.Contains(pi.Id)))
+            .ToList();
+
+        if (pickLists.Count == 0)
+            return;
+
+        SalesOrder? linkedSo = null;
+        if (bundleCandidates.Count > 0 && dn.SalesOrderId.HasValue)
+        {
+            linkedSo = await _salesOrderRepository.FindAsync(dn.SalesOrderId.Value);
+        }
+
+        var bundleService = bundleCandidates.Count > 0
+            ? LazyServiceProvider.LazyGetService<ProductBundleDecompositionService>()
+            : null;
+
+        foreach (var pl in pickLists)
+        {
+            var modified = false;
+
+            foreach (var item in itemsWithPickList)
+            {
+                var plItem = pl.Items.FirstOrDefault(pi => pi.Id == item.PickListItemId!.Value);
+                if (plItem != null)
+                {
+                    var stockQty = Math.Abs(item.StockQty);
+                    if (isCancel)
+                        plItem.RevertDelivery(stockQty);
+                    else
+                        plItem.RecordDelivery(stockQty);
+                    modified = true;
+                }
+            }
+
+            if (targetPickListId.HasValue && pl.Id == targetPickListId.Value && bundleService != null)
+            {
+                foreach (var bundleDnItem in bundleCandidates)
+                {
+                    var soItem = linkedSo?.Items.FirstOrDefault(si => si.Id == bundleDnItem.SalesOrderItemId!.Value);
+                    var isBundle = (soItem?.ProductBundleId.HasValue ?? false)
+                        || await bundleService.IsBundleItemAsync(bundleDnItem.ItemId, isReturn: isCancel);
+                    if (!isBundle)
+                        continue;
+
+                    var components = await bundleService.DecomposeAsync(
+                        bundleDnItem.ItemId,
+                        Math.Abs(bundleDnItem.Quantity),
+                        bundleDnItem.UnitPrice,
+                        bundleDnItem.WarehouseId ?? dn.WarehouseId,
+                        bundleDnItem.SalesOrderItemId,
+                        isReturn: isCancel,
+                        productBundleId: soItem?.ProductBundleId);
+
+                    foreach (var comp in components)
+                    {
+                        var remaining = Math.Abs(comp.Qty);
+                        var matchingRows = pl.Items
+                            .Where(pi => pi.SourceDocumentItemId == bundleDnItem.SalesOrderItemId
+                                      && pi.ItemId == comp.ComponentItemId)
+                            .ToList();
+                        if (matchingRows.Count == 0)
+                            continue;
+
+                        if (isCancel)
+                        {
+                            foreach (var row in matchingRows)
+                            {
+                                if (remaining <= 0) break;
+                                var toRevert = Math.Min(remaining, row.DeliveredQty);
+                                if (toRevert > 0)
+                                {
+                                    row.RevertDelivery(toRevert);
+                                    remaining -= toRevert;
+                                    modified = true;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            foreach (var row in matchingRows)
+                            {
+                                if (remaining <= 0) break;
+                                var available = Math.Max(0m, row.Qty - row.DeliveredQty);
+                                var toRecord = Math.Min(remaining, available);
+                                if (toRecord > 0)
+                                {
+                                    row.RecordDelivery(toRecord);
+                                    remaining -= toRecord;
+                                    modified = true;
+                                }
+                            }
+                            if (remaining > 0)
+                            {
+                                matchingRows[^1].RecordDelivery(remaining);
+                                modified = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (modified)
+            {
+                await plRepo.UpdateAsync(pl, autoSave: true);
+            }
+        }
+    }
+}

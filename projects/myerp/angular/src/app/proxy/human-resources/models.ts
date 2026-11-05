@@ -1,0 +1,581 @@
+import type { AuditedEntityDto, EntityDto, FullAuditedEntityDto, PagedAndSortedResultRequestDto } from '@abp/ng.core';
+import type { AttendanceStatus } from './attendance-status.enum';
+import type { EmploymentStatus } from './employment-status.enum';
+import type { LeaveApplicationStatus } from './leave-application-status.enum';
+import type { ShiftAssignmentStatus } from './shift-assignment-status.enum';
+
+export interface AttendanceDto extends FullAuditedEntityDto<string> {
+  companyId?: string;
+  employeeId?: string;
+  employeeName?: string | null;
+  date?: string;
+  status?: AttendanceStatus;
+  shiftTypeId?: string | null;
+  inTime?: string | null;
+  outTime?: string | null;
+  leaveApplicationId?: string | null;
+}
+
+export interface BulkLeaveAllocationDto {
+  companyId: string;
+  leaveTypeId: string;
+  fromDate: string;
+  toDate: string;
+  totalLeavesPerEmployee: number;
+}
+
+export interface ChangeEmployeeStatusDto {
+  status: EmploymentStatus;
+  dateOfResignation?: string | null;
+}
+
+export interface CreateAttendanceDto {
+  companyId?: string;
+  employeeId?: string;
+  date?: string;
+  status?: AttendanceStatus;
+  shiftTypeId?: string | null;
+  inTime?: string | null;
+  outTime?: string | null;
+}
+
+export interface CreateExpenseClaimDto {
+  companyId?: string;
+  employeeId?: string;
+  employeeName?: string | null;
+  postingDate?: string;
+  expenseType?: string | null;
+  expenses?: CreateExpenseDetailDto[];
+}
+
+export interface CreateExpenseDetailDto {
+  expenseDate?: string;
+  description?: string;
+  amount?: number;
+}
+
+export interface CreateHolidayDto {
+  holidayDate?: string;
+  description?: string;
+  isWeeklyOff?: boolean;
+}
+
+export interface CreateHolidayListDto {
+  companyId?: string;
+  name?: string;
+  year?: number;
+  weeklyOff?: string | null;
+  isDefault?: boolean;
+  holidays?: CreateHolidayDto[];
+}
+
+export interface CreateLeaveAllocationDto {
+  companyId: string;
+  employeeId: string;
+  leaveTypeId: string;
+  fromDate: string;
+  toDate: string;
+  totalLeavesAllocated: number;
+  carryForwardDays?: number;
+}
+
+export interface CreateLeaveApplicationDto {
+  companyId: string;
+  employeeId: string;
+  employeeName?: string | null;
+  leaveTypeId: string;
+  leaveTypeName?: string | null;
+  fromDate: string;
+  toDate: string;
+  totalLeaveDays: number;
+  halfDay?: boolean;
+  reason?: string | null;
+  leaveApproverId?: string | null;
+}
+
+export interface CreateLeaveTypeDto {
+  name: string;
+  maxDaysAllowed: number;
+  isPaidLeave?: boolean;
+  requiresApproval?: boolean;
+  allowCarryForward?: boolean;
+  maxCarryForwardDays?: number;
+}
+
+export interface CreateLoanDto {
+  companyId?: string;
+  employeeId?: string;
+  loanType?: number;
+  interestMethod?: number;
+  loanAmount?: number;
+  annualInterestRate?: number;
+  tenureMonths?: number;
+  gracePeriodMonths?: number;
+}
+
+export interface CreatePayrollBankEntryDto {
+  payrollEntryId: string;
+  bankAccountId: string;
+  referenceNumber?: string | null;
+  paymentDate?: string | null;
+}
+
+export interface CreatePayrollEntryDto {
+  companyId: string;
+  year: number;
+  month: number;
+}
+
+export interface CreateSalarySlipDto {
+  companyId: string;
+  employeeId: string;
+  postingDate: string;
+  startDate: string;
+  endDate: string;
+  totalWorkingDays?: number;
+  paymentDays?: number;
+  leavesWithoutPay?: number;
+  earnings?: SalarySlipComponentInputDto[];
+  deductions?: SalarySlipComponentInputDto[];
+}
+
+export interface CreateSalaryStructureDetailDto {
+  salaryComponentId?: string;
+  componentName?: string;
+  amount?: number;
+  formula?: string | null;
+}
+
+export interface CreateSalaryStructureDto {
+  companyId?: string;
+  name?: string;
+  isHourlyBased?: boolean;
+  payrollFrequency?: string;
+  description?: string | null;
+  details?: CreateSalaryStructureDetailDto[];
+}
+
+export interface CreateShiftAssignmentDto {
+  companyId?: string;
+  employeeId?: string;
+  shiftTypeId?: string;
+  startDate?: string;
+  endDate?: string | null;
+}
+
+export interface CreateShiftTypeDto {
+  companyId?: string;
+  name?: string;
+  startTime?: string;
+  endTime?: string;
+  holidayListId?: string | null;
+}
+
+export interface CreateUpdateDepartmentDto {
+  name?: string;
+  companyId?: string;
+  parentId?: string | null;
+  isGroup?: boolean;
+  isActive?: boolean;
+}
+
+export interface CreateUpdateDesignationDto {
+  name?: string;
+  description?: string | null;
+}
+
+export interface CreateUpdateEmployeeDto {
+  companyId: string;
+  firstName: string;
+  lastName?: string | null;
+  dateOfBirth?: string | null;
+  dateOfJoining?: string | null;
+  phone?: string | null;
+  email?: string | null;
+  designation?: string | null;
+  department?: string | null;
+  gender?: string | null;
+  reportsToEmployeeId?: string | null;
+  userId?: string | null;
+  epfNumber?: string | null;
+  socsoNumber?: string | null;
+  taxNumber?: string | null;
+}
+
+export interface CreateUpdateEmployeeGroupDto {
+  companyId: string;
+  groupName: string;
+  isDisabled?: boolean;
+  items?: CreateUpdateEmployeeGroupItemDto[];
+}
+
+export interface CreateUpdateEmployeeGroupItemDto {
+  employeeId: string;
+  employeeName: string;
+  designation?: string | null;
+}
+
+export interface CreateUpdateLeaveTypeDto {
+  name?: string;
+  maxDaysAllowed?: number;
+  requiresApproval?: boolean;
+  allowCarryForward?: boolean;
+  maxCarryForwardDays?: number;
+  carryForwardExpiryMonths?: number;
+  isPaidLeave?: boolean;
+  includeHolidays?: boolean;
+  allowNegativeBalance?: boolean;
+}
+
+export interface CreateUpdateSalaryComponentDto {
+  name?: string;
+  abbreviation?: string | null;
+  componentType?: number;
+  isStatutory?: boolean;
+  isTaxApplicable?: boolean;
+  dependsOnPaymentDays?: boolean;
+  defaultAccountId?: string | null;
+  description?: string | null;
+}
+
+export interface DepartmentDto extends EntityDto<string> {
+  name?: string;
+  companyId?: string;
+  parentId?: string | null;
+  isGroup?: boolean;
+  isActive?: boolean;
+}
+
+export interface DesignationDto extends EntityDto<string> {
+  name?: string;
+  description?: string | null;
+}
+
+export interface DisburseLoanDto {
+  disbursementDate?: string;
+  repaymentStartDate?: string;
+}
+
+export interface EmployeeDto extends FullAuditedEntityDto<string> {
+  companyId?: string;
+  employeeId?: string;
+  firstName?: string;
+  lastName?: string | null;
+  fullName?: string | null;
+  dateOfBirth?: string | null;
+  dateOfJoining?: string | null;
+  dateOfResignation?: string | null;
+  citizenship?: string | null;
+  phone?: string | null;
+  email?: string | null;
+  designation?: string | null;
+  department?: string | null;
+  gender?: string | null;
+  status?: string | null;
+  reportsToEmployeeId?: string | null;
+  userId?: string | null;
+}
+
+export interface EmployeeGroupDto extends FullAuditedEntityDto<string> {
+  companyId?: string;
+  groupName?: string;
+  isDisabled?: boolean;
+  items?: EmployeeGroupItemDto[];
+}
+
+export interface EmployeeGroupItemDto extends EntityDto<string> {
+  employeeGroupId?: string;
+  employeeId?: string;
+  employeeName?: string;
+  designation?: string | null;
+}
+
+export interface ExpenseClaimDetailDto {
+  id?: string;
+  expenseDate?: string;
+  description?: string;
+  amount?: number;
+}
+
+export interface ExpenseClaimDto extends EntityDto<string> {
+  companyId?: string;
+  employeeId?: string;
+  employeeName?: string | null;
+  postingDate?: string;
+  expenseType?: string | null;
+  totalClaimedAmount?: number;
+  totalSanctionedAmount?: number;
+  totalAmountReimbursed?: number;
+  status?: number;
+  expenses?: ExpenseClaimDetailDto[];
+}
+
+export interface GetAttendanceListDto extends PagedAndSortedResultRequestDto {
+  companyId?: string | null;
+  employeeId?: string | null;
+  fromDate?: string | null;
+  toDate?: string | null;
+  status?: AttendanceStatus | null;
+}
+
+export interface GetEmployeeGroupListDto extends PagedAndSortedResultRequestDto {
+  companyId?: string | null;
+  isDisabled?: boolean | null;
+  filter?: string | null;
+}
+
+export interface GetEmployeeListDto extends PagedAndSortedResultRequestDto {
+  filter?: string | null;
+  companyId?: string | null;
+}
+
+export interface GetLeaveAllocationListDto extends PagedAndSortedResultRequestDto {
+  employeeId?: string | null;
+  companyId?: string | null;
+  leaveTypeId?: string | null;
+}
+
+export interface GetLeaveListDto extends PagedAndSortedResultRequestDto {
+  employeeId?: string | null;
+  status?: LeaveApplicationStatus | null;
+}
+
+export interface GetPayrollListDto extends PagedAndSortedResultRequestDto {
+  companyId?: string | null;
+  filter?: string | null;
+  status?: string | null;
+}
+
+export interface GetShiftAssignmentListDto extends PagedAndSortedResultRequestDto {
+  companyId?: string | null;
+  employeeId?: string | null;
+}
+
+export interface HolidayDto {
+  id?: string;
+  holidayDate?: string;
+  description?: string;
+  isWeeklyOff?: boolean;
+}
+
+export interface HolidayListDto extends EntityDto<string> {
+  companyId?: string;
+  name?: string;
+  year?: number;
+  weeklyOff?: string | null;
+  isDefault?: boolean;
+  holidays?: HolidayDto[];
+  creationTime?: string;
+}
+
+export interface LeaveAllocationDto extends EntityDto<string> {
+  companyId?: string;
+  employeeId?: string;
+  leaveTypeId?: string;
+  fromDate?: string;
+  toDate?: string;
+  totalLeavesAllocated?: number;
+  carryForwardDays?: number;
+  leavesUsed?: number;
+  balance?: number;
+}
+
+export interface LeaveApplicationDto extends AuditedEntityDto<string> {
+  companyId?: string;
+  employeeId?: string;
+  employeeName?: string | null;
+  leaveTypeId?: string;
+  leaveTypeName?: string | null;
+  fromDate?: string;
+  toDate?: string;
+  totalLeaveDays?: number;
+  halfDay?: boolean;
+  reason?: string | null;
+  status?: LeaveApplicationStatus;
+  leaveApproverId?: string | null;
+}
+
+export interface LeaveTypeDetailDto extends EntityDto<string> {
+  name?: string;
+  maxDaysAllowed?: number;
+  isActive?: boolean;
+  requiresApproval?: boolean;
+  allowCarryForward?: boolean;
+  maxCarryForwardDays?: number;
+  carryForwardExpiryMonths?: number;
+  isPaidLeave?: boolean;
+  includeHolidays?: boolean;
+  allowNegativeBalance?: boolean;
+}
+
+export interface LeaveTypeDto extends EntityDto<string> {
+  name?: string;
+  maxDaysAllowed?: number;
+  isPaidLeave?: boolean;
+  allowCarryForward?: boolean;
+  requiresApproval?: boolean;
+}
+
+export interface LoanDto extends EntityDto<string> {
+  companyId?: string;
+  employeeId?: string;
+  loanNumber?: string;
+  loanType?: number;
+  interestMethod?: number;
+  status?: number;
+  loanAmount?: number;
+  annualInterestRate?: number;
+  tenureMonths?: number;
+  gracePeriodMonths?: number;
+  emi?: number;
+  totalAmountRepaid?: number;
+  outstandingBalance?: number;
+  disbursementDate?: string | null;
+  repaymentStartDate?: string | null;
+  schedule?: LoanRepaymentScheduleDto[];
+}
+
+export interface LoanRepaymentScheduleDto {
+  paymentDate?: string;
+  principalAmount?: number;
+  interestAmount?: number;
+  totalPayment?: number;
+  outstandingBalance?: number;
+  isPaid?: boolean;
+}
+
+export interface PayrollBankEntryResultDto {
+  journalEntryId?: string;
+  journalEntryNumber?: string;
+  totalAmount?: number;
+  employeeCount?: number;
+}
+
+export interface PayrollEmployeePreviewDto {
+  employeeId?: string;
+  employeeName?: string;
+  department?: string | null;
+  designation?: string | null;
+  basicSalary?: number;
+}
+
+export interface PayrollEntryDto extends EntityDto<string> {
+  companyId?: string;
+  payrollNumber?: string;
+  year?: number;
+  month?: number;
+  periodLabel?: string;
+  postingDate?: string;
+  totalGrossSalary?: number;
+  totalDeductions?: number;
+  totalNetSalary?: number;
+  totalEmployerContributions?: number;
+  status?: string;
+  lines?: PayrollEntryLineDto[];
+}
+
+export interface PayrollEntryLineDto {
+  id?: string;
+  employeeId?: string;
+  employeeName?: string;
+  grossSalary?: number;
+  epfEmployee?: number;
+  epfEmployer?: number;
+  socsoEmployee?: number;
+  socsoEmployer?: number;
+  eisEmployee?: number;
+  eisEmployer?: number;
+  pcb?: number;
+  totalDeductions?: number;
+  netSalary?: number;
+}
+
+export interface PayrollPreviewDto {
+  employeeCount?: number;
+  estimatedGrossTotal?: number;
+  employees?: PayrollEmployeePreviewDto[];
+}
+
+export interface RecordRepaymentDto {
+  principalAmount?: number;
+  interestAmount?: number;
+  totalAmount?: number;
+}
+
+export interface SalaryComponentDto extends EntityDto<string> {
+  name?: string;
+  abbreviation?: string | null;
+  componentType?: number;
+  isStatutory?: boolean;
+  isTaxApplicable?: boolean;
+  dependsOnPaymentDays?: boolean;
+  defaultAccountId?: string | null;
+  isActive?: boolean;
+  description?: string | null;
+}
+
+export interface SalarySlipComponentDto extends EntityDto<string> {
+  salaryComponentId?: string;
+  componentName?: string;
+  amount?: number;
+  isStatutory?: boolean;
+}
+
+export interface SalarySlipComponentInputDto {
+  salaryComponentId: string;
+  componentName: string;
+  amount: number;
+  isStatutory?: boolean;
+}
+
+export interface SalarySlipDto extends EntityDto<string> {
+  companyId?: string;
+  employeeId?: string;
+  employeeName?: string | null;
+  postingDate?: string;
+  startDate?: string;
+  endDate?: string;
+  grossAmount?: number;
+  totalDeductions?: number;
+  netAmount?: number;
+  status?: number;
+  earnings?: SalarySlipComponentDto[];
+  deductions?: SalarySlipComponentDto[];
+}
+
+export interface SalaryStructureDetailDto {
+  id?: string;
+  salaryComponentId?: string;
+  componentName?: string;
+  amount?: number;
+  formula?: string | null;
+}
+
+export interface SalaryStructureDto extends EntityDto<string> {
+  companyId?: string;
+  name?: string;
+  isHourlyBased?: boolean;
+  payrollFrequency?: string;
+  isActive?: boolean;
+  description?: string | null;
+  details?: SalaryStructureDetailDto[];
+}
+
+export interface ShiftAssignmentDto extends FullAuditedEntityDto<string> {
+  companyId?: string;
+  employeeId?: string;
+  employeeName?: string | null;
+  shiftTypeId?: string;
+  shiftTypeName?: string | null;
+  startDate?: string;
+  endDate?: string | null;
+  status?: ShiftAssignmentStatus;
+}
+
+export interface ShiftTypeDto extends FullAuditedEntityDto<string> {
+  companyId?: string;
+  name?: string;
+  startTime?: string;
+  endTime?: string;
+  holidayListId?: string | null;
+}

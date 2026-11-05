@@ -1,0 +1,55 @@
+<abp-page [title]="'::Warehouses' | abpLocalization">
+  <div class="d-flex justify-content-end gap-2 mb-3">
+    <button class="btn btn-primary btn-sm" (click)="createWarehouse()">
+      <i class="fa fa-plus me-1"></i> {{ '::NewWarehouse' | abpLocalization }}
+    </button>
+  </div>
+
+  <div class="card">
+    <div class="card-body">
+      @if (isLoading) {
+        <div class="text-center py-5">
+          <div class="spinner-border text-primary" role="status">
+            <span class="visually-hidden">Loading...</span>
+          </div>
+        </div>
+      } @else if (warehouses.length === 0) {
+        <div class="text-center py-5">
+          <i class="fa fa-inbox fa-3x text-muted mb-3 d-block"></i>
+          <h6 class="text-muted">{{ '::NoRecordsFound' | abpLocalization }}</h6>
+          <p class="text-muted small mb-3">{{ '::NoWarehousesYet' | abpLocalization }}</p>
+          <button class="btn btn-primary btn-sm" routerLink="new">
+            <i class="fa fa-plus me-1"></i>{{ '::NewWarehouse' | abpLocalization }}
+          </button>
+        </div>
+      } @else {
+        <div class="table-responsive">
+                    <table class="table table-hover w-100">
+            <thead>
+              <tr>
+                <th>{{ '::Code' | abpLocalization }}</th>
+                <th style="min-width: 150px;">{{ '::Name' | abpLocalization }}</th>
+                <th>{{ '::Branch' | abpLocalization }}</th>
+                <th>{{ '::Status' | abpLocalization }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (w of warehouses; track w.id ?? $index) {
+                <tr>
+                  <td class="font-monospace">{{ w.warehouseCode }}</td>
+                  <td class="text-truncate" style="max-width: 200px;" [title]="w.name">
+                    <a [routerLink]="['/inventory/warehouses', w.id, 'edit']" class="text-primary text-decoration-none">{{ w.name }}</a>
+                  </td>
+                  <td>{{ w.branchId ? (branchNames()[w.branchId] || '—') : '—' }}</td>
+                  <td><app-status-badge [status]="w.isActive ? 'Active' : 'Inactive'" /></td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        </div>
+      }
+    </div>
+  </div>
+
+  <app-pagination [totalCount]="totalCount" [pageSize]="pageSize" [currentPage]="currentPage" (pageChange)="onPageChange($event)" />
+</abp-page>

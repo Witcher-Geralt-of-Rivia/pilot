@@ -1,0 +1,229 @@
+using System;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Accounting.Entities;
+using MyERP.Inventory.Entities;
+using MyERP.Permissions;
+using Volo.Abp;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+
+using MyERP;
+
+namespace MyERP.Accounting;
+
+public class AccountAppService :
+    CrudAppService<
+        Account,
+        AccountDto,
+        Guid,
+        GetAccountListDto,
+        CreateUpdateAccountDto>,
+    IAccountAppService
+{
+    public AccountAppService(IRepository<Account, Guid> repository)
+        : base(repository)
+    {
+        GetPolicyName = MyERPPermissions.Accounts.Default;
+        GetListPolicyName = MyERPPermissions.Accounts.Default;
+        CreatePolicyName = MyERPPermissions.Accounts.Create;
+        UpdatePolicyName = MyERPPermissions.Accounts.Edit;
+        DeletePolicyName = MyERPPermissions.Accounts.Delete;
+    }
+
+    public override async Task<PagedResultDto<AccountDto>> GetListAsync(GetAccountListDto input)
+    {
+        var queryable = await Repository.GetQueryableAsync();
+
+        if (input.CompanyId.HasValue && input.CompanyId.Value != Guid.Empty)
+        {
+            queryable = queryable.Where(a => a.CompanyId == input.CompanyId.Value);
+        }
+
+        if (input.AccountSubType.HasValue)
+        {
+            queryable = queryable.Where(a => a.AccountSubType == input.AccountSubType.Value);
+        }
+
+        if (input.IsGroup.HasValue)
+        {
+            queryable = queryable.Where(a => a.IsGroup == input.IsGroup.Value);
+        }
+
+        if (!string.IsNullOrWhiteSpace(input.Filter))
+        {
+            queryable = queryable.Where(a =>
+                a.AccountName.Contains(input.Filter)
+                || a.AccountCode.Contains(input.Filter));
+        }
+
+        var totalCount = queryable.Count();
+        var items = queryable
+            .OrderBy(a => a.AccountCode)
+            .ThenBy(a => a.AccountName)
+            .Skip(input.SkipCount)
+            .Take(input.MaxResultCount)
+            .ToList();
+
+        return new PagedResultDto<AccountDto>(
+            totalCount,
+            items.Select(ObjectMapper.Map<Account, AccountDto>).ToList());
+    }
+
+    public override async Task<AccountDto> CreateAsync(CreateUpdateAccountDto input)
+    {
+        if (string.IsNullOrWhiteSpace(input.Currency))
+        {
+            var companyRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.Company, Guid>>();
+            var company = await companyRepo.FindAsync(input.CompanyId);
+            if (company != null)
+            {
+                input.Currency = company.CurrencyCode;
+            }
+        }
+        return await base.CreateAsync(input);
+    }
+
+    protected override Account MapToEntity(CreateUpdateAccountDto input)
+    {
+        var entity = new Account(
+            GuidGenerator.Create(),
+            input.CompanyId,
+            input.AccountCode,
+            input.AccountName,
+            input.AccountType,
+            CurrentTenant.Id);
+        MapUpdateFields(input, entity);
+        return entity;
+    }
+
+    protected override void MapToEntity(CreateUpdateAccountDto input, Account entity)
+    {
+        entity.SetAccountCode(input.AccountCode);
+        entity.SetAccountName(input.AccountName);
+        MapUpdateFields(input, entity);
+    }
+
+    private static void MapUpdateFields(CreateUpdateAccountDto input, Account entity)
+    {
+        entity.AccountType = input.AccountType;
+        entity.AccountSubType = input.AccountSubType;
+        entity.ParentAccountId = input.ParentAccountId;
+        entity.IsGroup = input.IsGroup;
+        entity.Currency = input.Currency;
+        entity.Description = input.Description;
+        entity.IsFrozen = input.IsFrozen;
+        entity.IsActive = input.IsActive;
+    }
+
+    /// <summary>
+    /// Override UpdateAsync to validate stock account type change.
+    /// Per ERPNext PR #57283: cannot change account type FROM 'Stock' when SLE exists
+    /// for any warehouse using this account.
+    /// </summary>
+    public override async Task<AccountDto> UpdateAsync(Guid id, CreateUpdateAccountDto input)
+    {
+        var entity = await Repository.GetAsync(id);
+
+        // Block changing account sub-type from Stock when stock transactions exist
+        // Per ERPNext PR #57283
+        if (entity.AccountSubType == AccountSubType.Stock && input.AccountSubType != AccountSubType.Stock)
+        {
+            var sleRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<StockLedgerEntry, Guid>>();
+            var sleQuery = await sleRepo.GetQueryableAsync();
+            var hasSle = sleQuery.Any(sle => sle.CompanyId == entity.CompanyId);
+
+            if (hasSle)
+            {
+                throw new BusinessException("MyERP:02028")
+                    .WithData("accountName", entity.AccountName);
+            }
+        }
+
+        return await base.UpdateAsync(id, input);
+    }
+
+    /// <summary>
+    /// Prevent deletion of accounts with GL entries (Journal Entry lines).
+    /// Per DO-NOT: cannot delete accounts that have been used in transactions.
+    /// </summary>
+    public override async Task DeleteAsync(Guid id)
+    {
+        var jeRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<JournalEntry, Guid>>();
+        var jeQuery = await jeRepo.GetQueryableAsync();
+        var hasGLEntries = jeQuery.Any(je =>
+            je.Lines.Any(l => l.AccountId == id));
+
+        if (hasGLEntries)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.AccountCannotBeDeleted)
+                .WithData("reason", "Account has been used in Journal Entries. Deactivate instead of deleting.");
+        }
+
+        // Check if account is a group (has children)
+        var account = await Repository.GetAsync(id);
+        if (account.IsGroup)
+        {
+            var childQuery = await Repository.GetQueryableAsync();
+            var hasChildren = childQuery.Any(a => a.ParentAccountId == id);
+            if (hasChildren)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.AccountCannotBeDeleted)
+                    .WithData("reason", "Group account has child accounts. Delete children first.");
+            }
+        }
+
+        await base.DeleteAsync(id);
+    }
+
+    /// <summary>
+    /// Returns the hierarchical Chart of Accounts tree for a company (ERPNext PR #58520).
+    /// </summary>
+    public async Task<System.Collections.Generic.List<AccountTreeNodeDto>> GetTreeAsync(Guid companyId, bool includeDisabled = false)
+    {
+        var queryable = await Repository.GetQueryableAsync();
+        var query = queryable.Where(a => a.CompanyId == companyId);
+        if (!includeDisabled)
+        {
+            query = query.Where(a => a.IsActive);
+        }
+
+        var accounts = query
+            .OrderBy(a => a.AccountCode)
+            .ToList();
+
+        var nodes = accounts.Select(a => new AccountTreeNodeDto
+        {
+            Id = a.Id,
+            CompanyId = a.CompanyId,
+            AccountCode = a.AccountCode,
+            AccountName = a.AccountName,
+            AccountType = a.AccountType,
+            AccountSubType = a.AccountSubType,
+            ParentAccountId = a.ParentAccountId,
+            IsGroup = a.IsGroup,
+            Currency = a.Currency,
+            IsFrozen = a.IsFrozen,
+            IsActive = a.IsActive,
+            Balance = 0
+        }).ToList();
+
+        var nodeMap = nodes.ToDictionary(n => n.Id);
+        var rootNodes = new System.Collections.Generic.List<AccountTreeNodeDto>();
+
+        foreach (var node in nodes)
+        {
+            if (node.ParentAccountId.HasValue && nodeMap.TryGetValue(node.ParentAccountId.Value, out var parent))
+            {
+                parent.Children.Add(node);
+            }
+            else
+            {
+                rootNodes.Add(node);
+            }
+        }
+
+        return rootNodes;
+    }
+}

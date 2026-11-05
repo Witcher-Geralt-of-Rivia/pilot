@@ -1,0 +1,353 @@
+import { CompanyCurrencyPipe } from '../../shared/pipes/company-currency.pipe';
+import { Component, inject, OnInit, signal, computed } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { FormsModule } from '@angular/forms';
+import { ActivatedRoute } from '@angular/router';
+import { LocalizationPipe, LocalizationService } from '@abp/ng.core';
+import { PageModule } from '@abp/ng.components/page';
+import { ToasterService } from '@abp/ng.theme.shared';
+import { PosService } from '../../proxy/sales/pos.service';
+import type { PosItemDto, ParentItemGroupDto } from '../../proxy/sales/models';
+import { debounceTime, Subject } from 'rxjs';
+
+interface CartItem {
+  itemId: string;
+  itemName: string;
+  qty: number;
+  rate: number;
+  amount: number;
+  discount: number;
+  taxRate: number;
+  taxAmount: number;
+}
+
+interface PaymentRow {
+  mode: string;
+  amount: number;
+}
+
+interface HeldOrder {
+  id: string;
+  customer: string;
+  items: CartItem[];
+  payments: PaymentRow[];
+  heldAt: Date;
+}
+
+@Component({
+  selector: 'app-pos',
+  standalone: true,
+  imports: [CompanyCurrencyPipe, CommonModule, FormsModule, PageModule, LocalizationPipe],
+  templateUrl: './pos.component.html',
+  styleUrls: ['./pos.component.scss'],
+})
+export class PosComponent implements OnInit {
+  private posService = inject(PosService);
+  private route = inject(ActivatedRoute);
+  private toaster = inject(ToasterService);
+  private localization = inject(LocalizationService);
+
+  // Search & Items
+  searchQuery = '';
+  items = signal<PosItemDto[]>([]);
+  itemGroups = signal<ParentItemGroupDto[]>([]);
+  selectedItemGroupId = signal<string | null>(null);
+  posProfileId = signal<string | null>(null);
+  private searchSubject = new Subject<string>();
+  private searchEpoch = 0;
+
+  // Cart
+  cart: CartItem[] = [];
+  netTotal = 0;
+  taxTotal = 0;
+  discountTotal = 0;
+  grandTotal = 0;
+
+  // Payment
+  payments: PaymentRow[] = [{ mode: 'Cash', amount: 0 }];
+  selectedPaymentMode = signal<string>('');
+  totalPaid = computed(() => this.payments.reduce((s, p) => s + (p.amount || 0), 0));
+
+  // Customer
+  customerId: string | null = null;
+  customerName = '';
+  customerSearch = '';
+
+  // State
+  isProcessing = false;
+  lastInvoice: string | null = null;
+  companyId = '';
+
+  // Hold / Resume
+  heldOrders: HeldOrder[] = [];
+  showHeldOrders = false;
+
+  // Tax rate from settings (SST for Malaysia)
+  defaultTaxRate = 6; // SST 6% — should come from company settings
+
+  // Payment modes available
+  paymentModes = ['Cash', 'Credit Card', 'Bank Transfer', 'E-Wallet', 'Cheque'];
+
+  ngOnInit(): void {
+    const profileId = this.route.snapshot.queryParams['posProfileId'] || null;
+    this.posProfileId.set(profileId);
+    if (profileId) {
+      this.posService.getItemGroups(profileId).subscribe((groups) => {
+        this.itemGroups.set(groups ?? []);
+      });
+      // Deterministic default item group via LCA (PR #59720)
+      this.posService.getParentItemGroup(profileId).subscribe((parent) => {
+        if (parent?.id && parent.id !== '00000000-0000-0000-0000-000000000000') {
+          this.selectedItemGroupId.set(parent.id);
+          this.loadItems();
+        }
+      });
+    }
+
+    this.loadItems();
+
+    this.searchSubject.pipe(debounceTime(300)).subscribe(() => {
+      this.loadItems();
+    });
+
+    // Load held orders from session storage
+    const saved = sessionStorage.getItem('pos_held_orders');
+    if (saved) this.heldOrders = JSON.parse(saved);
+  }
+
+  selectItemGroup(id: string | null): void {
+    this.selectedItemGroupId.set(id);
+    this.loadItems();
+  }
+
+  loadItems(): void {
+    const epoch = ++this.searchEpoch;
+    this.posService.searchItems({
+      search: this.searchQuery,
+      posProfileId: this.posProfileId() ?? undefined,
+      itemGroupId: this.selectedItemGroupId() ?? undefined,
+      maxResultCount: 30
+    }).subscribe((result) => {
+      if (epoch === this.searchEpoch) {
+        this.items.set(result.items ?? []);
+      }
+    });
+  }
+
+  onSearchChange(query: string): void {
+    this.searchSubject.next(query);
+  }
+
+  addToCart(item: PosItemDto): void {
+    const rate = item.sellingPrice ?? 0;
+    // Per ERPNext PR #60580: merge repeat clicks with matching rate precision
+    const existing = this.cart.find(c => c.itemId === item.id && Math.abs(c.rate - rate) < 0.001);
+    if (existing) {
+      existing.qty++;
+      existing.amount = existing.qty * existing.rate * (1 - existing.discount / 100);
+      existing.taxAmount = existing.amount * existing.taxRate / 100;
+    } else {
+      const taxRate = this.defaultTaxRate;
+      this.cart.push({
+        itemId: item.id!,
+        itemName: item.itemName!,
+        qty: 1,
+        rate,
+        amount: rate,
+        discount: 0,
+        taxRate,
+        taxAmount: rate * taxRate / 100,
+      });
+    }
+    this.recalculate();
+  }
+
+  removeFromCart(index: number): void {
+    this.cart.splice(index, 1);
+    this.recalculate();
+  }
+
+  updateQty(index: number, qty: number): void {
+    if (qty <= 0) { this.removeFromCart(index); return; }
+    const item = this.cart[index];
+    item.qty = qty;
+    item.amount = qty * item.rate * (1 - item.discount / 100);
+    item.taxAmount = item.amount * item.taxRate / 100;
+    this.recalculate();
+  }
+
+  updateDiscount(index: number, discount: number): void {
+    const item = this.cart[index];
+    item.discount = Math.min(100, Math.max(0, discount));
+    item.amount = item.qty * item.rate * (1 - item.discount / 100);
+    item.taxAmount = item.amount * item.taxRate / 100;
+    this.recalculate();
+  }
+
+  recalculate(): void {
+    this.netTotal = this.cart.reduce((s, c) => s + c.amount, 0);
+    this.taxTotal = this.cart.reduce((s, c) => s + c.taxAmount, 0);
+    this.discountTotal = this.cart.reduce((s, c) => s + (c.qty * c.rate - c.amount), 0);
+    this.grandTotal = this.netTotal + this.taxTotal;
+
+    // Auto-fill first payment row with grand total if only one payment mode
+    if (this.payments.length === 1 && this.payments[0].amount === 0) {
+      this.payments[0].amount = this.grandTotal;
+    }
+  }
+
+  // Payment methods
+  selectPaymentMode(mode: string): void {
+    this.selectedPaymentMode.set(mode);
+    if (this.payments.length > 0) {
+      this.payments[0].mode = mode;
+    }
+  }
+
+  addPaymentRow(): void {
+    this.payments.push({ mode: 'Cash', amount: 0 });
+  }
+
+  removePaymentRow(index: number): void {
+    if (this.payments.length > 1) this.payments.splice(index, 1);
+  }
+
+  get changeAmount(): number {
+    const paid = this.payments.reduce((s, p) => s + (p.amount || 0), 0);
+    return Math.max(0, paid - this.grandTotal);
+  }
+
+  get outstandingAmount(): number {
+    const paid = this.payments.reduce((s, p) => s + (p.amount || 0), 0);
+    return Math.max(0, this.grandTotal - paid);
+  }
+
+  // Hold / Resume
+  holdOrder(): void {
+    if (this.cart.length === 0) return;
+    const order: HeldOrder = {
+      id: Date.now().toString(36),
+      customer: this.customerName || 'Walk-in',
+      items: [...this.cart],
+      payments: [...this.payments],
+      heldAt: new Date(),
+    };
+    this.heldOrders.push(order);
+    sessionStorage.setItem('pos_held_orders', JSON.stringify(this.heldOrders));
+    this.makeNewInvoice();
+    this.toaster.info('::OrderHeld');
+  }
+
+  resumeOrder(index: number): void {
+    const order = this.heldOrders[index];
+    this.cart = [...order.items];
+    this.payments = [...order.payments];
+    this.selectedPaymentMode.set(this.payments[0]?.mode ?? '');
+    this.customerName = order.customer;
+    this.heldOrders.splice(index, 1);
+    sessionStorage.setItem('pos_held_orders', JSON.stringify(this.heldOrders));
+    this.showHeldOrders = false;
+    this.recalculate();
+  }
+
+  deleteHeldOrder(index: number): void {
+    this.heldOrders.splice(index, 1);
+    sessionStorage.setItem('pos_held_orders', JSON.stringify(this.heldOrders));
+  }
+
+  makeNewInvoice(): void {
+    this.clearCart();
+    this.lastInvoice = null;
+    this.loadItems();
+  }
+
+  clearCart(): void {
+    this.cart = [];
+    this.payments = [{ mode: 'Cash', amount: 0 }];
+    this.selectedPaymentMode.set('');
+    this.customerId = null;
+    this.customerName = '';
+    this.netTotal = 0;
+    this.taxTotal = 0;
+    this.discountTotal = 0;
+    this.grandTotal = 0;
+  }
+
+  // Barcode Scanner
+  barcodeInput = '';
+  barcodeScanning = signal(false);
+  lastScanResult = signal<{ success: boolean; message: string } | null>(null);
+
+  onBarcodeScanned(): void {
+    const barcode = this.barcodeInput.trim();
+    if (!barcode) return;
+    this.barcodeScanning.set(true);
+    this.lastScanResult.set(null);
+    this.posService.scanBarcode({ barcode, companyId: this.companyId || undefined } as any).subscribe({
+      next: (result: any) => {
+        this.barcodeScanning.set(false);
+        if (result?.itemId) {
+          const item: PosItemDto = { id: result.itemId, itemName: result.itemName, itemCode: result.itemCode, sellingPrice: result.rate ?? 0 };
+          this.addToCart(item);
+          this.lastScanResult.set({ success: true, message: result.itemName ?? barcode });
+        } else {
+          this.lastScanResult.set({ success: false, message: this.localization.instant('::ItemNotFound') });
+          this.toaster.warn('::ItemNotFound');
+        }
+        this.barcodeInput = '';
+      },
+      error: () => {
+        this.barcodeScanning.set(false);
+        this.lastScanResult.set({ success: false, message: this.localization.instant('::ScanFailed') });
+        this.barcodeInput = '';
+      },
+    });
+  }
+
+  onBarcodeKeydown(event: KeyboardEvent): void {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      this.onBarcodeScanned();
+    }
+  }
+
+  completeSale(): void {
+    if (this.cart.length === 0) {
+      this.toaster.warn('::CartIsEmpty');
+      return;
+    }
+
+    if (this.outstandingAmount > 0.01) {
+      this.toaster.warn('::PaymentAmountLessThanTotal');
+      return;
+    }
+
+    this.isProcessing = true;
+    this.posService.completeSale({
+      companyId: this.companyId,
+      customerId: this.customerId || undefined,
+      items: this.cart.map(c => ({
+        itemId: c.itemId,
+        description: c.itemName,
+        quantity: c.qty,
+        unitPrice: c.rate,
+        discountPercentage: c.discount,
+        taxAmount: c.taxAmount,
+      })),
+      paymentMethod: this.payments[0]?.mode ?? 'Cash',
+      amountReceived: this.payments.reduce((s, p) => s + (p.amount || 0), 0),
+    } as any).subscribe({
+      next: (result) => {
+        this.isProcessing = false;
+        this.lastInvoice = result.invoiceNumber ?? null;
+        this.toaster.success(this.localization.instant('::SaleCompleted'));
+        this.clearCart();
+        this.loadItems();
+      },
+      error: (err) => {
+        this.isProcessing = false;
+        this.toaster.error(err?.error?.error?.message || '::SaleFailed');
+      },
+    });
+  }
+}

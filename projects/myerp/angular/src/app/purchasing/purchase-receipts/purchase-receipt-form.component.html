@@ -1,0 +1,141 @@
+<abp-page [title]="'::NewPurchaseReceipt' | abpLocalization">
+  <form [formGroup]="form" (ngSubmit)="save()">
+    <div class="card mb-4">
+      <div class="card-body">
+        <div class="row">
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label">{{ '::Supplier' | abpLocalization }} <span class="text-danger">*</span></label>
+            <select class="form-select" formControlName="supplierId"
+              (change)="onSupplierChanged()"
+              [class.is-invalid]="form.get('supplierId')?.invalid && form.get('supplierId')?.touched">
+              <option value="">Select supplier...</option>
+              @for (s of suppliers(); track s.id) {
+                <option [value]="s.id">{{ s.name }}</option>
+              }
+            </select>
+          </div>
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label">{{ '::Warehouse' | abpLocalization }} <span class="text-danger">*</span></label>
+            <select class="form-select" formControlName="warehouseId"
+              [class.is-invalid]="form.get('warehouseId')?.invalid && form.get('warehouseId')?.touched">
+              <option value="">{{ '::SelectWarehouse' | abpLocalization }}</option>
+              @for (wh of warehouses(); track wh.id) {
+                <option [value]="wh.id">{{ wh.name }}</option>
+              }
+            </select>
+          </div>
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label">{{ '::PostingDate' | abpLocalization }} <span class="text-danger">*</span></label>
+            <input type="date" class="form-control" formControlName="postingDate" />
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::PurchaseOrder' | abpLocalization }}</label>
+            <div class="input-group">
+              <select class="form-select" formControlName="purchaseOrderId" (change)="onPurchaseOrderChanged()">
+                <option value="">{{ '::Placeholder:SelectPurchaseOrder' | abpLocalization }}</option>
+                @for (po of availablePOs(); track po.id) {
+                  <option [value]="po.id">{{ po.orderNumber }} — {{ po.orderDate | date:'dd/MM/yyyy' }} ({{ po.grandTotal | number:'1.2-2' }})</option>
+                }
+              </select>
+              @if (isLoadingPOItems()) {
+                <span class="input-group-text"><span class="spinner-border spinner-border-sm"></span></span>
+              }
+            </div>
+            @if (!form.get('supplierId')?.value) {
+              <small class="text-muted">{{ '::SelectSupplierToLoadOrders' | abpLocalization }}</small>
+            }
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::SupplierDeliveryNote' | abpLocalization }}</label>
+            <input type="text" class="form-control" formControlName="supplierDeliveryNote" />
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Items -->
+    <div class="card mb-4">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="card-title mb-0"><i class="fa fa-list me-2"></i>{{ '::Items' | abpLocalization }}</h5>
+        <div class="d-flex gap-2">
+          <button type="button" class="btn btn-outline-secondary btn-sm"
+                  [disabled]="items.length === 0 || isApplyingPutaway()"
+                  (click)="applyPutawayRule()">
+            <i class="fa fa-warehouse me-1"></i>{{ '::ApplyPutawayRule' | abpLocalization }}
+          </button>
+          <button type="button" class="btn btn-outline-primary btn-sm" (click)="addItem()">
+            <i class="fa fa-plus me-1"></i>{{ '::AddRow' | abpLocalization }}
+          </button>
+        </div>
+      </div>
+      <div class="card-body">
+        @if (items.length === 0) {
+          <p class="text-muted text-center py-3">{{ '::NoItemsAddedYet' | abpLocalization }}</p>
+        } @else {
+          <div class="table-responsive">
+            <table class="table table-hover w-100">
+              <thead>
+                <tr>
+                  <th>{{ '::Item' | abpLocalization }}</th>
+                  <th style="width:160px">{{ '::Warehouse' | abpLocalization }}</th>
+                  <th style="width:95px">{{ '::ReceivedQty' | abpLocalization }}</th>
+                  <th style="width:95px">{{ '::AcceptedQty' | abpLocalization }}</th>
+                  <th style="width:95px">{{ '::RejectedQty' | abpLocalization }}</th>
+                  <th style="width:160px">{{ '::RejectedWarehouse' | abpLocalization }}</th>
+                  <th style="width:110px">{{ '::UnitPrice' | abpLocalization }}</th>
+                  <th style="width:75px">{{ '::UOM' | abpLocalization }}</th>
+                  <th style="width:40px"></th>
+                </tr>
+              </thead>
+              <tbody>
+                @for (item of items.controls; track $index; let i = $index) {
+                  <tr [formGroup]="$any(item)">
+                    <td>
+                      <select class="form-select form-select-sm" formControlName="itemId" (change)="onItemSelected(i, $event)">
+                        <option value="">{{ '::SelectItem' | abpLocalization }}</option>
+                        @for (avail of availableItems(); track avail.id) {
+                          <option [value]="avail.id">{{ avail.itemCode }} — {{ avail.itemName }}</option>
+                        }
+                      </select>
+                    </td>
+                    <td>
+                      <select class="form-select form-select-sm" formControlName="warehouseId">
+                        <option value="">{{ '::SameAsReceipt' | abpLocalization }}</option>
+                        @for (wh of warehouses(); track wh.id) {
+                          <option [value]="wh.id">{{ wh.name }}</option>
+                        }
+                      </select>
+                    </td>
+                    <td><input type="number" class="form-control form-control-sm" formControlName="receivedQty" /></td>
+                    <td><input type="number" class="form-control form-control-sm" formControlName="quantity" /></td>
+                    <td><input type="number" class="form-control form-control-sm" formControlName="rejectedQty" /></td>
+                    <td>
+                      <select class="form-select form-select-sm" formControlName="rejectedWarehouseId">
+                        <option value="">{{ '::SelectWarehouse' | abpLocalization }}</option>
+                        @for (wh of warehouses(); track wh.id) {
+                          <option [value]="wh.id">{{ wh.name }}</option>
+                        }
+                      </select>
+                    </td>
+                    <td><input type="number" class="form-control form-control-sm" formControlName="unitPrice" /></td>
+                    <td><input class="form-control form-control-sm" formControlName="uom" /></td>
+                    <td><button type="button" class="btn btn-sm btn-outline-danger" (click)="removeItem(i)"><i class="fa fa-trash"></i></button></td>
+                  </tr>
+                }
+              </tbody>
+            </table>
+          </div>
+        }
+      </div>
+    </div>
+
+    <div class="d-flex justify-content-end gap-2">
+      <button type="button" class="btn btn-outline-secondary" (click)="cancel()">
+        <i class="fa fa-times me-1"></i>{{ '::Cancel' | abpLocalization }}
+      </button>
+      <button type="submit" class="btn btn-primary" [disabled]="form.invalid">
+        <i class="fa fa-save me-1"></i>{{ '::Save' | abpLocalization }}
+      </button>
+    </div>
+  </form>
+</abp-page>

@@ -1,0 +1,88 @@
+using System;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Accounting.Entities;
+using MyERP.Permissions;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+
+namespace MyERP.Accounting;
+
+[Authorize(MyERPPermissions.Accounts.Default)]
+public class PaymentTermsTemplateAppService : ApplicationService, IPaymentTermsTemplateAppService
+{
+    private readonly IRepository<PaymentTermsTemplate, Guid> _repository;
+
+    public PaymentTermsTemplateAppService(IRepository<PaymentTermsTemplate, Guid> repository)
+        => _repository = repository;
+
+    public async Task<PagedResultDto<PaymentTermsTemplateDto>> GetListAsync(PagedAndSortedResultRequestDto input)
+    {
+        var query = await _repository.GetQueryableAsync();
+        var totalCount = query.Count();
+        var items = query.OrderBy(t => t.Name)
+            .Skip(input.SkipCount).Take(input.MaxResultCount).ToList();
+        return new PagedResultDto<PaymentTermsTemplateDto>(totalCount,
+            items.Select(ObjectMapper.Map<PaymentTermsTemplate, PaymentTermsTemplateDto>).ToList());
+    }
+
+    public async Task<PaymentTermsTemplateDto> GetAsync(Guid id)
+        => ObjectMapper.Map<PaymentTermsTemplate, PaymentTermsTemplateDto>(await _repository.GetAsync(id));
+
+    [Authorize(MyERPPermissions.Accounts.Create)]
+    public async Task<PaymentTermsTemplateDto> CreateAsync(CreateUpdatePaymentTermsTemplateDto input)
+    {
+        var template = new PaymentTermsTemplate(GuidGenerator.Create(), input.Name, CurrentTenant.Id);
+        foreach (var term in input.Terms)
+        {
+            template.AddTerm(new PaymentTerm(GuidGenerator.Create(), template.Id,
+                term.InvoicePortion, term.CreditDays, term.Description)
+            { ModeOfPaymentId = term.ModeOfPaymentId });
+        }
+        template.ValidatePortions();
+        await _repository.InsertAsync(template);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "PaymentTermsTemplate", template.Id,
+            "Created", Guid.Empty,
+            template.Name, "Draft", "Active",
+            CurrentUser.Id,
+            $"Payment terms template '{template.Name}' created with {template.Terms.Count} terms", CurrentTenant.Id));
+
+        return ObjectMapper.Map<PaymentTermsTemplate, PaymentTermsTemplateDto>(template);
+    }
+
+    [Authorize(MyERPPermissions.Accounts.Edit)]
+    public async Task<PaymentTermsTemplateDto> UpdateAsync(Guid id, CreateUpdatePaymentTermsTemplateDto input)
+    {
+        var template = await _repository.GetAsync(id);
+        template.Name = input.Name;
+        // Terms is IReadOnlyList backed by private List — re-create via delete+insert
+        await _repository.DeleteAsync(template.Id);
+        var updated = new PaymentTermsTemplate(template.Id, input.Name, template.TenantId) { IsActive = template.IsActive };
+        foreach (var term in input.Terms)
+        {
+            updated.AddTerm(new PaymentTerm(GuidGenerator.Create(), updated.Id,
+                term.InvoicePortion, term.CreditDays, term.Description)
+            { ModeOfPaymentId = term.ModeOfPaymentId });
+        }
+        updated.ValidatePortions();
+        await _repository.InsertAsync(updated);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "PaymentTermsTemplate", updated.Id,
+            "Updated", Guid.Empty,
+            updated.Name, "Active", "Active",
+            CurrentUser.Id,
+            $"Payment terms template '{updated.Name}' updated", CurrentTenant.Id));
+
+        return ObjectMapper.Map<PaymentTermsTemplate, PaymentTermsTemplateDto>(updated);
+    }
+
+    [Authorize(MyERPPermissions.Accounts.Delete)]
+    public async Task DeleteAsync(Guid id) => await _repository.DeleteAsync(id);
+}

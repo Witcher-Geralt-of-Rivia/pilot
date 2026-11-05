@@ -1,0 +1,336 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Volo.Abp;
+using Volo.Abp.Domain.Entities.Auditing;
+using Volo.Abp.MultiTenancy;
+using MyERP.Core;
+
+namespace MyERP.Inventory.Entities;
+
+/// <summary>
+/// Serial and Batch Bundle — modern system for tracking serial/batch items in stock transactions.
+/// Each stock movement creates a bundle document tracking which specific serial numbers
+/// and/or batches are involved, along with their valuation rates.
+/// Replaces old comma-separated serial_no field.
+/// Maps to ERPNext stock/doctype/serial_and_batch_bundle.
+/// </summary>
+public class SerialAndBatchBundle : FullAuditedAggregateRoot<Guid>, IMultiTenant
+{
+    public Guid? TenantId { get; set; }
+    public Guid CompanyId { get; set; }
+
+    public Guid ItemId { get; set; }
+    public Guid WarehouseId { get; set; }
+
+    /// <summary>Inward (receiving) or Outward (consuming).</summary>
+    public BundleTransactionType TypeOfTransaction { get; set; }
+
+    /// <summary>Total quantity across all entries (must equal parent transaction line qty).</summary>
+    public decimal TotalQty { get; set; }
+
+    /// <summary>Average incoming/outgoing rate across entries.</summary>
+    public decimal AvgRate { get; set; }
+
+    /// <summary>Total stock value of this bundle (sum of entry qty × rate).</summary>
+    public decimal TotalAmount { get; set; }
+
+    /// <summary>Source voucher (Stock Entry, Purchase Receipt, Delivery Note, etc.).</summary>
+    public string VoucherType { get; set; } = null!;
+    public Guid VoucherId { get; set; }
+
+    /// <summary>Specific row in the voucher this bundle belongs to.</summary>
+    public Guid? VoucherDetailId { get; set; }
+
+    /// <summary>Voucher document status (Draft, Submitted, Cancelled).</summary>
+    public DocumentStatus Status { get; private set; } = DocumentStatus.Draft;
+
+    /// <summary>Whether this bundle has been cancelled (audit trail preservation).</summary>
+    public bool IsCancelled { get; set; }
+
+    /// <summary>Whether this bundle is for rejected quantity.</summary>
+    public bool IsRejected { get; set; }
+
+    /// <summary>Posting date/time of the parent transaction.</summary>
+    public DateTime PostingDate { get; set; }
+
+    /// <summary>Item has serial number tracking.</summary>
+    public bool HasSerialNo { get; set; }
+
+    /// <summary>Item has batch tracking.</summary>
+    public bool HasBatchNo { get; set; }
+
+    /// <summary>Individual serial/batch entries in this bundle.</summary>
+    public ICollection<SerialAndBatchEntry> Entries { get; private set; } = new List<SerialAndBatchEntry>();
+
+    protected SerialAndBatchBundle() { }
+
+    public SerialAndBatchBundle(Guid id, Guid companyId, Guid itemId, Guid warehouseId,
+        BundleTransactionType typeOfTransaction, string voucherType, Guid voucherId,
+        DateTime postingDate, Guid? tenantId = null)
+        : base(id)
+    {
+        CompanyId = companyId;
+        ItemId = Check.NotDefaultOrNull<Guid>(itemId, nameof(itemId));
+        WarehouseId = Check.NotDefaultOrNull<Guid>(warehouseId, nameof(warehouseId));
+        TypeOfTransaction = typeOfTransaction;
+        VoucherType = voucherType;
+        VoucherId = voucherId;
+        PostingDate = postingDate;
+        TenantId = tenantId;
+    }
+
+    /// <summary>Add a serial/batch entry to this bundle.</summary>
+    public void AddEntry(SerialAndBatchEntry entry)
+    {
+        if (IsCancelled)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("reason", "Bundle is cancelled");
+
+        Entries.Add(entry);
+        Recalculate();
+    }
+
+    /// <summary>
+    /// Recalculate totals from entries.
+    /// Per ERPNext PR #58994 / commit 825d24f406:
+    /// Calculate batch bundle valuation per unit using absolute total quantity.
+    /// </summary>
+    public void Recalculate()
+    {
+        TotalQty = Entries.Sum(e => e.Qty);
+        TotalAmount = Entries.Sum(e => e.Qty * e.IncomingRate);
+        var absQty = Math.Abs(TotalQty);
+        AvgRate = absQty != 0 ? Math.Round(Math.Abs(TotalAmount / absQty), 4) : 0m;
+    }
+
+    /// <summary>
+    /// Calculates the valuation rate per unit across all entries in the bundle.
+    /// Per ERPNext PR #58994 / commit 825d24f406:
+    /// returns abs(total_amount / total_qty) to ensure rate is per-unit rather than entire bundle amount.
+    /// </summary>
+    public decimal CalculateUnitValuationRate()
+    {
+        var absQty = Math.Abs(TotalQty);
+        if (absQty == 0) return 0m;
+        return Math.Round(Math.Abs(TotalAmount / absQty), 4);
+    }
+
+    /// <summary>
+    /// Submits this bundle, linking voucher number if provided.
+    /// Per ERPNext commit ad25636afb: skips submission if already submitted (e.g. backdated reconciliation).
+    /// </summary>
+    public void Submit(string? voucherNo = null)
+    {
+        if (Status != DocumentStatus.Draft) return;
+        Status = DocumentStatus.Submitted;
+    }
+
+    /// <summary>Mark as cancelled (preserves audit trail — never deleted).</summary>
+    public void Cancel()
+    {
+        Status = DocumentStatus.Cancelled;
+        IsCancelled = true;
+    }
+
+    /// <summary>Validate bundle qty matches transaction line qty.</summary>
+    public void ValidateQtyMatch(decimal transactionQty, int precision = 4)
+    {
+        var absTransactionQty = Math.Abs(transactionQty);
+        if (Math.Round(TotalQty, precision) != Math.Round(absTransactionQty, precision))
+            throw new BusinessException(MyERPDomainErrorCodes.BundleQtyMismatch)
+                .WithData("bundleQty", TotalQty)
+                .WithData("transactionQty", absTransactionQty);
+    }
+
+    /// <summary>
+    /// Maps raw material entry to finished good serial or batch for traceability (ERPNext PR #59706).
+    /// </summary>
+    public void MapEntryToFinishedGood(Guid entryId, string? fgSerialNo, string? fgBatchNo)
+    {
+        if (IsCancelled)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("reason", "Bundle is cancelled");
+
+        var entry = Entries.FirstOrDefault(e => e.Id == entryId)
+            ?? throw new BusinessException(MyERPDomainErrorCodes.ItemNotFound)
+                .WithData("entryId", entryId);
+
+        entry.SetFinishedGoodMapping(fgSerialNo, fgBatchNo);
+    }
+
+    /// <summary>
+    /// Auto-maps raw material serial / batch entries to finished good serial / batches for traceability (ERPNext PR #59706).
+    /// Spreads serialized raw materials evenly across finished goods; links batch raw material when single finished good.
+    /// </summary>
+    public void AutoMapToFinishedGoods(IEnumerable<(string? FgSerialNo, string? FgBatchNo)> finishedGoods)
+    {
+        var fgList = finishedGoods.ToList();
+        if (fgList.Count == 0) return;
+
+        var unmapped = Entries.Where(e => string.IsNullOrWhiteSpace(e.FgSerialNo) && string.IsNullOrWhiteSpace(e.FgBatchNo)).ToList();
+        if (unmapped.Count == 0) return;
+
+        if (fgList.Count == 1)
+        {
+            var singleFg = fgList[0];
+            foreach (var entry in unmapped)
+            {
+                entry.SetFinishedGoodMapping(singleFg.FgSerialNo, singleFg.FgBatchNo);
+            }
+        }
+        else
+        {
+            // For multiple finished goods, spread serialized entries evenly across FGs
+            var fgIndex = 0;
+            foreach (var entry in unmapped)
+            {
+                if (!string.IsNullOrWhiteSpace(entry.SerialNo))
+                {
+                    var fg = fgList[fgIndex % fgList.Count];
+                    entry.SetFinishedGoodMapping(fg.FgSerialNo, fg.FgBatchNo);
+                    fgIndex++;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Calculates transfer incoming rates by batch/serial from an outward bundle and row additional cost.
+    /// Per ERPNext PR #59657 / commit 1cf560fbc7:
+    /// Keeps each batch's rate through a material transfer, adding proportional additional cost.
+    /// </summary>
+    public static Dictionary<(string? SerialNo, Guid? BatchId), decimal> CalculateTransferRates(
+        SerialAndBatchBundle outwardBundle,
+        decimal additionalCost,
+        decimal transferQty)
+    {
+        var rates = new Dictionary<(string? SerialNo, Guid? BatchId), decimal>();
+        var additionalCostPerUnit = transferQty > 0 ? (additionalCost / transferQty) : 0m;
+
+        foreach (var entry in outwardBundle.Entries)
+        {
+            var key = (entry.SerialNo, entry.BatchId);
+            rates[key] = entry.IncomingRate + additionalCostPerUnit;
+        }
+
+        return rates;
+    }
+
+    /// <summary>
+    /// Applies transfer rates from an outward bundle to this inward bundle.
+    /// Preserves batch-wise valuation rates plus additional costs across material transfer.
+    /// Per ERPNext PR #60629 / commit 6e580e3f18: Each entry starts from the row rate (defaultRate),
+    /// so an entry without an outward match does not inherit an earlier entry's transfer rate.
+    /// </summary>
+    public void ApplyTransferRates(SerialAndBatchBundle outwardBundle, decimal additionalCost, decimal transferQty, decimal defaultRate = 0m)
+    {
+        var rates = CalculateTransferRates(outwardBundle, additionalCost, transferQty);
+        var additionalCostPerUnit = transferQty > 0 ? (additionalCost / transferQty) : 0m;
+
+        foreach (var entry in Entries)
+        {
+            if (rates.TryGetValue((entry.SerialNo, entry.BatchId), out var transferRate))
+            {
+                entry.IncomingRate = transferRate;
+            }
+            else if (entry.BatchId.HasValue)
+            {
+                var match = outwardBundle.Entries.FirstOrDefault(e => e.BatchId == entry.BatchId);
+                if (match != null)
+                {
+                    entry.IncomingRate = match.IncomingRate + additionalCostPerUnit;
+                }
+                else if (defaultRate > 0)
+                {
+                    entry.IncomingRate = defaultRate + additionalCostPerUnit;
+                }
+            }
+            else if (!string.IsNullOrWhiteSpace(entry.SerialNo))
+            {
+                var match = outwardBundle.Entries.FirstOrDefault(e => e.SerialNo == entry.SerialNo);
+                if (match != null)
+                {
+                    entry.IncomingRate = match.IncomingRate + additionalCostPerUnit;
+                }
+                else if (defaultRate > 0)
+                {
+                    entry.IncomingRate = defaultRate + additionalCostPerUnit;
+                }
+            }
+            else if (defaultRate > 0)
+            {
+                entry.IncomingRate = defaultRate + additionalCostPerUnit;
+            }
+        }
+
+        Recalculate();
+    }
+}
+
+/// <summary>
+/// Individual entry within a Serial and Batch Bundle.
+/// Each row represents one serial number or one batch allocation.
+/// </summary>
+public class SerialAndBatchEntry : FullAuditedEntity<Guid>, IMultiTenant
+{
+    public Guid? TenantId { get; set; }
+    public Guid SerialAndBatchBundleId { get; set; }
+
+    /// <summary>Serial number (for serial-tracked items).</summary>
+    public string? SerialNo { get; set; }
+
+    /// <summary>Batch number (for batch-tracked items).</summary>
+    public Guid? BatchId { get; set; }
+
+    /// <summary>Finished good serial no this raw material was consumed into (Manufacture / Repack). Per ERPNext PR #59706.</summary>
+    public string? FgSerialNo { get; set; }
+
+    /// <summary>Finished good batch this raw material was consumed into (Manufacture / Repack). Per ERPNext PR #59706.</summary>
+    public string? FgBatchNo { get; set; }
+
+    /// <summary>Quantity for this entry (usually 1 for serial, variable for batch).</summary>
+    public decimal Qty { get; set; }
+
+    /// <summary>Valuation/incoming rate for this specific serial/batch.</summary>
+    public decimal IncomingRate { get; set; }
+
+    /// <summary>Stock value for this entry (Qty × IncomingRate).</summary>
+    public decimal StockValueDifference => Qty * IncomingRate;
+
+    /// <summary>Warehouse (normally matches parent, but can differ for transfers).</summary>
+    public Guid? WarehouseId { get; set; }
+
+    /// <summary>FIFO/LIFO stock queue JSON for non-batchwise valuation scenarios.</summary>
+    public string? StockQueue { get; set; }
+
+    protected SerialAndBatchEntry() { }
+
+    public SerialAndBatchEntry(Guid id, Guid serialAndBatchBundleId, decimal qty, decimal incomingRate,
+        string? serialNo = null, Guid? batchId = null, Guid? tenantId = null,
+        string? fgSerialNo = null, string? fgBatchNo = null)
+        : base(id)
+    {
+        SerialAndBatchBundleId = serialAndBatchBundleId;
+        Qty = qty;
+        IncomingRate = incomingRate;
+        SerialNo = serialNo;
+        BatchId = batchId;
+        TenantId = tenantId;
+        FgSerialNo = fgSerialNo;
+        FgBatchNo = fgBatchNo;
+    }
+
+    public void SetFinishedGoodMapping(string? fgSerialNo, string? fgBatchNo)
+    {
+        FgSerialNo = fgSerialNo;
+        FgBatchNo = fgBatchNo;
+    }
+}
+
+/// <summary>Bundle direction: Inward (receiving stock) or Outward (consuming stock).</summary>
+public enum BundleTransactionType
+{
+    Inward = 0,
+    Outward = 1
+}

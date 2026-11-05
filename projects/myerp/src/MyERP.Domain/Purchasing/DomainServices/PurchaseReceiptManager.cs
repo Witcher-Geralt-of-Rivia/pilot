@@ -1,0 +1,456 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Assets.Entities;
+using MyERP.Purchasing.Entities;
+using Volo.Abp;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Domain.Services;
+
+namespace MyERP.Purchasing.DomainServices;
+
+/// <summary>
+/// Domain service for Purchase Receipt business rules.
+/// Validates receipt against linked PO, return documents, and dependent cancellation guards.
+/// </summary>
+public class PurchaseReceiptManager : DomainService
+{
+    private readonly IRepository<PurchaseOrder, Guid> _poRepository;
+    private readonly IRepository<PurchaseReceipt, Guid> _prRepository;
+    private readonly IRepository<Tax.Entities.TransactionTaxRow, Guid>? _taxRowRepository;
+
+    public PurchaseReceiptManager(
+        IRepository<PurchaseOrder, Guid> poRepository,
+        IRepository<PurchaseReceipt, Guid> prRepository)
+        : this(poRepository, prRepository, null)
+    {
+    }
+
+    public PurchaseReceiptManager(
+        IRepository<PurchaseOrder, Guid> poRepository,
+        IRepository<PurchaseReceipt, Guid> prRepository,
+        IRepository<Tax.Entities.TransactionTaxRow, Guid>? taxRowRepository)
+    {
+        _poRepository = poRepository;
+        _prRepository = prRepository;
+        _taxRowRepository = taxRowRepository;
+    }
+
+    /// <summary>
+    /// Mandatory PO linkage: every PR item must reference a Purchase Order.
+    /// Per ERPNext stock/doctype/purchase_receipt/purchase_receipt.py → po_required().
+    /// Skipped for return receipts.
+    /// </summary>
+    public static void ValidatePoRequired(PurchaseReceipt receipt, bool poRequired)
+    {
+        if (!poRequired || receipt.IsReturn) return;
+
+        var unlinkedItem = receipt.Items.FirstOrDefault(i => !i.PurchaseOrderItemId.HasValue);
+        if (unlinkedItem != null)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.PurchaseOrderLinkRequired)
+                .WithData("itemDescription", unlinkedItem.Description);
+        }
+    }
+
+    /// <summary>
+    /// Validates receipt quantities and posting date against the linked Purchase Order.
+    /// Prevents over-receipt and temporal ordering violations.
+    /// <summary>
+    /// Validates linked PO: active status, temporal ordering, and pending receipt limits.
+    /// Per ERPNext PR #58126: purchase returns against a Closed PO are allowed (cancelled POs are always blocked).
+    /// </summary>
+    public async Task ValidateAgainstPurchaseOrderAsync(PurchaseReceipt receipt)
+    {
+        var poIds = new HashSet<Guid>();
+        if (receipt.PurchaseOrderId.HasValue)
+        {
+            poIds.Add(receipt.PurchaseOrderId.Value);
+        }
+
+        var linkedPoItemIds = receipt.Items
+            .Where(i => i.PurchaseOrderItemId.HasValue)
+            .Select(i => i.PurchaseOrderItemId!.Value)
+            .Distinct()
+            .ToList();
+
+        if (linkedPoItemIds.Count > 0)
+        {
+            var poQuery = await _poRepository.GetQueryableAsync();
+            var itemPoIds = poQuery
+                .Where(p => p.Items.Any(pi => linkedPoItemIds.Contains(pi.Id)))
+                .Select(p => p.Id)
+                .ToList();
+            foreach (var pid in itemPoIds) poIds.Add(pid);
+        }
+
+        if (poIds.Count == 0) return;
+
+        var poList = new List<PurchaseOrder>();
+        foreach (var pid in poIds)
+        {
+            poList.Add(await _poRepository.GetAsync(pid));
+        }
+
+        // Validate combinability across multiple Purchase Orders (PR #60510 / commit 77e0c43997)
+        if (poList.Count > 1)
+        {
+            await ValidateCombinablePurchaseOrdersAsync(receipt, poList);
+        }
+
+        foreach (var po in poList)
+        {
+            // PO must be in an active fulfillment state (returns allowed against Closed PO, but blocked against Cancelled)
+            if (po.Status == Core.DocumentStatus.Cancelled || (!receipt.IsReturn && po.Status == Core.DocumentStatus.Closed))
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                    .WithData("documentType", "Purchase Order")
+                    .WithData("status", po.Status.ToString());
+            }
+
+            // Return PRs bypass temporal ordering and pending quantity checks against PO
+            if (receipt.IsReturn) continue;
+
+            // Temporal ordering: cannot receive before ordering
+            if (receipt.PostingDate.Date < po.OrderDate.Date)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.PostingDateBeforePODate)
+                    .WithData("postingDate", receipt.PostingDate)
+                    .WithData("poDate", po.OrderDate)
+                    .WithData("poNumber", po.OrderNumber);
+            }
+
+            foreach (var prItem in receipt.Items)
+            {
+                var poItem = prItem.PurchaseOrderItemId.HasValue
+                    ? po.Items.FirstOrDefault(i => i.Id == prItem.PurchaseOrderItemId.Value)
+                    : (po.Id == receipt.PurchaseOrderId ? po.Items.FirstOrDefault(i => i.ItemId == prItem.ItemId) : null);
+
+                if (poItem != null)
+                {
+                    if (poItem.IsClosed)
+                    {
+                        throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                            .WithData("detail", $"Item {prItem.Description} is closed in Purchase Order {po.OrderNumber} and cannot be processed further.");
+                    }
+                    var prFactor = prItem.ConversionFactor > 0 ? prItem.ConversionFactor : 1m;
+                    var poFactor = poItem.ConversionFactor > 0 ? poItem.ConversionFactor : 1m;
+                    var attemptedInPoUom = (prItem.Quantity * prFactor) / poFactor;
+
+                    if (attemptedInPoUom > poItem.PendingReceiptQty)
+                    {
+                        throw new BusinessException("MyERP:08006")
+                            .WithData("itemName", prItem.Description)
+                            .WithData("orderedQty", poItem.Quantity)
+                            .WithData("receivedQty", poItem.ReceivedQty)
+                            .WithData("attemptedQty", attemptedInPoUom);
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Validates that no submitted Assets exist on the original document before allowing return.
+    /// Per DO-NOT: "Allow purchase return (PR/PI) when submitted Assets exist on the original document"
+    /// </summary>
+    public async Task ValidateAssetReturnAsync(
+        PurchaseReceipt returnReceipt,
+        IRepository<Asset, Guid> assetRepository)
+    {
+        if (!returnReceipt.IsReturn || !returnReceipt.ReturnAgainstId.HasValue) return;
+
+        var assetQuery = await assetRepository.GetQueryableAsync();
+        var hasSubmittedAssets = assetQuery.Any(a =>
+            a.PurchaseReceiptId == returnReceipt.ReturnAgainstId.Value
+            && a.Status != Assets.AssetStatus.Draft
+            && a.Status != Assets.AssetStatus.Cancelled);
+
+        if (hasSubmittedAssets)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.AssetExistsOnReturnDocument)
+                .WithData("documentType", "Purchase Receipt")
+                .WithData("returnAgainst", returnReceipt.ReturnAgainstId.Value);
+        }
+    }
+
+    /// <summary>
+    /// Validates from_warehouse rules on purchase document items.
+    /// (1) from_warehouse cannot equal target warehouse (no-op transfer blocked)
+    /// (2) from_warehouse cannot be set on subcontracted documents
+    /// </summary>
+    public void ValidateFromWarehouse(PurchaseReceipt receipt)
+    {
+        foreach (var item in receipt.Items)
+        {
+            if (item.FromWarehouseId.HasValue && item.FromWarehouseId == item.WarehouseId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.FromWarehouseEqualsTargetWarehouse)
+                    .WithData("row", item.Description);
+            }
+
+            if (item.FromWarehouseId.HasValue && receipt.IsSubcontracted)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.FromWarehouseOnSubcontractedDocument)
+                    .WithData("row", item.Description);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Validates return receipt (goods return to supplier) business rules.
+    /// Return qty per item cannot exceed original receipt qty.
+    /// </summary>
+    public async Task ValidateReturnAsync(PurchaseReceipt returnReceipt)
+    {
+        if (!returnReceipt.IsReturn || !returnReceipt.ReturnAgainstId.HasValue) return;
+
+        // Must have negative quantities and at least one item with negative quantity or negative rejected quantity (PR #57645 / PR #59280)
+        if (returnReceipt.Items.Any(i => i.Quantity > 0 || i.RejectedQty > 0) ||
+            !returnReceipt.Items.Any(i => i.Quantity < 0 || i.RejectedQty < 0))
+        {
+            throw new BusinessException("MyERP:08001")
+                .WithData("documentType", "Purchase Receipt");
+        }
+
+        var original = await _prRepository.GetAsync(returnReceipt.ReturnAgainstId.Value);
+
+        // Validate supplier and company match original document (ERPNext PR #48588 / commit e073075834)
+        if (original.SupplierId != returnReceipt.SupplierId || original.CompanyId != returnReceipt.CompanyId)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ReturnPartyMismatch)
+                .WithData("documentType", "Purchase Receipt")
+                .WithData("returnSupplier", returnReceipt.SupplierId)
+                .WithData("originalSupplier", original.SupplierId);
+        }
+
+        // Query prior submitted/posted returns against this same original purchase receipt
+        var prQuery = await _prRepository.GetQueryableAsync();
+        var priorReturns = prQuery
+            .Where(pr => pr.ReturnAgainstId == original.Id
+                && pr.Id != returnReceipt.Id
+                && (pr.Status == Core.DocumentStatus.Submitted || pr.Status == Core.DocumentStatus.Posted))
+            .SelectMany(pr => pr.Items)
+            .ToList();
+
+        var priorReturnedByItem = priorReturns
+            .Where(i => !i.ReturnQtyFromRejectedWarehouse)
+            .GroupBy(i => i.ItemId)
+            .ToDictionary(g => g.Key, g => g.Sum(i => Math.Abs(i.Quantity * (i.ConversionFactor > 0 ? i.ConversionFactor : 1m))));
+
+        var priorReturnedRejectedByItem = priorReturns
+            .GroupBy(i => i.ItemId)
+            .ToDictionary(g => g.Key, g => g.Sum(i => (Math.Abs(i.RejectedQty) + (i.ReturnQtyFromRejectedWarehouse ? Math.Abs(i.Quantity) : 0m)) * (i.ConversionFactor > 0 ? i.ConversionFactor : 1m)));
+
+        // Validate that all return items exist in the original Purchase Receipt (ERPNext PR #59820)
+        var validItemIds = original.Items.Select(i => i.ItemId).ToHashSet();
+        foreach (var returnItem in returnReceipt.Items)
+        {
+            if (!validItemIds.Contains(returnItem.ItemId))
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ReturnItemNotFoundInOriginal)
+                    .WithData("item", returnItem.Description)
+                    .WithData("referenceDoc", original.ReceiptNumber);
+            }
+        }
+
+        // Return qty per item cannot exceed (original qty - already_returned)
+        // Uses stock qty comparison to support different UOM returns (ERPNext commit abf94bc72d, PR #59280).
+        var accumulatedReturnedByItem = priorReturnedByItem.ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+        var accumulatedReturnedRejectedByItem = priorReturnedRejectedByItem.ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+
+        foreach (var returnItem in returnReceipt.Items)
+        {
+            var returnFactor = returnItem.ConversionFactor > 0 ? returnItem.ConversionFactor : 1m;
+
+            // Validate accepted or rejected-warehouse return (PR #60672 / commit 4cc2ffb2a8)
+            if (returnItem.Quantity < 0)
+            {
+                var returnStockQty = Math.Abs(returnItem.Quantity) * returnFactor;
+
+                if (returnItem.ReturnQtyFromRejectedWarehouse)
+                {
+                    var originalRejectedStock = original.Items
+                        .Where(i => i.ItemId == returnItem.ItemId)
+                        .Sum(i => i.RejectedQty * (i.ConversionFactor > 0 ? i.ConversionFactor : 1m));
+
+                    var alreadyReturnedRejected = accumulatedReturnedRejectedByItem.GetValueOrDefault(returnItem.ItemId, 0m);
+                    var maxReturnableRejected = originalRejectedStock - alreadyReturnedRejected;
+
+                    if (returnStockQty > maxReturnableRejected + 0.0000001m)
+                    {
+                        throw new BusinessException("MyERP:08004")
+                            .WithData("itemName", returnItem.Description)
+                            .WithData("originalQty", originalRejectedStock / returnFactor)
+                            .WithData("alreadyReturned", alreadyReturnedRejected / returnFactor)
+                            .WithData("returnQty", Math.Abs(returnItem.Quantity));
+                    }
+
+                    accumulatedReturnedRejectedByItem[returnItem.ItemId] = alreadyReturnedRejected + returnStockQty;
+                }
+                else
+                {
+                    var originalStockQty = original.Items
+                        .Where(i => i.ItemId == returnItem.ItemId)
+                        .Sum(i => i.Quantity * (i.ConversionFactor > 0 ? i.ConversionFactor : 1m));
+
+                    var alreadyReturnedStock = accumulatedReturnedByItem.GetValueOrDefault(returnItem.ItemId, 0m);
+                    var maxReturnableStock = originalStockQty - alreadyReturnedStock;
+
+                    if (returnStockQty > maxReturnableStock + 0.0000001m)
+                    {
+                        throw new BusinessException("MyERP:08004")
+                            .WithData("itemName", returnItem.Description)
+                            .WithData("originalQty", originalStockQty / returnFactor)
+                            .WithData("alreadyReturned", alreadyReturnedStock / returnFactor)
+                            .WithData("returnQty", Math.Abs(returnItem.Quantity));
+                    }
+
+                    accumulatedReturnedByItem[returnItem.ItemId] = alreadyReturnedStock + returnStockQty;
+                }
+            }
+
+            // Validate rejected qty return (PR #59280 / commit b3d55db893)
+            if (returnItem.RejectedQty < 0)
+            {
+                var returnRejectedStock = Math.Abs(returnItem.RejectedQty) * returnFactor;
+                var originalRejectedStock = original.Items
+                    .Where(i => i.ItemId == returnItem.ItemId)
+                    .Sum(i => i.RejectedQty * (i.ConversionFactor > 0 ? i.ConversionFactor : 1m));
+
+                var alreadyReturnedRejected = accumulatedReturnedRejectedByItem.GetValueOrDefault(returnItem.ItemId, 0m);
+                var maxReturnableRejected = originalRejectedStock - alreadyReturnedRejected;
+
+                if (returnRejectedStock > maxReturnableRejected + 0.0000001m)
+                {
+                    throw new BusinessException("MyERP:08004")
+                        .WithData("itemName", returnItem.Description)
+                        .WithData("originalQty", originalRejectedStock / returnFactor)
+                        .WithData("alreadyReturned", alreadyReturnedRejected / returnFactor)
+                        .WithData("returnQty", Math.Abs(returnItem.RejectedQty));
+                }
+
+                accumulatedReturnedRejectedByItem[returnItem.ItemId] = alreadyReturnedRejected + returnRejectedStock;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Validates a PR can be cancelled — blocks if submitted Purchase Invoices reference this receipt.
+    /// Per DO-NOT: must cancel children first.
+    /// </summary>
+    public async Task ValidateCanCancelAsync(
+        PurchaseReceipt receipt,
+        IRepository<PurchaseInvoice, Guid> piRepository)
+    {
+        var piQuery = await piRepository.GetQueryableAsync();
+        var prItemIds = receipt.Items.Select(i => i.Id).ToList();
+        var hasSubmittedPI = piQuery.Any(pi =>
+            pi.Items.Any(i => i.PurchaseReceiptItemId.HasValue && prItemIds.Contains(i.PurchaseReceiptItemId.Value))
+            && pi.Status != Core.DocumentStatus.Draft
+            && pi.Status != Core.DocumentStatus.Cancelled);
+
+        if (hasSubmittedPI)
+        {
+            throw new BusinessException("MyERP:01010")
+                .WithData("documentType", "Purchase Receipt")
+                .WithData("dependent", "Purchase Invoice");
+        }
+    }
+
+    /// <summary>
+    /// Validates that items are not duplicated when AllowMultipleItems is disabled in Buying Settings.
+    /// Per ERPNext: rows from different purchase orders do not count as duplicates.
+    /// </summary>
+    public void ValidateDuplicateItems(PurchaseReceipt receipt, bool allowMultipleItems)
+    {
+        if (allowMultipleItems)
+            return;
+
+        var duplicates = receipt.Items
+            .GroupBy(i => (i.ItemId, i.PurchaseOrderItemId))
+            .Any(g => g.Count() > 1);
+
+        if (duplicates)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Same item cannot be entered multiple times.");
+        }
+    }
+
+    /// <summary>
+    /// Validates whether multiple Purchase Orders can be combined into a single Purchase Receipt.
+    /// Per ERPNext PR #60510 (commit 77e0c43997 / 7fda3d0b4f):
+    /// "One Purchase Receipt carries one currency, one set of rate-based taxes and one header discount."
+    /// A percentage discount can be shared by orders; an amount discount belongs to its order alone.
+    /// Rate-based taxes (plus actual charges if referenced by previous rows) must match across orders.
+    /// </summary>
+    public async Task ValidateCombinablePurchaseOrdersAsync(PurchaseReceipt receipt, IReadOnlyList<PurchaseOrder> orders)
+    {
+        if (orders.Count < 2) return;
+
+        // 1. Currency validation: orders must all share the receipt's currency
+        var currencies = orders.Select(o => o.CurrencyCode).Distinct().ToList();
+        if (currencies.Count > 1 || (receipt != null && orders.Any(o => !string.Equals(o.CurrencyCode, receipt.CurrencyCode, StringComparison.OrdinalIgnoreCase))))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.CannotCombinePurchaseOrders)
+                .WithData("orders", string.Join(", ", orders.Select(o => o.OrderNumber)))
+                .WithData("reason", "Currencies do not match.");
+        }
+
+        // 2. Discount terms validation
+        // Per ERPNext: an amount discount belongs to its order alone; a percentage discount can be shared.
+        var hasAmountDiscount = orders.Any(o => o.DiscountAmount > 0);
+        if (hasAmountDiscount)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.CannotCombinePurchaseOrders)
+                .WithData("orders", string.Join(", ", orders.Select(o => o.OrderNumber)))
+                .WithData("reason", "Orders with header discount amounts cannot be combined.");
+        }
+
+        var discountTerms = orders.Select(o => o.AdditionalDiscountPercentage > 0
+            ? (o.ApplyDiscountOn ?? "Net Total", o.AdditionalDiscountPercentage)
+            : ("None", 0m)).Distinct().ToList();
+
+        if (discountTerms.Count > 1)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.CannotCombinePurchaseOrders)
+                .WithData("orders", string.Join(", ", orders.Select(o => o.OrderNumber)))
+                .WithData("reason", "Orders have different discount percentages or discount basis.");
+        }
+
+        // 3. Tax terms validation
+        if (_taxRowRepository != null)
+        {
+            var taxQueryable = await _taxRowRepository.GetQueryableAsync();
+            var orderIds = orders.Select(o => o.Id).ToList();
+            var allTaxes = taxQueryable
+                .Where(t => t.ParentType == "PurchaseOrder" && orderIds.Contains(t.ParentId))
+                .ToList();
+
+            var taxesByOrder = allTaxes.GroupBy(t => t.ParentId).ToDictionary(g => g.Key, g => g.OrderBy(t => t.RowIndex).ToList());
+
+            var orderTaxSignatures = new List<string>();
+            foreach (var order in orders)
+            {
+                var taxes = taxesByOrder.GetValueOrDefault(order.Id, new List<Tax.Entities.TransactionTaxRow>());
+                var hasRowBasedTax = taxes.Any(t => t.ChargeType is "On Previous Row Amount" or "On Previous Row Total");
+                var rateBasedTaxes = taxes
+                    .Where(t => hasRowBasedTax || t.ChargeType != "Actual")
+                    .OrderBy(t => t.RowIndex)
+                    .Select(t => $"{t.ChargeType}|{t.Rate}|{t.AccountId}|{t.CostCenterId}|{t.IncludedInPrintRate}|{t.AddDeductTax}|{t.TaxCategory}")
+                    .ToList();
+
+                orderTaxSignatures.Add(string.Join(";", rateBasedTaxes));
+            }
+
+            if (orderTaxSignatures.Distinct().Count() > 1)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CannotCombinePurchaseOrders)
+                    .WithData("orders", string.Join(", ", orders.Select(o => o.OrderNumber)))
+                    .WithData("reason", "Orders have different rate-based taxes or tax charge terms.");
+            }
+        }
+    }
+}

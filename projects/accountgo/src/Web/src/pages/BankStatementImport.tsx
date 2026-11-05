@@ -1,0 +1,1116 @@
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { Link, useOutletContext, useParams, useSearchParams } from 'react-router-dom';
+import { AlertTriangle, CheckCircle2, Link2Off, Loader2, Plus, Upload } from 'lucide-react';
+import { PageHeader, HeaderButton } from '../components/PageHeader';
+import { StatementLineApplyInvoiceDialog } from '../components/StatementLineApplyInvoiceDialog';
+import { StatementLineExcludeDialog } from '../components/StatementLineExcludeDialog';
+import { StatementLineExpenseDialog } from '../components/StatementLineExpenseDialog';
+import { StatementLineOtherIncomeDialog } from '../components/StatementLineOtherIncomeDialog';
+import { StatementLineTransactionDialog } from '../components/StatementLineTransactionDialog';
+import { LinkedEntryDialog } from '../components/LinkedEntryDialog';
+import { STATEMENT_EXCLUSION_REASONS } from '../types/banking';
+import { useAuth } from '../auth/AuthContext';
+import { useTenantContext } from '../components/Gating';
+import { useCapabilities } from '../lib/entitlements';
+import { refreshIncomingReview } from '../lib/integrations';
+import { ConfirmDialog } from '../components/ConfirmDialog';
+import { IncomingProvenance } from '../components/IncomingProvenance';
+import {
+  CSV_SAMPLE_ROWS,
+  bytesToBase64,
+  clampStatementLinePage,
+  decodeStatementBytes,
+  detectDelimiter,
+  emptyColumnMap,
+  hasAmountMapping,
+  importSummary,
+  isBeforeBooksStart,
+  parseCsvRows,
+  sourceForFileName,
+  suggestColumnMap,
+} from '../lib/statementImport';
+import type { TenantContextType } from '../types';
+import type {
+  BankAccount,
+  BankStatementColumnMap,
+  BankStatementCommitResult,
+  BankStatementLine,
+  BankStatementLineList,
+  BankStatementPreview,
+  BankStatementResolveMapping,
+  StatementLineStatus,
+} from '../types/banking';
+
+const labelClass = 'block text-xs font-semibold uppercase tracking-wider text-[var(--text-muted)] mb-1';
+const inputClass =
+  'w-full h-10 px-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-subtle)] text-sm text-[var(--text-main)]';
+const LIST_PAGE_SIZE = 100;
+
+type ColumnKey =
+  | 'dateColumn'
+  | 'amountColumn'
+  | 'depositColumn'
+  | 'withdrawalColumn'
+  | 'directionColumn'
+  | 'payeeColumn'
+  | 'memoColumn'
+  | 'referenceColumn'
+  | 'externalIdColumn'
+  | 'currencyColumn'
+  | 'statusColumn';
+
+const COLUMN_FIELDS: { key: ColumnKey; label: string; required?: boolean }[] = [
+  { key: 'dateColumn', label: 'Date', required: true },
+  { key: 'amountColumn', label: 'Amount' },
+  { key: 'directionColumn', label: 'Direction (in/out)' },
+  { key: 'depositColumn', label: 'Deposits (if separate)' },
+  { key: 'withdrawalColumn', label: 'Withdrawals (if separate)' },
+  { key: 'payeeColumn', label: 'Payee / description' },
+  { key: 'memoColumn', label: 'Memo' },
+  { key: 'referenceColumn', label: 'Reference / check no.' },
+  { key: 'externalIdColumn', label: 'Bank transaction id' },
+  { key: 'currencyColumn', label: 'Currency' },
+  { key: 'statusColumn', label: 'Status' },
+];
+
+const HEADER_HINTS =
+  /^(date|posted|created|created_on|amount|signed_amount|direction|payee|description|memo|currency|status|activity_id|fitid)$/i;
+
+function findSampleHeaderIndex(rows: string[][]): number {
+  for (let i = 0; i < Math.min(rows.length, 30); i += 1) {
+    const nonBlank = rows[i].filter((c) => c.trim() !== '');
+    if (nonBlank.length === 0) continue;
+    const numericish = nonBlank.filter((c) => /\d/.test(c) && !HEADER_HINTS.test(c.trim())).length;
+    if (numericish > nonBlank.length / 2) continue;
+    if (nonBlank.some((c) => HEADER_HINTS.test(c.trim().replace(/\s+/g, '_')))) return i;
+  }
+  return 0;
+}
+
+const BankStatementImportPage: React.FC = () => {
+  const { bankId } = useParams<{ bankId: string }>();
+  const id = Number(bankId);
+  const [searchParams] = useSearchParams();
+  const focusedLineId = Number(searchParams.get('lineId')) || null;
+  const { currentOrg } = useOutletContext<TenantContextType>();
+  const { authFetch } = useAuth();
+  const { hasPermission } = useTenantContext();
+  const canManage = hasPermission('banking.accounts.manage');
+  const canCreateTx = hasPermission('banking.transactions.create');
+  const canCreateLinkedEntry = currentOrg.entityType === 'SoleProprietor' &&
+    hasPermission('financials.journal.post') && hasPermission('financials.journal.create');
+  const { canModule, canWrite, canCreate } = useCapabilities();
+  const hasFinancials = canModule('financials');
+  const purchasesWritable = canModule('purchases') && canWrite('purchases');
+  const canRecordExpense =
+    canManage &&
+    purchasesWritable &&
+    hasPermission('purchases.bills.create') &&
+    hasPermission('purchases.bills.post') &&
+    hasPermission('purchases.payments.create');
+  const canPayOpenBill = canManage && purchasesWritable && hasPermission('purchases.payments.create');
+  const canDraft = canManage && purchasesWritable && hasPermission('purchases.bills.create') && canCreate('bills');
+  const salesWritable = canModule('sales') && canWrite('sales');
+  const canApplyOpenInvoice =
+    canManage && salesWritable && hasPermission('sales.receipts.create');
+  const canRecordOtherIncome =
+    canManage &&
+    salesWritable &&
+    hasPermission('sales.invoices.create') &&
+    hasPermission('sales.invoices.post') &&
+    hasPermission('sales.receipts.create');
+
+  const [account, setAccount] = useState<BankAccount | null>(null);
+  const [list, setList] = useState<BankStatementLineList | null>(null);
+  const [status, setStatus] = useState<StatementLineStatus>(focusedLineId ? 'all' : 'unmatched');
+  const [page, setPage] = useState(1);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const [fileName, setFileName] = useState('');
+  const [content, setContent] = useState('');
+  const [contentBase64, setContentBase64] = useState<string | null>(null);
+  const [source, setSource] = useState<1 | 2 | 4 | 5 | 6 | 7 | null>(null);
+  const [sampleRows, setSampleRows] = useState<string[][]>([]);
+  const [columnMap, setColumnMap] = useState<BankStatementColumnMap>(emptyColumnMap());
+  const [mappingSource, setMappingSource] = useState<string | null>(null);
+  const [presetName, setPresetName] = useState<string | null>(null);
+  const [preview, setPreview] = useState<BankStatementPreview | null>(null);
+
+  const [createFor, setCreateFor] = useState<BankStatementLine | null>(null);
+  const [expenseFor, setExpenseFor] = useState<BankStatementLine | null>(null);
+  const [expenseMode, setExpenseMode] = useState<'expense' | 'draft'>('expense');
+  const [matchConfirm, setMatchConfirm] = useState<{ line: BankStatementLine; ledgerId: number } | null>(null);
+  const [applyFor, setApplyFor] = useState<BankStatementLine | null>(null);
+  const [incomeFor, setIncomeFor] = useState<BankStatementLine | null>(null);
+  const [linkedEntryFor, setLinkedEntryFor] = useState<{ line: BankStatementLine; kind: 'Personal' | 'MoneyIn' } | null>(null);
+  const [excludeFor, setExcludeFor] = useState<BankStatementLine | null>(null);
+  const [pickedCandidate, setPickedCandidate] = useState<Record<number, string>>({});
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);
+
+  const formatCurrency = useCallback(
+    (n: number) =>
+      new Intl.NumberFormat(undefined, {
+        style: 'currency',
+        currency: account?.currencyCode || currentOrg.currency || 'USD',
+      }).format(n),
+    [account?.currencyCode, currentOrg.currency],
+  );
+
+  const fetchLines = useCallback(
+    async (nextStatus: StatementLineStatus, nextPage: number): Promise<BankStatementLineList> => {
+      const q = new URLSearchParams({
+        status: nextStatus,
+        page: String(nextPage),
+        pageSize: String(LIST_PAGE_SIZE),
+      });
+      if (focusedLineId) q.set('lineId', String(focusedLineId));
+      const res = await authFetch(`/api/Banking/Accounts/${id}/StatementLines?${q}`);
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error(body?.message || 'Could not load statement lines.');
+      }
+      return (await res.json()) as BankStatementLineList;
+    },
+    [authFetch, id, focusedLineId],
+  );
+
+  const loadLines = useCallback(
+    async (nextStatus: StatementLineStatus, nextPage: number) => {
+      let data = await fetchLines(nextStatus, nextPage);
+      const clamped = clampStatementLinePage(nextPage, data.totalCount, data.pageSize || LIST_PAGE_SIZE);
+      if (clamped !== nextPage) {
+        setPage(clamped);
+        data = await fetchLines(nextStatus, clamped);
+      }
+      setList(data);
+      refreshIncomingReview();
+    },
+    [fetchLines],
+  );
+
+  // Account only when the bank changes — page/status changes fetch lines alone.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!Number.isFinite(id)) return;
+      setLoading(true);
+      setError(null);
+      setAccount(null);
+      setList(null);
+      setPage(1);
+      try {
+        const accRes = await authFetch(`/api/Banking/Accounts/${id}`);
+        if (!accRes.ok) throw new Error('Bank account not found.');
+        const next = (await accRes.json()) as BankAccount;
+        if (!cancelled) setAccount(next);
+      } catch (err: unknown) {
+        if (!cancelled) setError(err instanceof Error ? err.message : 'Could not load.');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [authFetch, id]);
+
+  useEffect(() => {
+    if (!account || !Number.isFinite(id)) return;
+    let cancelled = false;
+    (async () => {
+      setError(null);
+      try {
+        await loadLines(status, page);
+      } catch (err: unknown) {
+        if (!cancelled) setError(err instanceof Error ? err.message : 'Could not load statement lines.');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [account, id, loadLines, status, page]);
+
+  const totalCount = list?.totalCount ?? 0;
+  const pageSize = list?.pageSize ?? LIST_PAGE_SIZE;
+  const currentPage = clampStatementLinePage(list?.page ?? page, totalCount, pageSize);
+  const showingFrom = totalCount === 0 ? 0 : (currentPage - 1) * pageSize + 1;
+  const showingTo = Math.min(currentPage * pageSize, totalCount);
+  const canPrev = currentPage > 1;
+  const canNext = currentPage * pageSize < totalCount;
+
+  const headers = useMemo(() => {
+    if (source !== 1 || sampleRows.length === 0) return [];
+    return sampleRows[0].map((cell, index) => (columnMap.hasHeaderRow && cell.trim() ? cell.trim() : `Column ${index + 1}`));
+  }, [source, sampleRows, columnMap.hasHeaderRow]);
+
+  const onFile = async (file: File | null) => {
+    setPreview(null);
+    setNotice(null);
+    setError(null);
+    if (!file) return;
+    const detected = sourceForFileName(file.name);
+    if (!detected) {
+      setError('Choose a .csv, .ofx, .qfx, .xml (CAMT), .mt940, .qif, or .xlsx file.');
+      return;
+    }
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const text = decodeStatementBytes(bytes);
+    const b64 = bytesToBase64(bytes);
+    setFileName(file.name);
+    setContent(text);
+    setContentBase64(b64);
+    setSource(detected);
+    setMappingSource(null);
+    setPresetName(null);
+    const needsColumnMap = detected === 1 || detected === 7;
+    if (needsColumnMap) {
+      // XLSX is decoded server-side; for mapping UI we only have client text for CSV.
+      const mapText = detected === 1 ? text : text;
+      const delimiter = detectDelimiter(mapText);
+      const rows = detected === 1 ? parseCsvRows(mapText, delimiter, 40) : [];
+      const headerIndex = rows.length ? findSampleHeaderIndex(rows) : 0;
+      const headerRow = rows[headerIndex] ?? [];
+      const sample = rows.slice(headerIndex, headerIndex + CSV_SAMPLE_ROWS + 1);
+      setSampleRows(sample);
+      const suggested = headerRow.length ? suggestColumnMap(headerRow) : emptyColumnMap();
+      suggested.headerRowIndex = headerIndex;
+      setColumnMap(suggested);
+      try {
+        const res = await authFetch(`/api/Banking/Accounts/${id}/StatementImports/ResolveMapping`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            source: detected,
+            fileName: file.name,
+            content: detected === 7 ? '' : text,
+            contentBase64: b64,
+          }),
+        });
+        if (res.ok) {
+          const resolved = (await res.json()) as BankStatementResolveMapping;
+          setMappingSource(resolved.mappingSource);
+          setPresetName(resolved.presetName ?? null);
+          if (resolved.columnMap && (resolved.mappingSource === 'saved' || resolved.mappingSource === 'preset')) {
+            const next = { ...resolved.columnMap, headerRowIndex: resolved.columnMap.headerRowIndex ?? headerIndex };
+            setColumnMap(next);
+          }
+        }
+      } catch {
+        // Client suggestion remains if resolve fails.
+      }
+    } else {
+      setSampleRows([]);
+    }
+  };
+
+  const setColumn = (key: ColumnKey, value: string) => {
+    setPreview(null);
+    setColumnMap((prev) => ({ ...prev, [key]: value === '' ? null : Number(value) }));
+  };
+
+  const payload = () => ({
+    source,
+    fileName,
+    content,
+    contentBase64,
+    // CSV/xlsx need the full map; QIF only needs dateFormat when dates are ambiguous.
+    columnMap: source === 1 || source === 7 || source === 6 ? columnMap : null,
+  });
+
+  const mappingReady =
+    source === 2 ||
+    source === 4 ||
+    source === 5 ||
+    source === 6 ||
+    ((source === 1 || source === 7) && hasAmountMapping(columnMap));
+  const dateFormatBlockingImport =
+    !!preview?.detection?.needsDateFormatChoice && !columnMap.dateFormat;
+  const amountFormatBlockingImport =
+    !!preview?.detection?.needsAmountFormatChoice && !columnMap.decimalSeparator;
+
+  const runPreview = async () => {
+    if (!mappingReady) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await authFetch(`/api/Banking/Accounts/${id}/StatementImports/Preview`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload()),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error(body?.message || 'Could not read the file.');
+      }
+      setPreview(await res.json());
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Could not read the file.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const commit = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await authFetch(`/api/Banking/Accounts/${id}/StatementImports`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload()),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error(body?.message || 'Could not import the file.');
+      }
+      const result: BankStatementCommitResult = await res.json();
+      setNotice(importSummary(result));
+      setPreview(null);
+      setContent('');
+      setContentBase64(null);
+      setFileName('');
+      setSource(null);
+      setSampleRows([]);
+      setPage(1);
+      await loadLines(status, 1);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Could not import the file.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleSelected = (id: number) => {
+    setSelectedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  };
+
+  const bulkRecordExpense = async () => {
+    if (selectedIds.length === 0) return;
+    const first = (list?.lines ?? []).find((l) => l.id === selectedIds[0]);
+    if (!first || first.amount >= 0) {
+      setError('Bulk record expense only works on money-out lines.');
+      return;
+    }
+    setExpenseFor(first);
+  };
+
+  const booksStart = list?.booksStartDate ? String(list.booksStartDate).slice(0, 10) : null;
+  const beforeBooksStartCount = list?.beforeBooksStartCount ?? 0;
+
+  const excludeBeforeBooksStart = async () => {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await authFetch(`/api/Banking/Accounts/${id}/StatementLines/ExcludeBeforeBooksStart`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error(body?.message || `Could not exclude the lines (HTTP ${res.status}).`);
+      }
+      const result = (await res.json()) as { excluded: number };
+      setSelectedIds([]);
+      setNotice(`Excluded ${result.excluded} line${result.excluded === 1 ? '' : 's'} dated before ${booksStart}.`);
+      await loadLines(status, 1);
+      setPage(1);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Could not exclude the lines.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const lineAction = async (
+    line: BankStatementLine,
+    action: 'Match' | 'Unmatch' | 'Include',
+    glLineId?: number,
+  ) => {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await authFetch(`/api/Banking/StatementLines/${line.id}/${action}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(action === 'Match' ? { generalLedgerLineId: glLineId ?? null } : {}),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error(body?.message || `Could not ${action.toLowerCase()} the line.`);
+      }
+      await loadLines(status, page);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Action failed.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (loading && !account) {
+    return (
+      <div className="flex items-center gap-2 text-sm text-[var(--text-muted)]">
+        <Loader2 className="w-4 h-4 animate-spin" /> Loading…
+      </div>
+    );
+  }
+
+  if (!account) {
+    return (
+      <div className="space-y-4">
+        <PageHeader title="Import statement" back={{ to: `/org/${currentOrg.slug}/banking`, label: 'Banking' }} />
+        {error && (
+          <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-600 text-sm">{error}</div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <PageHeader
+        title={focusedLineId ? 'Review incoming transaction' : 'Import statement'}
+        subtitle={account.name}
+        back={{ to: `/org/${currentOrg.slug}/banking/${account.id}`, label: 'Register' }}
+      />
+      {focusedLineId && <p className="text-sm text-[var(--text-secondary)]">Receipt does not approve accounting. Review the source and suggestions below, supply missing details, or leave this item for later. <Link className="underline" to={`/org/${currentOrg.slug}/banking/needs-review`}>Back to Needs review</Link></p>}
+      {focusedLineId && <IncomingProvenance companyId={currentOrg.id} bankId={id} lineId={focusedLineId} />}
+
+      {error && (
+        <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-600 text-sm flex gap-2" role="alert">
+          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+          {error}
+        </div>
+      )}
+      {notice && (
+        <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-700 text-sm flex gap-2">
+          <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5" />
+          {notice}
+        </div>
+      )}
+
+      {canManage && !account.archivedAt && !focusedLineId && (
+        <section className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] p-5 space-y-4 shadow-sm">
+          <h2 className="text-sm font-bold text-[var(--text-main)]">1. Choose a file</h2>
+          <input
+            type="file"
+            accept=".csv,.txt,.ofx,.qfx,.xml,.camt,.mt940,.sta,.qif,.xlsx"
+            aria-label="Statement file"
+            onChange={(e) => void onFile(e.target.files?.[0] ?? null)}
+            className="block text-sm text-[var(--text-secondary)]"
+          />
+
+          {source === 6 && (
+            <div className="space-y-4">
+              <h2 className="text-sm font-bold text-[var(--text-main)]">2. Date format</h2>
+              <div className="max-w-sm">
+                <label className={labelClass} htmlFor="qif-dateFormat">
+                  Date format
+                  {preview?.detection?.needsDateFormatChoice ? ' (required — dates are ambiguous)' : ' (optional)'}
+                </label>
+                <select
+                  id="qif-dateFormat"
+                  value={columnMap.dateFormat ?? ''}
+                  onChange={(e) => {
+                    setPreview(null);
+                    setColumnMap((prev) => ({ ...prev, dateFormat: e.target.value.trim() || null }));
+                  }}
+                  className={inputClass}
+                >
+                  <option value="">Detected / ISO / year-first</option>
+                  <option value="dd/MM/yyyy">dd/MM/yyyy (day first)</option>
+                  <option value="MM/dd/yyyy">MM/dd/yyyy (month first)</option>
+                  <option value="d/M/yyyy">d/M/yyyy</option>
+                  <option value="M/d/yyyy">M/d/yyyy</option>
+                </select>
+              </div>
+              {preview?.detection?.needsDateFormatChoice && !columnMap.dateFormat && (
+                <p className="text-xs text-amber-600">
+                  Every date has day and month ≤ 12. Choose day-first or month-first — we will not guess.
+                </p>
+              )}
+            </div>
+          )}
+
+          {(source === 1 || source === 7) && (source === 7 || sampleRows.length > 0) && (
+            <div className="space-y-4">
+              <h2 className="text-sm font-bold text-[var(--text-main)]">2. Map the columns</h2>
+              {mappingSource === 'saved' && (
+                <p className="text-xs text-[var(--text-muted)]">Using the saved mapping for this bank and header. Confirm in Preview before import.</p>
+              )}
+              {mappingSource === 'preset' && (
+                <p className="text-xs text-[var(--text-muted)]">
+                  Starting from the {presetName ?? 'built-in'} preset. Confirm in Preview before import.
+                </p>
+              )}
+              <label className="flex items-center gap-2 text-sm text-[var(--text-main)]">
+                <input
+                  type="checkbox"
+                  checked={columnMap.hasHeaderRow}
+                  onChange={(e) => {
+                    setPreview(null);
+                    setColumnMap((prev) => ({ ...prev, hasHeaderRow: e.target.checked }));
+                  }}
+                />
+                First row is a header
+              </label>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                {COLUMN_FIELDS.map((field) => (
+                  <div key={field.key}>
+                    <label className={labelClass} htmlFor={`col-${field.key}`}>
+                      {field.label}
+                      {field.required ? ' *' : ''}
+                    </label>
+                    <select
+                      id={`col-${field.key}`}
+                      value={columnMap[field.key] ?? ''}
+                      onChange={(e) => setColumn(field.key, e.target.value)}
+                      className={inputClass}
+                    >
+                      {!field.required && <option value="">Not in file</option>}
+                      {headers.map((header, index) => (
+                        <option key={index} value={index}>
+                          {header}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ))}
+                <div>
+                  <label className={labelClass} htmlFor="col-dateFormat">
+                    Date format
+                    {preview?.detection?.needsDateFormatChoice ? ' (required — dates are ambiguous)' : ' (optional)'}
+                  </label>
+                  <select
+                    id="col-dateFormat"
+                    value={columnMap.dateFormat ?? ''}
+                    onChange={(e) => {
+                      setPreview(null);
+                      setColumnMap((prev) => ({ ...prev, dateFormat: e.target.value.trim() || null }));
+                    }}
+                    className={inputClass}
+                  >
+                    <option value="">Detected / ISO / year-first</option>
+                    <option value="dd/MM/yyyy">dd/MM/yyyy (day first)</option>
+                    <option value="MM/dd/yyyy">MM/dd/yyyy (month first)</option>
+                    <option value="d/M/yyyy">d/M/yyyy</option>
+                    <option value="M/d/yyyy">M/d/yyyy</option>
+                  </select>
+                </div>
+                <div>
+                  <label className={labelClass} htmlFor="col-decimalSeparator">
+                    Amount decimal
+                    {preview?.detection?.needsAmountFormatChoice
+                      ? ' (required — amounts are ambiguous)'
+                      : ' (optional)'}
+                  </label>
+                  <select
+                    id="col-decimalSeparator"
+                    value={columnMap.decimalSeparator ?? ''}
+                    onChange={(e) => {
+                      setPreview(null);
+                      setColumnMap((prev) => ({
+                        ...prev,
+                        decimalSeparator: e.target.value.trim() || null,
+                      }));
+                    }}
+                    className={inputClass}
+                  >
+                    <option value="">Detected from the column</option>
+                    <option value=".">. (US / 1,234.56)</option>
+                    <option value=",">, (European / 1.234,56)</option>
+                  </select>
+                </div>
+              </div>
+              <label className="flex items-center gap-2 text-sm text-[var(--text-main)]">
+                <input
+                  type="checkbox"
+                  checked={columnMap.invertSign}
+                  onChange={(e) => {
+                    setPreview(null);
+                    setColumnMap((prev) => ({ ...prev, invertSign: e.target.checked }));
+                  }}
+                />
+                Payments are shown as positive amounts (flip the sign)
+              </label>
+              {!hasAmountMapping(columnMap) && (
+                <p className="text-xs text-amber-600">Pick the amount column, or the deposit and withdrawal columns.</p>
+              )}
+              {preview?.detection?.needsDateFormatChoice && !columnMap.dateFormat && (
+                <p className="text-xs text-amber-600">
+                  Every date has day and month ≤ 12. Choose day-first or month-first — we will not guess.
+                </p>
+              )}
+              {preview?.detection?.needsAmountFormatChoice && !columnMap.decimalSeparator && (
+                <p className="text-xs text-amber-600">
+                  Amounts like 1.500 are ambiguous. Choose . or , as the decimal separator — we will not guess.
+                </p>
+              )}
+            </div>
+          )}
+
+          {source && (
+            <div className="flex flex-wrap items-center gap-2">
+              <HeaderButton
+                label="Preview"
+                icon={Upload}
+                variant="secondary"
+                onClick={() => void runPreview()}
+                busy={busy}
+                disabled={!mappingReady}
+              />
+              {preview && preview.readyRows > 0 && (
+                <HeaderButton
+                  label={`Import ${preview.readyRows} line${preview.readyRows === 1 ? '' : 's'}`}
+                  variant="primary"
+                  onClick={() => void commit()}
+                  busy={busy}
+                  disabled={dateFormatBlockingImport || amountFormatBlockingImport}
+                />
+              )}
+            </div>
+          )}
+
+          {preview && (
+            <div className="space-y-3">
+              {preview.detection && (
+                <p className="text-xs text-[var(--text-muted)]">
+                  {[
+                    preview.detection.date && `Date: ${preview.detection.date}`,
+                    preview.detection.amount && `Amount: ${preview.detection.amount}`,
+                    preview.detection.currency && `Currency: ${preview.detection.currency}`,
+                    preview.detection.status && `Status: ${preview.detection.status}`,
+                    preview.detection.header && `Header: ${preview.detection.header}`,
+                  ]
+                    .filter(Boolean)
+                    .join(' · ')}
+                </p>
+              )}
+              <p className="text-sm text-[var(--text-secondary)]">
+                {preview.totalRows} rows: {preview.readyRows} new, {preview.duplicateRows} already imported,{' '}
+                {preview.errorRows} with errors.
+              </p>
+              <div className="overflow-x-auto rounded-lg border border-[var(--border-subtle)]">
+                <table className="w-full text-sm min-w-[560px]">
+                  <thead>
+                    <tr className="text-left text-xs uppercase tracking-wider text-[var(--text-muted)] border-b border-[var(--border-subtle)]">
+                      <th className="px-3 py-2">Row</th>
+                      <th className="px-3 py-2">Date</th>
+                      <th className="px-3 py-2">Payee</th>
+                      <th className="px-3 py-2 text-right">Amount</th>
+                      <th className="px-3 py-2">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[var(--border-subtle)]">
+                    {preview.rows.map((row) => (
+                      <tr key={row.rowNumber}>
+                        <td className="px-3 py-2">{row.rowNumber}</td>
+                        <td className="px-3 py-2 whitespace-nowrap">{row.postedDate ? String(row.postedDate).slice(0, 10) : '—'}</td>
+                        <td className="px-3 py-2">{row.payee || row.memo || '—'}</td>
+                        <td className="px-3 py-2 text-right font-mono">
+                          {row.amount != null ? formatCurrency(row.amount) : '—'}
+                        </td>
+                        <td className="px-3 py-2">
+                          {row.status === 'ok' && 'New'}
+                          {row.status === 'duplicate' && <span className="text-[var(--text-muted)]">Already imported</span>}
+                          {row.status === 'error' && <span className="text-rose-600">{row.error}</span>}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {preview.totalRows > preview.rows.length && (
+                <p className="text-xs text-[var(--text-muted)]">Showing the first {preview.rows.length} rows.</p>
+              )}
+            </div>
+          )}
+        </section>
+      )}
+
+      <section className="space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h2 className="text-sm font-bold text-[var(--text-main)]">
+            Statement lines
+            {list && (
+              <span className="ml-2 font-normal text-[var(--text-muted)]">
+                {list.unmatchedCount} unmatched · {list.matchedCount} matched · {list.excludedCount ?? 0}{' '}
+                excluded
+              </span>
+            )}
+          </h2>
+          <div className="flex gap-1">
+            {(['unmatched', 'matched', 'excluded', 'all'] as StatementLineStatus[]).map((value) => (
+              <button
+                key={value}
+                type="button"
+                onClick={() => {
+                  setStatus(value);
+                  setPage(1);
+                }}
+                className={`h-8 px-3 rounded-lg text-xs font-semibold capitalize ${
+                  status === value
+                    ? 'bg-[var(--brand-primary)] text-white'
+                    : 'text-[var(--text-secondary)] hover:bg-[var(--bg-surface-hover)]'
+                }`}
+              >
+                {value}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {list && beforeBooksStartCount > 0 && booksStart && (
+          <div
+            className="p-4 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-800 dark:text-amber-300 text-sm flex flex-wrap items-start gap-3"
+            role="note"
+          >
+            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+            <p className="flex-1 min-w-[220px]">
+              {beforeBooksStartCount} unmatched line{beforeBooksStartCount === 1 ? ' is' : 's are'} dated before your
+              books start date ({booksStart}). Nothing can be recorded before that date, so exclude{' '}
+              {beforeBooksStartCount === 1 ? 'it' : 'them'} to clear the list.
+            </p>
+            {canManage && !account.archivedAt && (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => void excludeBeforeBooksStart()}
+                className="h-8 px-3 rounded-lg text-xs font-semibold border border-amber-500/40 hover:bg-amber-500/10 disabled:opacity-50"
+              >
+                Exclude {beforeBooksStartCount} line{beforeBooksStartCount === 1 ? '' : 's'}
+              </button>
+            )}
+          </div>
+        )}
+
+        {list && (
+          <div className="flex flex-wrap items-center justify-between gap-3 text-sm text-[var(--text-secondary)]">
+            <p role="status">
+              {totalCount === 0
+                ? 'Showing 0 of 0'
+                : `Showing ${showingFrom}–${showingTo} of ${totalCount}`}
+            </p>
+            <div className="flex gap-2">
+              {canRecordExpense && selectedIds.length > 0 && (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void bulkRecordExpense()}
+                  className="h-8 px-3 rounded-lg text-xs font-semibold text-white bg-[var(--brand-primary)] disabled:opacity-50"
+                >
+                  Record expense ({selectedIds.length})
+                </button>
+              )}
+              <button
+                type="button"
+                disabled={!canPrev || busy || loading}
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                className="h-8 px-3 rounded-lg text-xs font-semibold border border-[var(--border-subtle)] disabled:opacity-40 hover:bg-[var(--bg-surface-hover)]"
+              >
+                Previous
+              </button>
+              <button
+                type="button"
+                disabled={!canNext || busy || loading}
+                onClick={() => setPage((p) => p + 1)}
+                className="h-8 px-3 rounded-lg text-xs font-semibold border border-[var(--border-subtle)] disabled:opacity-40 hover:bg-[var(--bg-surface-hover)]"
+              >
+                Next
+              </button>
+            </div>
+          </div>
+        )}
+
+        <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] overflow-x-auto shadow-sm">
+          <table className="w-full text-sm min-w-[720px]">
+            <thead>
+              <tr className="text-left text-xs uppercase tracking-wider text-[var(--text-muted)] border-b border-[var(--border-subtle)]">
+                {canManage && status === 'unmatched' && (
+                  <th className="px-3 py-3 font-semibold w-10">
+                    <span className="sr-only">Select</span>
+                  </th>
+                )}
+                <th className="px-4 py-3 font-semibold">Date</th>
+                <th className="px-4 py-3 font-semibold">Payee / memo</th>
+                <th className="px-4 py-3 font-semibold">Reference</th>
+                <th className="px-4 py-3 font-semibold text-right">Amount</th>
+                <th className="px-4 py-3 font-semibold text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-[var(--border-subtle)]">
+              {(list?.lines ?? []).map((line) => {
+                const early = !line.isMatched && !line.isExcluded && isBeforeBooksStart(line.postedDate, booksStart);
+                return (
+                <tr key={line.id} className="text-[var(--text-main)] align-top">
+                  {canManage && status === 'unmatched' && (
+                    <td className="px-3 py-2.5">
+                      {!line.isMatched && !line.isExcluded && !early && line.amount < 0 && (
+                        <input
+                          type="checkbox"
+                          aria-label={`Select line ${line.id}`}
+                          checked={selectedIds.includes(line.id)}
+                          onChange={() => toggleSelected(line.id)}
+                          className="rounded border-[var(--border-subtle)]"
+                        />
+                      )}
+                    </td>
+                  )}
+                  <td className="px-4 py-2.5 whitespace-nowrap">
+                    {String(line.postedDate).slice(0, 10)}
+                    {early && (
+                      <div
+                        className="mt-1 inline-flex px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide bg-amber-500/15 text-amber-700 dark:text-amber-300"
+                        title={`Dated before the books start date (${booksStart}). It can only be excluded.`}
+                      >
+                        Before books start
+                      </div>
+                    )}
+                  </td>
+                  <td className="px-4 py-2.5">
+                    <div>{line.payee || '—'}</div>
+                    {line.memo && <div className="text-xs text-[var(--text-muted)]">{line.memo}</div>}
+                  </td>
+                  <td className="px-4 py-2.5 max-w-[14rem]">
+                    {line.reference ? (
+                      // Long references (bank transfer IDs, card descriptors) are cut off; hover shows the whole value.
+                      <span className="block truncate" title={line.reference}>
+                        {line.reference}
+                      </span>
+                    ) : (
+                      '—'
+                    )}
+                  </td>
+                  <td className="px-4 py-2.5 text-right font-mono">{formatCurrency(line.amount)}</td>
+                  <td className="px-4 py-2.5 text-right">
+                    {canManage && line.isExcluded && (
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void lineAction(line, 'Include')}
+                        className="inline-flex items-center gap-1 h-8 px-3 rounded-lg text-xs font-semibold text-[var(--text-secondary)] hover:bg-[var(--bg-surface-hover)]"
+                      >
+                        Include
+                      </button>
+                    )}
+                    {canManage && line.isMatched && !line.isExcluded && (
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void lineAction(line, 'Unmatch')}
+                        className="inline-flex items-center gap-1 h-8 px-3 rounded-lg text-xs font-semibold text-[var(--text-secondary)] hover:bg-[var(--bg-surface-hover)]"
+                      >
+                        <Link2Off className="w-3.5 h-3.5" /> Unmatch
+                      </button>
+                    )}
+                    {canManage && !line.isMatched && !line.isExcluded && (
+                      <div className="flex flex-wrap items-center justify-end gap-2">
+                        {!early && line.candidates.length > 0 && (
+                          <>
+                            <select
+                              aria-label="Ledger line to match"
+                              value={pickedCandidate[line.id] ?? String(line.candidates[0].generalLedgerLineId)}
+                              onChange={(e) => setPickedCandidate((prev) => ({ ...prev, [line.id]: e.target.value }))}
+                              className="h-8 px-2 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-subtle)] text-xs max-w-[220px]"
+                            >
+                              {line.candidates.map((c) => (
+                                <option key={c.generalLedgerLineId} value={c.generalLedgerLineId}>
+                                  {String(c.date).slice(0, 10)} · {c.description || `Entry ${c.generalLedgerHeaderId}`}
+                                </option>
+                              ))}
+                            </select>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() =>
+                                setMatchConfirm({ line, ledgerId: Number(pickedCandidate[line.id] ?? line.candidates[0].generalLedgerLineId) })
+                              }
+                              className="h-8 px-3 rounded-lg text-xs font-semibold text-white bg-[var(--brand-primary)] disabled:opacity-50"
+                            >
+                              Match
+                            </button>
+                          </>
+                        )}
+                        {!early && line.amount < 0 && ((canRecordExpense && !line.draftBillId) || canPayOpenBill) && (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => { setExpenseMode('expense'); setExpenseFor(line); }}
+                            className="inline-flex items-center gap-1 h-8 px-3 rounded-lg text-xs font-semibold text-white bg-[var(--brand-primary)] disabled:opacity-50"
+                          >
+                            {canRecordExpense && !line.draftBillId ? 'Record expense' : 'Pay open bill'}
+                          </button>
+                        )}
+                        {!early && line.amount < 0 && !line.draftBillId && canCreateLinkedEntry && (
+                          <button type="button" disabled={busy} onClick={() => setLinkedEntryFor({ line, kind: 'Personal' })}
+                            className="h-8 px-3 rounded-lg text-xs font-semibold border border-[var(--border-subtle)] hover:bg-[var(--bg-surface-hover)]">Personal</button>
+                        )}
+                        {!early && line.amount < 0 && canDraft && !line.draftBillId && (
+                          <button type="button" disabled={busy} onClick={() => { setExpenseMode('draft'); setExpenseFor(line); }}
+                            className="h-8 px-3 rounded-lg text-xs font-semibold border border-[var(--border-subtle)]">Save bill draft</button>
+                        )}
+                        {line.draftBillId && <Link className="text-xs underline" to={`/org/${currentOrg.slug}/purchases/${line.draftBillId}`}>Review linked bill #{line.draftBillId}</Link>}
+                        {!early && line.amount > 0 && (canApplyOpenInvoice || canRecordOtherIncome) && (
+                          <>
+                            {canApplyOpenInvoice && (
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => setApplyFor(line)}
+                                className="inline-flex items-center gap-1 h-8 px-3 rounded-lg text-xs font-semibold text-white bg-[var(--brand-primary)] disabled:opacity-50"
+                              >
+                                Apply invoice
+                              </button>
+                            )}
+                            {canRecordOtherIncome && (
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => setIncomeFor(line)}
+                                className="inline-flex items-center gap-1 h-8 px-3 rounded-lg text-xs font-semibold text-[var(--text-main)] border border-[var(--border-subtle)] hover:bg-[var(--bg-surface-hover)]"
+                              >
+                                Other income
+                              </button>
+                            )}
+                          </>
+                        )}
+                        {!early && line.amount > 0 && !line.draftBillId && canCreateLinkedEntry && (
+                          <button type="button" disabled={busy} onClick={() => setLinkedEntryFor({ line, kind: 'MoneyIn' })}
+                            className="h-8 px-3 rounded-lg text-xs font-semibold border border-[var(--border-subtle)] hover:bg-[var(--bg-surface-hover)]">Money I put in</button>
+                        )}
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => setExcludeFor(line)}
+                          className="inline-flex items-center gap-1 h-8 px-3 rounded-lg text-xs font-semibold text-[var(--text-main)] border border-[var(--border-subtle)] hover:bg-[var(--bg-surface-hover)]"
+                        >
+                          Exclude
+                        </button>
+                        {!early && hasFinancials && canCreateTx && (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => setCreateFor(line)}
+                            className="inline-flex items-center gap-1 h-8 px-3 rounded-lg text-xs font-semibold text-[var(--text-main)] border border-[var(--border-subtle)] hover:bg-[var(--bg-surface-hover)]"
+                          >
+                            <Plus className="w-3.5 h-3.5" /> Create transaction
+                          </button>
+                        )}
+                      </div>
+                    )}
+                    {line.isExcluded && line.exclusionReason != null && (
+                      <div className="mt-1 text-xs text-[var(--text-muted)]">
+                        {STATEMENT_EXCLUSION_REASONS.find((r) => r.value === line.exclusionReason)?.label ||
+                          'Excluded'}
+                        {line.exclusionNote ? ` · ${line.exclusionNote}` : ''}
+                      </div>
+                    )}
+                  </td>
+                </tr>
+                );
+              })}
+              {list && list.lines.length === 0 && (
+                <tr>
+                  <td colSpan={5} className="px-4 py-8 text-center text-[var(--text-muted)]">
+                    {status === 'unmatched'
+                      ? 'Nothing waiting to be matched.'
+                      : status === 'excluded'
+                        ? 'No excluded lines.'
+                        : 'No statement lines.'}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      {expenseFor && (
+        <StatementLineExpenseDialog
+          initialMode={expenseMode}
+          bankAccountName={account.name}
+          line={expenseFor}
+          additionalLineIds={expenseMode === 'draft' ? [] : selectedIds.filter((id) => id !== expenseFor.id)}
+          formatCurrency={formatCurrency}
+          onClose={() => setExpenseFor(null)}
+          onSaved={async () => {
+            setExpenseFor(null);
+            setSelectedIds([]);
+            await loadLines(status, page);
+          }}
+        />
+      )}
+      {linkedEntryFor && <LinkedEntryDialog
+        line={linkedEntryFor.line}
+        workBankId={id}
+        initialKind={linkedEntryFor.kind}
+        workCurrency={currentOrg.currency || 'USD'}
+        onClose={() => setLinkedEntryFor(null)}
+        onSaved={async warning => {
+          setLinkedEntryFor(null);
+          setNotice(warning || 'Linked journals created. If this workspace requires review, the personal entry will post after the work journal is approved.');
+          await loadLines(status, page);
+        }} />}
+      {matchConfirm && <ConfirmDialog title="Match existing ledger entry?"
+        message={`Match ${formatCurrency(matchConfirm.line.amount)} dated ${matchConfirm.line.postedDate.slice(0, 10)} in ${account.name} to ledger line ${matchConfirm.ledgerId}. This links an existing posting; it does not create another payment.`}
+        confirmLabel="Confirm match" busy={busy} onCancel={() => setMatchConfirm(null)}
+        onConfirm={() => { void lineAction(matchConfirm.line, 'Match', matchConfirm.ledgerId).then(() => setMatchConfirm(null)); }} />}
+
+      {applyFor && (
+        <StatementLineApplyInvoiceDialog
+          line={applyFor}
+          formatCurrency={formatCurrency}
+          onClose={() => setApplyFor(null)}
+          onSaved={async () => {
+            setApplyFor(null);
+            await loadLines(status, page);
+          }}
+        />
+      )}
+
+      {incomeFor && (
+        <StatementLineOtherIncomeDialog
+          line={incomeFor}
+          formatCurrency={formatCurrency}
+          onClose={() => setIncomeFor(null)}
+          onSaved={async () => {
+            setIncomeFor(null);
+            await loadLines(status, page);
+          }}
+        />
+      )}
+
+      {excludeFor && (
+        <StatementLineExcludeDialog
+          line={excludeFor}
+          formatCurrency={formatCurrency}
+          onClose={() => setExcludeFor(null)}
+          onSaved={async () => {
+            setExcludeFor(null);
+            await loadLines(status, page);
+          }}
+        />
+      )}
+
+      {createFor && (
+        <StatementLineTransactionDialog
+          line={createFor}
+          formatCurrency={formatCurrency}
+          onClose={() => setCreateFor(null)}
+          onSaved={async () => {
+            setCreateFor(null);
+            await loadLines(status, page);
+          }}
+        />
+      )}
+    </div>
+  );
+};
+
+export default BankStatementImportPage;

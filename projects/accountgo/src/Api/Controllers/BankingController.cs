@@ -1,0 +1,1247 @@
+// Copyright (c) 2015-2026 Marvin Perez and AccountGo contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
+#nullable enable
+using System;
+using System.Data;
+using System.Globalization;
+using Api.Data;
+using Api.Filters;
+using Core.Authorization;
+using Core.Domain.Security;
+using Core.Entitlements;
+using Core.Tenancy;
+using Dto.Banking;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Services.Banking;
+using Services.Financial;
+
+namespace Api.Controllers
+{
+    [TenantScoped]
+    [Route("api/[controller]")]
+    [RequireModule(SystemModules.Sales, SystemModules.Purchases, SystemModules.Financials)]
+    public class BankingController : BaseController
+    {
+        private readonly IBankAccountService _banks;
+        private readonly IBankTransactionService _transactions;
+        private readonly IBankReconciliationService _reconciliations;
+        private readonly IBankStatementImportService _statements;
+        private readonly IStatementLineExpenseService _statementExpenses;
+        private readonly IStatementLineInvoiceService _statementInvoices;
+        private readonly IStatementIncomeRecorder _statementIncome;
+        private readonly ITenantContext _tenant;
+        private readonly IEntitlementService _entitlements;
+        private readonly IBooksLockGuard _booksLockGuard;
+        private readonly ApiDbContext _db;
+        private readonly Core.Authorization.IWorkspacePolicyTransaction _policyTransaction;
+
+        public BankingController(
+            IBankAccountService banks,
+            IBankTransactionService transactions,
+            IBankReconciliationService reconciliations,
+            IBankStatementImportService statements,
+            IStatementLineExpenseService statementExpenses,
+            IStatementLineInvoiceService statementInvoices,
+            IStatementIncomeRecorder statementIncome,
+            ITenantContext tenant,
+            IEntitlementService entitlements,
+            IBooksLockGuard booksLockGuard,
+            ApiDbContext db,
+            Core.Authorization.IWorkspacePolicyTransaction policyTransaction = null)
+        {
+            _banks = banks;
+            _transactions = transactions;
+            _reconciliations = reconciliations;
+            _statements = statements;
+            _statementExpenses = statementExpenses;
+            _statementInvoices = statementInvoices;
+            _statementIncome = statementIncome;
+            _tenant = tenant;
+            _entitlements = entitlements;
+            _booksLockGuard = booksLockGuard;
+            _db = db;
+            _policyTransaction = policyTransaction;
+        }
+
+        [HttpGet("Accounts")]
+        [RequirePermission(SystemPermissions.BankingAccountsView)]
+        public IActionResult ListAccounts([FromQuery] bool includeArchived = false)
+        {
+            return Ok(_banks.List(
+                includeArchived,
+                includeFullNumbers: CanManage(),
+                includeCashHistoryCodes: HasFinancialsModule()));
+        }
+
+        [HttpGet("Accounts/Picker")]
+        [RequireOperation(AccessOperationCatalog.BankingAccountsPicker)]
+        public IActionResult Picker()
+        {
+            if (!CanPickBanks())
+                return RequirePermissionAttribute.Denied(SystemPermissions.BankingAccountsView);
+
+            var includeOther = CanCreatePayments() && HasFinancialsModule();
+            return Ok(_banks.Picker(includeOther));
+        }
+
+        [HttpGet("Accounts/CashHistory")]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        public IActionResult CashHistory()
+        {
+            return Ok(_banks.GetCashHistory(includeCodes: HasFinancialsModule()));
+        }
+
+        [HttpGet("Accounts/EligiblePostingAccounts")]
+        [RequireModule(SystemModules.Financials)]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        public IActionResult EligiblePostingAccounts()
+        {
+            return Ok(_banks.EligiblePostingAccounts());
+        }
+
+        [HttpGet("Accounts/{id:int}")]
+        [RequirePermission(SystemPermissions.BankingAccountsView)]
+        public IActionResult GetAccount(int id)
+        {
+            try
+            {
+                return Ok(_banks.Get(id, includeFullNumbers: CanManage()));
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Bank account not found" });
+            }
+        }
+
+        [HttpGet("Accounts/{id:int}/Register")]
+        [RequirePermission(SystemPermissions.BankingAccountsView)]
+        public IActionResult GetRegister(
+            int id,
+            [FromQuery] string? from = null,
+            [FromQuery] string? to = null,
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = BankAccountService.RegisterDefaultPageSize)
+        {
+            try
+            {
+                return Ok(_banks.GetRegister(id, ParseRegisterDate(from), ParseRegisterDate(to), page, pageSize));
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Bank account not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or FormatException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpGet("Accounts/{id:int}/OutstandingAging")]
+        [RequireModule(SystemModules.Financials)]
+        [RequirePermission(SystemPermissions.BankingAccountsView)]
+        public IActionResult GetOutstandingAging(int id, [FromQuery] string? asOf = null)
+        {
+            try
+            {
+                return Ok(_banks.GetOutstandingAging(id, ParseRegisterDate(asOf)));
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Bank account not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or FormatException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPost("Accounts/{id:int}/BalanceCheck")]
+        [RequireModule(SystemModules.Sales, SystemModules.Purchases)]
+        [RequirePermission(SystemPermissions.BankingAccountsView)]
+        public IActionResult CheckBalance(int id, [FromBody] BankBalanceCheckRequest request)
+        {
+            try
+            {
+                return Ok(_banks.CheckBalance(id, request));
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Bank account not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpGet("CloseStatus")]
+        [RequireModule(SystemModules.Financials)]
+        [RequirePermission(SystemPermissions.BankingAccountsView)]
+        public IActionResult GetCloseStatus([FromQuery] string? asOf = null)
+        {
+            try
+            {
+                var status = _banks.GetCloseStatus(ParseRegisterDate(asOf));
+                return status == null ? NoContent() : Ok(status);
+            }
+            catch (FormatException ex)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        private static DateTime? ParseRegisterDate(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return null;
+            if (DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var parsed))
+                return parsed.Date;
+            throw new FormatException($"Invalid date '{value}'. Use yyyy-MM-dd.");
+        }
+
+        [HttpPost("Accounts")]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        public IActionResult CreateAccount([FromBody] CreateBankAccountRequest request)
+        {
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var created = _banks.Create(request, includeFullNumbers: true);
+                tx.Commit();
+                return CreatedAtAction(nameof(GetAccount), new { id = created.Id }, created);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPut("Accounts/{id:int}")]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        public IActionResult UpdateAccount(int id, [FromBody] UpdateBankAccountRequest request)
+        {
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var updated = _banks.Update(id, request, includeFullNumbers: true);
+                tx.Commit();
+                return Ok(updated);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Bank account not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPost("Accounts/{id:int}/Archive")]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        public IActionResult Archive(int id, [FromQuery] bool confirm = false)
+        {
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var archived = _banks.Archive(id, includeFullNumbers: true, confirmNonZeroBalance: confirm);
+                tx.Commit();
+                return Ok(archived);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Bank account not found" });
+            }
+            catch (BankArchiveConfirmationRequiredException ex)
+            {
+                return Conflict(new
+                {
+                    code = "ARCHIVE_CONFIRM_REQUIRED",
+                    message = ex.Message,
+                    balance = ex.Balance
+                });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPost("Accounts/{id:int}/Unarchive")]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        public IActionResult Unarchive(int id)
+        {
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var restored = _banks.Unarchive(id, includeFullNumbers: true);
+                tx.Commit();
+                return Ok(restored);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Bank account not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPost("Accounts/{id:int}/SetDefault")]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        public IActionResult SetDefault(int id, [FromQuery(Name = "for")] string forKind)
+        {
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var updated = _banks.SetDefault(id, forKind, includeFullNumbers: true);
+                tx.Commit();
+                return Ok(updated);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Bank account not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpGet("Transactions")]
+        [RequireModule(SystemModules.Financials)]
+        [RequirePermission(SystemPermissions.BankingAccountsView)]
+        public IActionResult ListTransactions(
+            [FromQuery] int bankId,
+            [FromQuery] string? from = null,
+            [FromQuery] string? to = null)
+        {
+            try
+            {
+                return Ok(new BankTransactionListDto
+                {
+                    Transactions = _transactions.List(bankId, ParseRegisterDate(from), ParseRegisterDate(to))
+                });
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Bank account not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or FormatException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPost("Transactions")]
+        [RequireModule(SystemModules.Financials)]
+        [RequirePermission(SystemPermissions.BankingTransactionsCreate)]
+        public IActionResult CreateTransaction([FromBody] CreateBankTransactionRequest request)
+        {
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var created = _transactions.Create(request);
+                tx.Commit();
+                return Ok(created);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Bank account not found" });
+            }
+            catch (ReconciledPeriodConfirmationRequiredException ex)
+            {
+                return ReconciledPeriodConflict(ex);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPost("Transactions/{id:int}/Void")]
+        [RequireModule(SystemModules.Financials)]
+        [RequirePermission(SystemPermissions.BankingTransactionsCreate)]
+        public IActionResult VoidTransaction(int id, [FromBody] VoidBankTransactionRequest? request)
+        {
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var voided = _transactions.Void(id, request ?? new VoidBankTransactionRequest());
+                tx.Commit();
+                return Ok(voided);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Bank transaction not found" });
+            }
+            catch (ReconciledTransactionException ex)
+            {
+                return ReconciledConflict(ex);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpGet("Reconciliations")]
+        [RequireModule(SystemModules.Financials)]
+        [RequirePermission(SystemPermissions.BankingAccountsView)]
+        public IActionResult ListReconciliations([FromQuery] int bankId)
+        {
+            try
+            {
+                return Ok(_reconciliations.List(bankId));
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Bank account not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPost("Reconciliations")]
+        [RequireModule(SystemModules.Financials)]
+        [RequirePermission(SystemPermissions.BankingReconcile)]
+        public IActionResult StartReconciliation([FromBody] StartBankReconciliationRequest request)
+        {
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var created = _reconciliations.Start(request, GetUserNameFromRequestHeader() ?? string.Empty);
+                tx.Commit();
+                return Ok(created);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Bank account not found" });
+            }
+            catch (BankReconciliationConflictException ex)
+            {
+                return ReconciliationConflict(ex);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpGet("Reconciliations/{id:int}")]
+        [RequireModule(SystemModules.Financials)]
+        [RequirePermission(SystemPermissions.BankingAccountsView)]
+        public IActionResult GetReconciliation(int id)
+        {
+            try
+            {
+                return Ok(_reconciliations.Get(id));
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Reconciliation not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPut("Reconciliations/{id:int}/Items")]
+        [RequireModule(SystemModules.Financials)]
+        [RequirePermission(SystemPermissions.BankingReconcile)]
+        public IActionResult UpdateReconciliationItems(int id, [FromBody] UpdateBankReconciliationItemsRequest request)
+        {
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var updated = _reconciliations.UpdateItems(id, request);
+                tx.Commit();
+                return Ok(updated);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Reconciliation not found" });
+            }
+            catch (BankReconciliationConflictException ex)
+            {
+                return ReconciliationConflict(ex);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPost("Reconciliations/{id:int}/Adjustments")]
+        [RequireModule(SystemModules.Financials)]
+        [RequirePermission(SystemPermissions.BankingReconcile)]
+        [RequirePermission(SystemPermissions.BankingTransactionsCreate)]
+        public IActionResult AddReconciliationAdjustment(int id, [FromBody] CreateReconciliationAdjustmentRequest request)
+        {
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var updated = _reconciliations.AddAdjustment(id, request);
+                tx.Commit();
+                return Ok(updated);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Reconciliation not found" });
+            }
+            catch (BankReconciliationConflictException ex)
+            {
+                return ReconciliationConflict(ex);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPost("Reconciliations/{id:int}/Finish")]
+        [RequireModule(SystemModules.Financials)]
+        [RequirePermission(SystemPermissions.BankingReconcile)]
+        public IActionResult FinishReconciliation(int id, [FromBody] FinishBankReconciliationRequest request)
+        {
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var finished = _reconciliations.Finish(id, request, GetUserNameFromRequestHeader() ?? string.Empty);
+                tx.Commit();
+                return Ok(finished);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Reconciliation not found" });
+            }
+            catch (BankReconciliationConflictException ex)
+            {
+                return ReconciliationConflict(ex);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPost("Reconciliations/{id:int}/Undo")]
+        [RequireModule(SystemModules.Financials)]
+        [RequirePermission(SystemPermissions.BankingReconcileUndo)]
+        public IActionResult UndoReconciliation(int id, [FromBody] UndoBankReconciliationRequest request)
+        {
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var undone = _reconciliations.Undo(id, request, GetUserNameFromRequestHeader() ?? string.Empty);
+                tx.Commit();
+                return Ok(undone);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Reconciliation not found" });
+            }
+            catch (BankReconciliationConflictException ex)
+            {
+                return ReconciliationConflict(ex);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPost("Reconciliations/{id:int}/Review")]
+        [RequireModule(SystemModules.Financials)]
+        [RequirePermission(SystemPermissions.BankingReconcile)]
+        public IActionResult ReviewReconciliation(int id)
+        {
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var reviewed = _reconciliations.Review(id, GetUserNameFromRequestHeader() ?? string.Empty);
+                tx.Commit();
+                return Ok(reviewed);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Reconciliation not found" });
+            }
+            catch (BankReconciliationConflictException ex)
+            {
+                return ReconciliationConflict(ex);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpDelete("Reconciliations/{id:int}")]
+        [RequireModule(SystemModules.Financials)]
+        [RequirePermission(SystemPermissions.BankingReconcile)]
+        public IActionResult DiscardReconciliation(int id)
+        {
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                _reconciliations.DiscardDraft(id);
+                tx.Commit();
+                return NoContent();
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Reconciliation not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpGet("Reconciliations/{id:int}/Report.pdf")]
+        [RequireModule(SystemModules.Financials)]
+        [RequirePermission(SystemPermissions.BankingAccountsView)]
+        public IActionResult ReconciliationReportPdf(int id)
+        {
+            try
+            {
+                var report = _reconciliations.GetReport(id);
+                var document = new Api.Service.BankReconciliationReportPdfDocument(report);
+                var bytes = QuestPDF.Fluent.GenerateExtensions.GeneratePdf(document);
+                return File(bytes, "application/pdf", $"{document.FileStem}.pdf");
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Reconciliation not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPost("Accounts/{bankId:int}/StatementImports/Preview")]
+        [RequireStatementImport]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        public IActionResult PreviewStatementImport(int bankId, [FromBody] BankStatementImportRequest request)
+        {
+            try
+            {
+                return Ok(_statements.Preview(bankId, request));
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Bank account not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        /// <summary>Saved mapping or built-in preset for this CSV header — never skips preview (#447 Phase B).</summary>
+        [HttpPost("Accounts/{bankId:int}/StatementImports/ResolveMapping")]
+        [RequireStatementImport]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        public IActionResult ResolveStatementMapping(int bankId, [FromBody] BankStatementImportRequest request)
+        {
+            try
+            {
+                return Ok(_statements.ResolveMapping(bankId, request));
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Bank account not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPost("Accounts/{bankId:int}/StatementImports")]
+        [RequireStatementImport]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        public IActionResult CommitStatementImport(int bankId, [FromBody] BankStatementImportRequest request)
+        {
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var result = _statements.Commit(bankId, request, GetUserNameFromRequestHeader() ?? string.Empty);
+                tx.Commit();
+                return Ok(result);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Bank account not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpGet("Accounts/{bankId:int}/StatementLines")]
+        [RequireStatementImport]
+        [RequirePermission(SystemPermissions.BankingAccountsView)]
+        public IActionResult ListStatementLines(
+            int bankId,
+            [FromQuery] string? status = null,
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = BankStatementImportService.DefaultListPageSize,
+            [FromQuery] int? lineId = null)
+        {
+            try
+            {
+                return Ok(_statements.ListLines(bankId, status, page, pageSize, lineId));
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Bank account not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpGet("StatementLines/ForBill/{billId:int}")]
+        [RequireStatementImport]
+        [RequirePermission(SystemPermissions.BankingAccountsView)]
+        [RequirePermission(SystemPermissions.PurchasesBillsView)]
+        public IActionResult StatementLinesForBill(int billId)
+        {
+            var companyId = _tenant.RequireCompanyId();
+            var paymentHeaders = _db.VendorPayments.Where(p => p.CompanyId == companyId &&
+                p.PurchaseInvoiceHeaderId == billId && p.GeneralLedgerHeaderId != null)
+                .Select(p => p.GeneralLedgerHeaderId);
+            var paymentLines = _db.GeneralLedgerLines.Where(l => l.CompanyId == companyId &&
+                paymentHeaders.Contains(l.GeneralLedgerHeaderId)).Select(l => (int?)l.Id);
+            return Ok(_db.BankStatementLines.AsNoTracking().Where(l => l.CompanyId == companyId &&
+                (l.DraftBillId == billId || paymentLines.Contains(l.MatchedGeneralLedgerLineId)))
+                .Select(l => new { l.Id, l.BankId }).ToList());
+        }
+
+        [HttpPost("StatementLines/{id:int}/Match")]
+        [RequireStatementImport]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        public IActionResult MatchStatementLine(int id, [FromBody] MatchBankStatementLineRequest? request)
+        {
+            if (RefuseIfBooksLocked(id) is { } locked)
+                return locked;
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var matched = _statements.Match(id, request ?? new MatchBankStatementLineRequest());
+                AuditStatementDecision(id, "match");
+                tx.Commit();
+                return Ok(matched);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Statement line not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPost("StatementLines/{id:int}/Unmatch")]
+        [RequireStatementImport]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        public IActionResult UnmatchStatementLine(int id)
+        {
+            if (RefuseIfBooksLocked(id) is { } locked)
+                return locked;
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var unmatched = _statements.Unmatch(id);
+                AuditStatementDecision(id, "unmatch");
+                tx.Commit();
+                return Ok(unmatched);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Statement line not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPost("StatementLines/{id:int}/CreateTransaction")]
+        [RequireModule(SystemModules.Financials)]
+        [RequirePermission(SystemPermissions.BankingReconcile)]
+        [RequirePermission(SystemPermissions.BankingTransactionsCreate)]
+        public IActionResult CreateTransactionFromStatementLine(int id, [FromBody] CreateTransactionFromStatementLineRequest request)
+        {
+            if (RefuseBeforeBooksStart(id) is { } refused)
+                return refused;
+            if (RefuseIfBooksLocked(id) is { } locked)
+                return locked;
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var matched = _statements.CreateTransaction(id, request);
+                AuditStatementDecision(id, "create_transaction");
+                tx.Commit();
+                return Ok(matched);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Statement line not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        /// <summary>Curated expense categories (name only) plus More… for Record expense (#436 I2).</summary>
+        [HttpGet("StatementExpenseCategories")]
+        [RequireStatementImport]
+        [RequireModule(SystemModules.Purchases)]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        [RequirePermission(SystemPermissions.PurchasesBillsView)]
+        public IActionResult StatementExpenseCategories() =>
+            Ok(_statementExpenses.ListExpenseCategories());
+
+        /// <summary>Remembered vendor + category for a bank description (#436 I4).</summary>
+        [HttpGet("StatementDescriptionRule")]
+        [RequireStatementImport]
+        [RequireModule(SystemModules.Purchases)]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        [RequirePermission(SystemPermissions.PurchasesBillsView)]
+        public IActionResult StatementDescriptionRule([FromQuery] string? description)
+        {
+            var rule = _statementExpenses.FindDescriptionRule(description);
+            return rule == null ? NoContent() : Ok(rule);
+        }
+
+        [HttpPost("StatementLines/BulkRecordExpense")]
+        [RequireStatementImport]
+        [RequireModule(SystemModules.Purchases)]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        [RequirePermission(SystemPermissions.PurchasesBillsCreate)]
+        [RequirePermission(SystemPermissions.PurchasesBillsPost)]
+        [RequirePermission(SystemPermissions.PurchasesPaymentsCreate)]
+        public IActionResult BulkRecordExpenseFromStatementLines([FromBody] BulkRecordExpenseFromStatementLinesRequest request)
+        {
+            if (request?.NewVendor != null && !string.IsNullOrWhiteSpace(request.NewVendor.Name)
+                && !_tenant.Permissions.Contains(SystemPermissions.PurchasesVendorsManage))
+                return RequirePermissionAttribute.Denied(SystemPermissions.PurchasesVendorsManage);
+            if (RefuseBeforeBooksStart(request?.LineIds?.ToArray() ?? Array.Empty<int>()) is { } refused)
+                return refused;
+            if (RefuseIfBooksLocked(request?.LineIds?.ToArray() ?? Array.Empty<int>()) is { } locked)
+                return locked;
+            Core.Authorization.IWorkspacePolicyCompletionToken? scope = null;
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                scope = _policyTransaction?.BeginExternalScope();
+                var result = _statementExpenses.BulkRecordExpense(request, GetUserNameFromRequestHeader() ?? string.Empty);
+                foreach (var lineId in request.LineIds) AuditStatementDecision(lineId, "record_expense");
+                tx.Commit();
+                // Approved bills committed; dispose first so the drain sees no ambient transaction, then
+                // drain ONLY this scope's deferred telemetry. Never throws.
+                tx.Dispose();
+                scope?.Committed();
+                return Ok(result);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                scope?.RolledBack();
+                return NotFound(new { message = "Statement line not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                scope?.RolledBack();
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPost("StatementLines/{id:int}/RecordExpense")]
+        [RequireStatementImport]
+        [RequireModule(SystemModules.Purchases)]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        [RequirePermission(SystemPermissions.PurchasesBillsCreate)]
+        [RequirePermission(SystemPermissions.PurchasesBillsPost)]
+        [RequirePermission(SystemPermissions.PurchasesPaymentsCreate)]
+        public IActionResult RecordExpenseFromStatementLine(int id, [FromBody] RecordExpenseFromStatementLineRequest request)
+        {
+            if (request?.NewVendor != null && !string.IsNullOrWhiteSpace(request.NewVendor.Name)
+                && !_tenant.Permissions.Contains(SystemPermissions.PurchasesVendorsManage))
+                return RequirePermissionAttribute.Denied(SystemPermissions.PurchasesVendorsManage);
+            if (RefuseBeforeBooksStart(id) is { } refused)
+                return refused;
+            if (RefuseIfBooksLocked(id) is { } locked)
+                return locked;
+            Core.Authorization.IWorkspacePolicyCompletionToken? scope = null;
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                scope = _policyTransaction?.BeginExternalScope();
+                var result = _statementExpenses.RecordExpense(id, request, GetUserNameFromRequestHeader() ?? string.Empty);
+                AuditStatementDecision(id, "record_expense");
+                tx.Commit();
+                // Approved bill committed; dispose first so the drain sees no ambient transaction, then
+                // drain ONLY this scope's deferred telemetry. Never throws.
+                tx.Dispose();
+                scope?.Committed();
+                return Ok(result);
+            }
+
+            catch (TenantEntityNotFoundException)
+            {
+                scope?.RolledBack();
+                return NotFound(new { message = "Statement line not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                scope?.RolledBack();
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        /// <summary>Creates a linked bill draft without approval, payment or a statement match.</summary>
+        [HttpPost("StatementLines/{id:int}/DraftExpense")]
+        [RequireStatementImport]
+        [RequireModule(SystemModules.Purchases)]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        [RequirePermission(SystemPermissions.PurchasesBillsCreate)]
+        public IActionResult DraftExpenseFromStatementLine(int id, [FromBody] RecordExpenseFromStatementLineRequest request)
+        {
+            if (request?.NewVendor != null && !string.IsNullOrWhiteSpace(request.NewVendor.Name)
+                && !_tenant.Permissions.Contains(SystemPermissions.PurchasesVendorsManage))
+                return RequirePermissionAttribute.Denied(SystemPermissions.PurchasesVendorsManage);
+            if (RefuseBeforeBooksStart(id) is { } refused) return refused;
+            if (RefuseIfBooksLocked(id) is { } locked) return locked;
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var result = _statementExpenses.RecordExpense(id, request, GetUserNameFromRequestHeader() ?? string.Empty, saveDraft: true);
+                AuditStatementDecision(id, "save_draft");
+                tx.Commit();
+                return Ok(result);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Statement line not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPost("StatementLines/{id:int}/PayOpenBill")]
+        [RequireStatementImport]
+        [RequireModule(SystemModules.Purchases)]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        [RequirePermission(SystemPermissions.PurchasesPaymentsCreate)]
+        public IActionResult PayOpenBillFromStatementLine(int id, [FromBody] PayOpenBillFromStatementLineRequest request)
+        {
+            if (RefuseBeforeBooksStart(id) is { } refused)
+                return refused;
+            if (RefuseIfBooksLocked(id) is { } locked)
+                return locked;
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var result = _statementExpenses.PayOpenBill(id, request, GetUserNameFromRequestHeader() ?? string.Empty);
+                AuditStatementDecision(id, "record_bill_payment");
+                tx.Commit();
+                return Ok(result);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Statement line not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpGet("StatementIncomeCategories")]
+        [RequireStatementImport]
+        [RequireModule(SystemModules.Sales)]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        [RequirePermission(SystemPermissions.SalesInvoicesView)]
+        public IActionResult StatementIncomeCategories() =>
+            Ok(_statementIncome.ListIncomeCategories());
+
+        [HttpPost("StatementLines/{id:int}/RecordOtherIncome")]
+        [RequireStatementImport]
+        [RequireModule(SystemModules.Sales)]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        [RequirePermission(SystemPermissions.SalesInvoicesCreate)]
+        [RequirePermission(SystemPermissions.SalesInvoicesPost)]
+        [RequirePermission(SystemPermissions.SalesReceiptsCreate)]
+        public IActionResult RecordOtherIncomeFromStatementLine(int id, [FromBody] RecordOtherIncomeFromStatementLineRequest request)
+        {
+            if (RefuseBeforeBooksStart(id) is { } refused)
+                return refused;
+            if (RefuseIfBooksLocked(id) is { } locked)
+                return locked;
+            Core.Authorization.IWorkspacePolicyCompletionToken? scope = null;
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                scope = _policyTransaction?.BeginExternalScope();
+                var result = _statementIncome.Record(id, request, GetUserNameFromRequestHeader() ?? string.Empty);
+                AuditStatementDecision(id, "record_other_income");
+                tx.Commit();
+                // Posted income committed; dispose first so the drain sees no ambient transaction, then
+                // drain ONLY this scope's deferred telemetry. Never throws.
+                tx.Dispose();
+                scope?.Committed();
+                return Ok(result);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                scope?.RolledBack();
+                return NotFound(new { message = "Statement line not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                scope?.RolledBack();
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPost("StatementLines/{id:int}/ApplyOpenInvoice")]
+        [RequireStatementImport]
+        [RequireModule(SystemModules.Sales)]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        [RequirePermission(SystemPermissions.SalesReceiptsCreate)]
+        public IActionResult ApplyOpenInvoiceFromStatementLine(int id, [FromBody] ApplyOpenInvoiceFromStatementLineRequest request)
+        {
+            if (RefuseBeforeBooksStart(id) is { } refused)
+                return refused;
+            if (RefuseIfBooksLocked(id) is { } locked)
+                return locked;
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var result = _statementInvoices.ApplyOpenInvoice(id, request, GetUserNameFromRequestHeader() ?? string.Empty);
+                AuditStatementDecision(id, "apply_invoice");
+                tx.Commit();
+                return Ok(result);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Statement line not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPost("StatementLines/{id:int}/Exclude")]
+        [RequireStatementImport]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        public IActionResult ExcludeStatementLine(int id, [FromBody] ExcludeBankStatementLineRequest request)
+        {
+            if (RefuseIfBooksLocked(id) is { } locked)
+                return locked;
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var result = _statements.Exclude(id, request ?? new ExcludeBankStatementLineRequest(), GetUserNameFromRequestHeader() ?? string.Empty);
+                AuditStatementDecision(id, "exclude");
+                tx.Commit();
+                return Ok(result);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Statement line not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPost("Accounts/{bankId:int}/StatementLines/ExcludeBeforeBooksStart")]
+        [RequireStatementImport]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        public IActionResult ExcludeStatementLinesBeforeBooksStart(int bankId)
+        {
+            // Intentionally unguarded: lines before the books start can never post and are always on or before any lock date, so guarding would block the cleanup forever.
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var result = _statements.ExcludeBeforeBooksStart(bankId, GetUserNameFromRequestHeader() ?? string.Empty);
+                tx.Commit();
+                return Ok(result);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Bank account not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        [HttpPost("StatementLines/{id:int}/Include")]
+        [RequireStatementImport]
+        [RequirePermission(SystemPermissions.BankingAccountsManage)]
+        public IActionResult IncludeStatementLine(int id)
+        {
+            if (RefuseIfBooksLocked(id) is { } locked)
+                return locked;
+            try
+            {
+                using var tx = BeginWriteTransaction();
+                var result = _statements.Include(id);
+                AuditStatementDecision(id, "restore");
+                tx.Commit();
+                return Ok(result);
+            }
+            catch (TenantEntityNotFoundException)
+            {
+                return NotFound(new { message = "Statement line not found" });
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        private static IActionResult ReconciliationConflict(BankReconciliationConflictException ex) =>
+            new ConflictObjectResult(new
+            {
+                code = ex.Code,
+                message = ex.Message,
+                reconciliationId = ex.ReconciliationId
+            });
+
+        private static IActionResult ReconciledPeriodConflict(ReconciledPeriodConfirmationRequiredException ex) =>
+            new ConflictObjectResult(new
+            {
+                code = ReconciledPeriodConfirmationRequiredException.ErrorCode,
+                message = ex.Message,
+                bankName = ex.BankName,
+                statementEndDate = ex.StatementEndDate.ToString("yyyy-MM-dd"),
+                postingDate = ex.PostingDate.ToString("yyyy-MM-dd")
+            });
+
+        private static IActionResult ReconciledConflict(ReconciledTransactionException ex) =>
+            new ConflictObjectResult(new
+            {
+                code = ReconciledTransactionException.ErrorCode,
+                message = ex.Message,
+                bankName = ex.BankName,
+                statementEndDate = ex.StatementEndDate.ToString("yyyy-MM-dd")
+            });
+
+        private void AuditStatementDecision(int id, string action)
+        {
+            var line = _db.BankStatementLines.AsNoTracking()
+                .Single(l => l.Id == id && l.CompanyId == _tenant.RequireCompanyId());
+            _db.AuditLogs.Add(new Core.Domain.Auditing.AuditLog
+            {
+                CompanyId = line.CompanyId,
+                UserName = _tenant.UserId ?? GetUserNameFromRequestHeader() ?? "unknown",
+                AuditEventDateUTC = DateTime.UtcNow,
+                AuditEventType = (int)Core.Domain.Auditing.AuditEventTypes.Modified,
+                TableName = "BankStatementLine",
+                RecordId = id.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                FieldName = "ReviewDecision",
+                OriginalValue = string.Empty,
+                NewValue = System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    action, line.BankId, line.DraftBillId, line.MatchedGeneralLedgerLineId,
+                    line.ExclusionReason, line.ExclusionNote
+                })
+            });
+            _db.SaveChanges();
+        }
+
+        private Microsoft.EntityFrameworkCore.Storage.IDbContextTransaction BeginWriteTransaction() =>
+            RelationalDatabaseFacadeExtensions.BeginTransaction(_db.Database, IsolationLevel.Serializable);
+
+        private bool CanManage() =>
+            _tenant.IsResolved && _tenant.Permissions.Contains(SystemPermissions.BankingAccountsManage);
+
+        private bool CanPickBanks() =>
+            _tenant.IsResolved && (
+                _tenant.Permissions.Contains(SystemPermissions.SalesReceiptsCreate)
+                || _tenant.Permissions.Contains(SystemPermissions.PurchasesPaymentsCreate)
+                || _tenant.Permissions.Contains(SystemPermissions.BankingAccountsView));
+
+        private bool CanCreatePayments() =>
+            _tenant.IsResolved && _tenant.Permissions.Contains(SystemPermissions.PurchasesPaymentsCreate);
+
+        private bool HasFinancialsModule()
+        {
+            if (!_tenant.IsResolved)
+                return false;
+            var decision = _entitlements.Evaluate(
+                _tenant.RequireCompanyId(),
+                new EntitlementAction.Module(ModuleAccess.Read, SystemModules.Financials));
+            return decision.Allowed;
+        }
+
+        /// <summary>
+        /// A 400 when a statement line is dated before the books start date. Nothing can be posted for it, so the
+        /// request is refused before any vendor, document or payment work starts.
+        /// </summary>
+        private IActionResult? RefuseBeforeBooksStart(params int[] lineIds)
+        {
+            if (lineIds == null || lineIds.Length == 0)
+                return null;
+            var booksStart = _db.CompanySettings.Select(s => (DateTime?)s.BooksStartDate).FirstOrDefault()?.Date;
+            if (!booksStart.HasValue)
+                return null;
+            var earliest = _db.BankStatementLines
+                .Where(l => lineIds.Contains(l.Id) && l.PostedDate < booksStart.Value)
+                .OrderBy(l => l.PostedDate)
+                .Select(l => (DateTime?)l.PostedDate)
+                .FirstOrDefault();
+            return earliest.HasValue
+                ? BadRequest(new { message = new Core.Domain.BooksStartViolationException(earliest.Value, booksStart.Value).Message })
+                : null;
+        }
+
+        /// <summary>
+        /// A 400 when a statement line is dated on or before the books lock. Match/unmatch/exclude and record
+        /// actions are all refused for locked lines.
+        /// </summary>
+        private IActionResult? RefuseIfBooksLocked(params int[] lineIds)
+        {
+            if (lineIds == null || lineIds.Length == 0)
+                return null;
+            try
+            {
+                foreach (var posted in _db.BankStatementLines
+                    .Where(l => lineIds.Contains(l.Id))
+                    .Select(l => l.PostedDate)
+                    .ToList())
+                {
+                    _booksLockGuard.EnsureDateAllowed(posted);
+                }
+            }
+            catch (Core.Domain.BooksLockedException ex)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+
+            return null;
+        }
+    }
+}

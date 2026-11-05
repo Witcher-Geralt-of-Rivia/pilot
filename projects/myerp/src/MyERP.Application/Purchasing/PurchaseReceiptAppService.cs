@@ -1,0 +1,1495 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using MyERP.Accounting.DomainServices;
+using MyERP.Core.DomainServices;
+using MyERP.Core.Entities;
+using MyERP.Inventory.DomainServices;
+using MyERP.Permissions;
+using MyERP.Purchasing.Entities;
+using MyERP.Shared;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Settings;
+
+namespace MyERP.Purchasing;
+
+[Authorize(MyERPPermissions.PurchaseReceipts.Default)]
+public class PurchaseReceiptAppService : ApplicationService, IPurchaseReceiptAppService
+{
+    private readonly IRepository<PurchaseReceipt, Guid> _repository;
+    private readonly IRepository<PurchaseOrder, Guid> _purchaseOrderRepository;
+    private readonly IRepository<DocumentActivityLog, Guid> _activityLogRepository;
+    private readonly IRepository<Company, Guid> _companyRepository;
+    private readonly IDocumentNumberGenerator _numberGenerator;
+    private readonly StockValuationService _valuationService;
+    private readonly BinService _binService;
+    private readonly DocumentPostingOrchestrator _postingOrchestrator;
+    private readonly QualityInspectionEnforcementService _qiEnforcement;
+    private readonly ItemTransactionValidationService _itemValidation;
+
+    public PurchaseReceiptAppService(
+        IRepository<PurchaseReceipt, Guid> repository,
+        IRepository<PurchaseOrder, Guid> purchaseOrderRepository,
+        IRepository<DocumentActivityLog, Guid> activityLogRepository,
+        IRepository<Company, Guid> companyRepository,
+        IDocumentNumberGenerator numberGenerator,
+        StockValuationService valuationService,
+        BinService binService,
+        DocumentPostingOrchestrator postingOrchestrator,
+        QualityInspectionEnforcementService qiEnforcement,
+        ItemTransactionValidationService itemValidation)
+    {
+        _repository = repository;
+        _purchaseOrderRepository = purchaseOrderRepository;
+        _activityLogRepository = activityLogRepository;
+        _companyRepository = companyRepository;
+        _numberGenerator = numberGenerator;
+        _valuationService = valuationService;
+        _binService = binService;
+        _postingOrchestrator = postingOrchestrator;
+        _qiEnforcement = qiEnforcement;
+        _itemValidation = itemValidation;
+    }
+
+    public async Task<PurchaseReceiptDto> GetAsync(Guid id)
+    {
+        var receipt = await _repository.GetAsync(id);
+        var dto = ObjectMapper.Map<PurchaseReceipt, PurchaseReceiptDto>(receipt);
+
+        // Resolve supplier and warehouse names
+        var supplierRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Purchasing.Entities.Supplier, Guid>>();
+        var warehouseRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Inventory.Entities.Warehouse, Guid>>();
+
+        var supplier = await supplierRepo.FindAsync(receipt.SupplierId);
+        if (supplier != null) dto.SupplierName = supplier.Name;
+
+        var warehouse = await warehouseRepo.FindAsync(receipt.WarehouseId);
+        if (warehouse != null) dto.WarehouseName = warehouse.Name;
+
+        // Resolve item names for display
+        if (dto.Items?.Count > 0)
+        {
+            var itemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Inventory.Entities.Item, Guid>>();
+            var itemIds = dto.Items.Select(i => i.ItemId).Distinct().ToList();
+            var itemQuery = await itemRepo.GetQueryableAsync();
+            var itemNames = itemQuery.Where(i => itemIds.Contains(i.Id))
+                .Select(i => new { i.Id, i.ItemName }).ToList()
+                .ToDictionary(i => i.Id, i => i.ItemName);
+
+            foreach (var item in dto.Items)
+            {
+                if (itemNames.TryGetValue(item.ItemId, out var name))
+                    item.ItemName = name;
+            }
+
+            var rejectedWhIds = dto.Items
+                .Where(i => i.RejectedWarehouseId.HasValue)
+                .Select(i => i.RejectedWarehouseId!.Value)
+                .Distinct()
+                .ToList();
+            if (rejectedWhIds.Count > 0)
+            {
+                var rejectedWhs = await warehouseRepo.GetListAsync(w => rejectedWhIds.Contains(w.Id));
+                var rejectedNames = rejectedWhs.ToDictionary(w => w.Id, w => w.Name);
+                foreach (var item in dto.Items)
+                {
+                    if (item.RejectedWarehouseId.HasValue && rejectedNames.TryGetValue(item.RejectedWarehouseId.Value, out var rwName))
+                        item.RejectedWarehouseName = rwName;
+                }
+            }
+        }
+
+        return dto;
+    }
+
+    public async Task<PagedResultDto<PurchaseReceiptDto>> GetListAsync(CompanyFilteredPagedRequestDto input)
+    {
+        var query = await _repository.GetQueryableAsync();
+
+        if (input.CompanyId.HasValue)
+            query = query.Where(x => x.CompanyId == input.CompanyId.Value);
+
+        if (!string.IsNullOrWhiteSpace(input.Filter))
+        {
+            var filter = input.Filter; query = query.Where(x => x.ReceiptNumber.Contains(filter));
+        }
+
+        if (!string.IsNullOrWhiteSpace(input.Status) && Enum.TryParse<Core.DocumentStatus>(input.Status, true, out var status))
+            query = query.Where(x => x.Status == status);
+
+        if (input.FromDate.HasValue)
+            query = query.Where(x => x.PostingDate >= input.FromDate.Value);
+
+        if (input.ToDate.HasValue)
+            query = query.Where(x => x.PostingDate <= input.ToDate.Value);
+
+        var totalCount = query.Count();
+        var sorted = SortingHelper.ApplySorting(query, input.Sorting,
+            q => q.OrderByDescending(x => x.PostingDate),
+            ("receiptNumber", x => x.ReceiptNumber),
+            ("postingDate", x => x.PostingDate),
+            ("grandTotal", x => x.GrandTotal),
+            ("status", x => x.Status));
+        var list = sorted
+            .Skip(input.SkipCount)
+            .Take(input.MaxResultCount)
+            .ToList();
+
+        return new PagedResultDto<PurchaseReceiptDto>(
+            totalCount,
+            list.Select(x => ObjectMapper.Map<PurchaseReceipt, PurchaseReceiptDto>(x)).ToList());
+    }
+
+    [Authorize(MyERPPermissions.PurchaseReceipts.Create)]
+    public async Task<PurchaseReceiptDto> CreateAsync(CreatePurchaseReceiptDto input)
+    {
+        // Input validation
+        Check.NotDefaultOrNull<Guid>(input.CompanyId, nameof(input.CompanyId));
+        Check.NotDefaultOrNull<Guid>(input.SupplierId, nameof(input.SupplierId));
+        Check.NotDefaultOrNull<Guid>(input.WarehouseId, nameof(input.WarehouseId));
+        if (input.Items == null || input.Items.Count == 0)
+            throw new Volo.Abp.BusinessException("MyERP:01007")
+                .WithData("documentType", "Purchase Receipt");
+
+        // Validate all items are active
+        var itemIds = input.Items.Select(i => i.ItemId).ToList();
+        await _itemValidation.ValidateItemsForTransactionAsync(itemIds);
+        await _itemValidation.ValidateItemUomsForTransactionAsync(input.CompanyId, input.Items.Select(i => (i.ItemId, (string?)i.Uom)));
+
+        // ERPNext validate_party_frozen_disabled: no receipt from a disabled supplier
+        var partySupplier = await LazyServiceProvider.LazyGetRequiredService<IRepository<Supplier, Guid>>().FindAsync(input.SupplierId);
+        if (partySupplier != null)
+            await LazyServiceProvider.LazyGetRequiredService<Core.DomainServices.PartyValidationService>()
+                .ValidatePartyForTransactionAsync("Supplier", isDisabled: !partySupplier.IsActive, isFrozen: partySupplier.IsFrozen, partySupplier.Name, input.CompanyId);
+
+        var whRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Inventory.Entities.Warehouse, Guid>>();
+        var headerWh = await whRepo.FindAsync(input.WarehouseId);
+        if (headerWh != null && headerWh.CompanyId != input.CompanyId)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                .WithData("warehouseCompany", headerWh.CompanyId)
+                .WithData("receiptCompany", input.CompanyId);
+        }
+
+        await ValidateItemWarehousesAsync(input.Items, input.CompanyId);
+
+        var allWarehouseIds = input.Items
+            .SelectMany(i => new[] { i.WarehouseId, i.RejectedWarehouseId })
+            .Where(w => w.HasValue)
+            .Select(w => w!.Value)
+            .ToList();
+        allWarehouseIds.Add(input.WarehouseId);
+        allWarehouseIds = allWarehouseIds.Distinct().ToList();
+
+        var companyRestriction = LazyServiceProvider.LazyGetRequiredService<Core.DomainServices.CompanyRestrictionValidationService>();
+        await companyRestriction.ValidateTransactionCompanyAsync(
+            "PurchaseReceipt", input.CompanyId,
+            itemIds: itemIds,
+            supplierIds: new[] { input.SupplierId },
+            warehouseIds: allWarehouseIds.Count > 0 ? allWarehouseIds : null);
+
+        // Per gotcha #538: PR blocks future posting date
+        var maxAllowedDate = DateTime.Today > DateTime.UtcNow.Date ? DateTime.Today : DateTime.UtcNow.Date;
+        if (input.PostingDate.Date > maxAllowedDate)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Posting Date cannot be in the future for Purchase Receipts.");
+        }
+
+        // Per gotcha #1238 / #1508: PR posting date cannot be before linked PO date
+        if (input.PurchaseOrderId.HasValue)
+        {
+            var poRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseOrder, Guid>>();
+            var po = await poRepo.FindAsync(input.PurchaseOrderId.Value);
+            if (po != null)
+            {
+                if (po.CompanyId != input.CompanyId)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                        .WithData("purchaseOrderCompany", po.CompanyId)
+                        .WithData("receiptCompany", input.CompanyId);
+                }
+
+                // ERPNext check_purchase_order_on_hold_or_close: no receipt against a closed PO (returns exempt).
+                if (!input.IsReturn && po.Status == Core.DocumentStatus.Closed)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.LinkedPurchaseOrderClosed)
+                        .WithData("purchaseOrderNumber", po.OrderNumber);
+                }
+
+                if (input.PostingDate.Date < po.OrderDate.Date)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                        .WithData("detail", $"Posting Date cannot be before Purchase Order {po.OrderNumber} date ({po.OrderDate:yyyy-MM-dd}).");
+                }
+            }
+        }
+
+        var linkedPoItemIds = input.Items
+            .Where(i => i.PurchaseOrderItemId.HasValue)
+            .Select(i => i.PurchaseOrderItemId!.Value)
+            .Distinct()
+            .ToList();
+        if (linkedPoItemIds.Count > 0)
+        {
+            var poRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseOrder, Guid>>();
+            var poQuery = await poRepo.GetQueryableAsync();
+            var linkedPos = poQuery
+                .Where(po => po.Items.Any(i => linkedPoItemIds.Contains(i.Id)))
+                .ToList();
+
+            var crossCompanyPo = linkedPos.FirstOrDefault(po => po.CompanyId != input.CompanyId);
+            if (crossCompanyPo != null)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("purchaseOrderCompany", crossCompanyPo.CompanyId)
+                    .WithData("receiptCompany", input.CompanyId);
+            }
+
+            var priorPo = linkedPos.FirstOrDefault(po => input.PostingDate.Date < po.OrderDate.Date);
+            if (priorPo != null)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Posting Date cannot be before Purchase Order {priorPo.OrderNumber} date ({priorPo.OrderDate:yyyy-MM-dd}).");
+            }
+        }
+
+        PurchaseReceipt? returnAgainstPr = null;
+        if (input.IsReturn && input.ReturnAgainstId.HasValue)
+        {
+            returnAgainstPr = await _repository.FindAsync(input.ReturnAgainstId.Value);
+            if (returnAgainstPr != null && returnAgainstPr.CompanyId != input.CompanyId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("originalReceiptCompany", returnAgainstPr.CompanyId)
+                    .WithData("receiptCompany", input.CompanyId);
+            }
+        }
+
+        var receiptNumber = await _numberGenerator.GenerateAsync("PurchaseReceipt", input.CompanyId);
+
+        var receipt = new PurchaseReceipt(
+            GuidGenerator.Create(),
+            input.CompanyId,
+            input.SupplierId,
+            input.WarehouseId,
+            receiptNumber,
+            input.PostingDate,
+            CurrentTenant.Id);
+
+        receipt.PurchaseOrderId = input.PurchaseOrderId;
+        receipt.SupplierDeliveryNote = input.SupplierDeliveryNote;
+        receipt.IsReturn = input.IsReturn;
+        receipt.ReturnAgainstId = input.ReturnAgainstId;
+        receipt.Notes = input.Notes;
+        if (!string.IsNullOrWhiteSpace(input.CurrencyCode))
+            receipt.CurrencyCode = input.CurrencyCode;
+        if (input.ExchangeRate > 0)
+            receipt.ExchangeRate = input.ExchangeRate;
+        receipt.UseTransactionDateExchangeRate = input.UseTransactionDateExchangeRate;
+
+        foreach (var item in input.Items)
+        {
+            var poItemId = item.PurchaseOrderItemId;
+            var mrItemId = item.MaterialRequestItemId;
+            if (returnAgainstPr != null)
+            {
+                var origItem = returnAgainstPr.Items.FirstOrDefault(oi => oi.ItemId == item.ItemId);
+                if (origItem != null)
+                {
+                    poItemId ??= origItem.PurchaseOrderItemId;
+                    mrItemId ??= origItem.MaterialRequestItemId;
+                }
+            }
+
+            receipt.AddItem(
+                item.ItemId,
+                item.Description,
+                item.Quantity,
+                item.UnitPrice,
+                item.TaxAmount,
+                item.Uom,
+                poItemId,
+                item.WarehouseId,
+                item.RejectedQty,
+                item.RejectedWarehouseId,
+                item.ReceivedQty,
+                item.FromWarehouseId,
+                mrItemId,
+                item.ReturnQtyFromRejectedWarehouse);
+
+            if (item.ConversionFactor.HasValue && item.ConversionFactor.Value > 0)
+            {
+                receipt.Items.Last().ConversionFactor = item.ConversionFactor.Value;
+            }
+        }
+
+        // Resolve UOM conversion factors
+        var uomService = LazyServiceProvider.LazyGetRequiredService<Inventory.DomainServices.UomConversionService>();
+        var itemRepoUom = LazyServiceProvider.LazyGetRequiredService<IRepository<Inventory.Entities.Item, Guid>>();
+        foreach (var prItem in receipt.Items)
+        {
+            var itemEntity = await itemRepoUom.FindAsync(prItem.ItemId);
+            if (itemEntity != null)
+            {
+                prItem.StockUom = itemEntity.Uom;
+                if (prItem.ConversionFactor <= 1m && !string.Equals(prItem.Uom, itemEntity.Uom, StringComparison.OrdinalIgnoreCase))
+                    prItem.ConversionFactor = await uomService.GetConversionFactorAsync(
+                        prItem.ItemId, prItem.Uom, itemEntity.Uom);
+            }
+        }
+
+        var allowMultiple = await SettingProvider.IsTrueAsync(MyERP.Settings.MyERPSettings.Buying.AllowMultipleItems);
+        var prManagerCreate = LazyServiceProvider.LazyGetRequiredService<MyERP.Purchasing.DomainServices.PurchaseReceiptManager>();
+        prManagerCreate.ValidateDuplicateItems(receipt, allowMultiple);
+
+        await _repository.InsertAsync(receipt, autoSave: true);
+        return ObjectMapper.Map<PurchaseReceipt, PurchaseReceiptDto>(receipt);
+    }
+
+    [Authorize(MyERPPermissions.PurchaseReceipts.Edit)]
+    public async Task<PurchaseReceiptDto> UpdateAsync(Guid id, CreatePurchaseReceiptDto input)
+    {
+        var receipt = await _repository.GetAsync(id);
+        if (receipt.Status != Core.DocumentStatus.Draft)
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("detail", "Only Draft purchase receipts can be edited");
+
+        // Per gotcha #538: PR blocks future posting date
+        var maxAllowedDate = DateTime.Today > DateTime.UtcNow.Date ? DateTime.Today : DateTime.UtcNow.Date;
+        if (input.PostingDate.Date > maxAllowedDate)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Posting Date cannot be in the future for Purchase Receipts.");
+        }
+
+        // Per gotcha #1238 / #1508: PR posting date cannot be before linked PO date
+        var poId = input.PurchaseOrderId ?? receipt.PurchaseOrderId;
+        if (poId.HasValue)
+        {
+            var poRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseOrder, Guid>>();
+            var po = await poRepo.FindAsync(poId.Value);
+            if (po != null)
+            {
+                if (po.CompanyId != receipt.CompanyId)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                        .WithData("purchaseOrderCompany", po.CompanyId)
+                        .WithData("receiptCompany", receipt.CompanyId);
+                }
+
+                // ERPNext check_purchase_order_on_hold_or_close: no receipt against a closed PO (returns exempt).
+                if (!receipt.IsReturn && po.Status == Core.DocumentStatus.Closed)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.LinkedPurchaseOrderClosed)
+                        .WithData("purchaseOrderNumber", po.OrderNumber);
+                }
+
+                if (input.PostingDate.Date < po.OrderDate.Date)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                        .WithData("detail", $"Posting Date cannot be before Purchase Order {po.OrderNumber} date ({po.OrderDate:yyyy-MM-dd}).");
+                }
+            }
+        }
+
+        var updateWhRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Inventory.Entities.Warehouse, Guid>>();
+        var headerWh = await updateWhRepo.FindAsync(receipt.WarehouseId);
+        if (headerWh != null && headerWh.CompanyId != receipt.CompanyId)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                .WithData("warehouseCompany", headerWh.CompanyId)
+                .WithData("receiptCompany", receipt.CompanyId);
+        }
+
+        var updatePoItemIds = input.Items
+            .Where(i => i.PurchaseOrderItemId.HasValue)
+            .Select(i => i.PurchaseOrderItemId!.Value)
+            .Distinct()
+            .ToList();
+        if (updatePoItemIds.Count > 0)
+        {
+            var poRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseOrder, Guid>>();
+            var poQuery = await poRepo.GetQueryableAsync();
+            var linkedPos = poQuery
+                .Where(po => po.Items.Any(i => updatePoItemIds.Contains(i.Id)))
+                .ToList();
+
+            var crossCompanyPo = linkedPos.FirstOrDefault(po => po.CompanyId != receipt.CompanyId);
+            if (crossCompanyPo != null)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("purchaseOrderCompany", crossCompanyPo.CompanyId)
+                    .WithData("receiptCompany", receipt.CompanyId);
+            }
+
+            var priorPo = linkedPos.FirstOrDefault(po => input.PostingDate.Date < po.OrderDate.Date);
+            if (priorPo != null)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Posting Date cannot be before Purchase Order {priorPo.OrderNumber} date ({priorPo.OrderDate:yyyy-MM-dd}).");
+            }
+        }
+
+        var returnAgainstId = input.ReturnAgainstId ?? receipt.ReturnAgainstId;
+        if ((input.IsReturn || receipt.IsReturn) && returnAgainstId.HasValue)
+        {
+            var returnAgainstPr = await _repository.FindAsync(returnAgainstId.Value);
+            if (returnAgainstPr != null && returnAgainstPr.CompanyId != receipt.CompanyId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("originalReceiptCompany", returnAgainstPr.CompanyId)
+                    .WithData("receiptCompany", receipt.CompanyId);
+            }
+        }
+
+        await ValidateItemWarehousesAsync(input.Items, receipt.CompanyId);
+
+        var updateAllWarehouseIds = input.Items
+            .SelectMany(i => new[] { i.WarehouseId, i.RejectedWarehouseId })
+            .Where(w => w.HasValue)
+            .Select(w => w!.Value)
+            .ToList();
+        updateAllWarehouseIds.Add(receipt.WarehouseId);
+        updateAllWarehouseIds = updateAllWarehouseIds.Distinct().ToList();
+
+        var updateItemIds = input.Items.Select(i => i.ItemId).ToList();
+        await _itemValidation.ValidateItemsForTransactionAsync(updateItemIds);
+        await _itemValidation.ValidateItemUomsForTransactionAsync(receipt.CompanyId, input.Items.Select(i => (i.ItemId, (string?)i.Uom)));
+
+        var updateCompanyRestriction = LazyServiceProvider.LazyGetRequiredService<Core.DomainServices.CompanyRestrictionValidationService>();
+        await updateCompanyRestriction.ValidateTransactionCompanyAsync(
+            "PurchaseReceipt", receipt.CompanyId,
+            itemIds: updateItemIds,
+            supplierIds: new[] { receipt.SupplierId },
+            warehouseIds: updateAllWarehouseIds.Count > 0 ? updateAllWarehouseIds : null);
+
+        receipt.PostingDate = input.PostingDate;
+        receipt.PurchaseOrderId = input.PurchaseOrderId;
+        receipt.SupplierDeliveryNote = input.SupplierDeliveryNote;
+        receipt.IsReturn = input.IsReturn;
+        receipt.ReturnAgainstId = input.ReturnAgainstId;
+        receipt.Notes = input.Notes;
+        if (!string.IsNullOrWhiteSpace(input.CurrencyCode))
+            receipt.CurrencyCode = input.CurrencyCode;
+        if (input.ExchangeRate > 0)
+            receipt.ExchangeRate = input.ExchangeRate;
+        receipt.UseTransactionDateExchangeRate = input.UseTransactionDateExchangeRate;
+
+        if (receipt.UseTransactionDateExchangeRate && receipt.PurchaseOrderId.HasValue)
+        {
+            var companyRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Company, Guid>>();
+            var company = await companyRepo.FindAsync(receipt.CompanyId);
+            if (company != null && !string.Equals(receipt.CurrencyCode, company.CurrencyCode, StringComparison.OrdinalIgnoreCase))
+            {
+                var exchangeService = LazyServiceProvider.LazyGetService<Accounting.DomainServices.CurrencyExchangeService>();
+                if (exchangeService != null)
+                {
+                    receipt.ExchangeRate = await exchangeService.GetExchangeRateAsync(receipt.CurrencyCode, company.CurrencyCode, receipt.PostingDate);
+                }
+            }
+        }
+
+        receipt.ClearItems();
+        foreach (var item in input.Items)
+        {
+            receipt.AddItem(
+                item.ItemId,
+                item.Description,
+                item.Quantity,
+                item.UnitPrice,
+                item.TaxAmount,
+                item.Uom,
+                item.PurchaseOrderItemId,
+                item.WarehouseId,
+                item.RejectedQty,
+                item.RejectedWarehouseId,
+                item.ReceivedQty,
+                fromWarehouseId: null,
+                materialRequestItemId: item.MaterialRequestItemId,
+                returnQtyFromRejectedWarehouse: item.ReturnQtyFromRejectedWarehouse);
+        }
+
+        var allowMultipleUpdate = await SettingProvider.IsTrueAsync(MyERP.Settings.MyERPSettings.Buying.AllowMultipleItems);
+        var prManagerUpdate = LazyServiceProvider.LazyGetRequiredService<MyERP.Purchasing.DomainServices.PurchaseReceiptManager>();
+        prManagerUpdate.ValidateDuplicateItems(receipt, allowMultipleUpdate);
+
+        await _repository.UpdateAsync(receipt, autoSave: true);
+        return ObjectMapper.Map<PurchaseReceipt, PurchaseReceiptDto>(receipt);
+    }
+
+    [Authorize(MyERPPermissions.PurchaseReceipts.Submit)]
+    public async Task<PurchaseReceiptDto> SubmitAsync(Guid id)
+    {
+        var receipt = await _repository.GetAsync(id);
+
+        // Authorization control: high-value transaction approval check
+        var authControl = LazyServiceProvider.LazyGetRequiredService<MyERP.Core.DomainServices.AuthorizationControlService>();
+        var userRoles = (CurrentUser.Roles ?? Array.Empty<string>()).ToArray();
+        await authControl.ValidateApprovingAuthorityAsync(
+            "PurchaseReceipt", receipt.CompanyId,
+            CurrentUser.Id ?? Guid.Empty, userRoles, receipt.GrandTotal);
+
+        // Buying controller validations via domain manager
+        var prManager = LazyServiceProvider
+            .LazyGetRequiredService<MyERP.Purchasing.DomainServices.PurchaseReceiptManager>();
+
+        var allowMultipleSubmit = await SettingProvider.IsTrueAsync(MyERP.Settings.MyERPSettings.Buying.AllowMultipleItems);
+        prManager.ValidateDuplicateItems(receipt, allowMultipleSubmit);
+
+        // Mandatory PO linkage (Buying Settings: "Is Purchase Order required for Purchase Receipt?")
+        var poRequired = await SettingProvider.IsTrueAsync(MyERP.Settings.MyERPSettings.Buying.PoRequired);
+        MyERP.Purchasing.DomainServices.PurchaseReceiptManager.ValidatePoRequired(receipt, poRequired);
+
+        // Temporal ordering + over-receipt + PO status validation
+        await prManager.ValidateAgainstPurchaseOrderAsync(receipt);
+
+        // Asset return blocking (submitted assets on original doc)
+        var assetRepo = LazyServiceProvider
+            .LazyGetRequiredService<IRepository<MyERP.Assets.Entities.Asset, Guid>>();
+        await prManager.ValidateAssetReturnAsync(receipt, assetRepo);
+
+        // From-warehouse validation (same warehouse + subcontracting blocks)
+        prManager.ValidateFromWarehouse(receipt);
+
+        // Enforce Quality Inspection requirement (per item flags) — skip for returns
+        if (!receipt.IsReturn)
+        {
+            var itemIds = receipt.Items.Select(i => i.ItemId).ToArray();
+            await _qiEnforcement.ValidateForPurchaseReceiptAsync(receipt.Id, itemIds, receipt.TenantId);
+
+            // Over-receipt validation: PR qty cannot exceed PO pending receipt qty
+            if (receipt.PurchaseOrderId.HasValue)
+            {
+                var po = await _purchaseOrderRepository.GetAsync(receipt.PurchaseOrderId.Value);
+
+                // Block receipt against Cancelled or Closed POs (returns against closed PO are permitted per ERPNext PR #58126)
+                if (po.Status == Core.DocumentStatus.Cancelled || (po.Status == Core.DocumentStatus.Closed && !receipt.IsReturn))
+                {
+                    throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                        .WithData("documentType", "Purchase Order")
+                        .WithData("status", po.Status.ToString());
+                }
+
+                // Over-receipt tolerance: max allowed = ordered × (1 + allowance% / 100).
+                // Per ERPNext StatusUpdater; allowance comes from Company.OverDeliveryReceiptAllowance.
+                var company = await _companyRepository.GetAsync(receipt.CompanyId);
+                var allowancePct = company.OverDeliveryReceiptAllowance;
+
+                var prItemGroups = receipt.Items
+                    .Where(i => i.PurchaseOrderItemId.HasValue)
+                    .GroupBy(i => i.PurchaseOrderItemId!.Value);
+
+                foreach (var group in prItemGroups)
+                {
+                    var poItem = po.Items.FirstOrDefault(i => i.Id == group.Key);
+                    if (poItem == null) continue;
+
+                    // Convert PR item qty to PO item UOM if conversion factors differ (PR #61336 / commit 4f99ce9544)
+                    // Sum stock qty across rows before dividing by PO conversion factor (commit b97eb00c19)
+                    var totalStockQty = group.Sum(i => i.Quantity * (i.ConversionFactor > 0 ? i.ConversionFactor : 1m));
+                    var prQtyInPoUom = poItem.ConversionFactor > 0
+                        ? Math.Round(totalStockQty / poItem.ConversionFactor, 4)
+                        : totalStockQty;
+
+                    var uomRepo = LazyServiceProvider.LazyGetService<IRepository<Inventory.Entities.Uom, Guid>>();
+                    var mustBeWholeNumber = false;
+                    if (uomRepo != null && !string.IsNullOrWhiteSpace(poItem.Uom))
+                    {
+                        var uomObj = (await uomRepo.GetQueryableAsync()).FirstOrDefault(u => u.Name == poItem.Uom);
+                        mustBeWholeNumber = uomObj?.MustBeWholeNumber ?? false;
+                    }
+
+                    var maxAllowedTotal = poItem.GetMaxReceivableQty(allowancePct, mustBeWholeNumber);
+                    var remainingAllowed = maxAllowedTotal - poItem.ReceivedQty;
+
+                    if (prQtyInPoUom > remainingAllowed)
+                    {
+                        throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.OverReceipt)
+                            .WithData("item", poItem.Description ?? poItem.ItemId.ToString())
+                            .WithData("ordered", poItem.Quantity)
+                            .WithData("received", poItem.ReceivedQty)
+                            .WithData("attempted", prQtyInPoUom);
+                    }
+                }
+
+                // Maintain same rate throughout the purchase cycle (Buying Settings)
+                if (await SettingProvider.IsTrueAsync(MyERP.Settings.MyERPSettings.Buying.MaintainSameRate))
+                {
+                    var rateAction = await SettingProvider.GetOrNullAsync(MyERP.Settings.MyERPSettings.Buying.MaintainSameRateAction) ?? "Stop";
+                    var overrideRole = await SettingProvider.GetOrNullAsync(MyERP.Settings.MyERPSettings.Buying.RoleToOverrideStopAction);
+                    var canOverride = !string.IsNullOrEmpty(overrideRole)
+                        && (CurrentUser.Roles ?? Array.Empty<string>()).Contains(overrideRole);
+
+                    var rateLines = receipt.Items
+                        .Where(i => i.PurchaseOrderItemId.HasValue)
+                        .Select(i => (i.Description,
+                            i.UnitPrice,
+                            po.Items.FirstOrDefault(poi => poi.Id == i.PurchaseOrderItemId!.Value)?.UnitPrice ?? i.UnitPrice,
+                            "Purchase Order"));
+
+                    var transactionValidation = LazyServiceProvider
+                        .LazyGetRequiredService<MyERP.Core.DomainServices.TransactionValidationService>();
+                    transactionValidation.ValidateMaintainSameRate(rateLines, rateAction, canOverride);
+                }
+            }
+        }
+
+        receipt.Submit();
+
+        // Stock value actually moved, keyed by the warehouse it moved into/out of. With one
+        // warehouse this has a single entry and GL is unchanged; with putaway-split lines it lets
+        // the stock leg be posted against each warehouse's own stock account instead of lumping
+        // everything onto the header warehouse's account.
+        var stockValueByWarehouse = new Dictionary<Guid, decimal>();
+
+        if (receipt.IsReturn)
+        {
+            // Validate return qty does not exceed original receipt qty
+            // Per DO-NOT: "Allow return qty to exceed (original qty - already returned qty)"
+            PurchaseReceipt? originalPr = null;
+            if (receipt.ReturnAgainstId.HasValue)
+            {
+                originalPr = await _repository.GetAsync(receipt.ReturnAgainstId.Value);
+                foreach (var returnItem in receipt.Items)
+                {
+                    var originalItem = originalPr.Items
+                        .FirstOrDefault(i => i.ItemId == returnItem.ItemId);
+                    if (originalItem != null)
+                    {
+                        if (returnItem.Quantity < 0)
+                        {
+                            var maxReturnQty = originalItem.Quantity;
+                            var returnQty = Math.Abs(returnItem.Quantity);
+                            if (returnQty > maxReturnQty)
+                            {
+                                throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.ReturnQtyExceedsOriginal)
+                                    .WithData("item", returnItem.Description)
+                                    .WithData("originalQty", maxReturnQty)
+                                    .WithData("returnQty", returnQty);
+                            }
+                        }
+
+                        if (returnItem.RejectedQty < 0)
+                        {
+                            var maxRejectedQty = originalItem.RejectedQty;
+                            var returnRejectedQty = Math.Abs(returnItem.RejectedQty);
+                            if (returnRejectedQty > maxRejectedQty)
+                            {
+                                throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.ReturnQtyExceedsOriginal)
+                                    .WithData("item", returnItem.Description)
+                                    .WithData("originalQty", maxRejectedQty)
+                                    .WithData("returnQty", returnRejectedQty);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // RETURN TO SUPPLIER: Stock goes OUT (negative SLE, negative Bin)
+            var returnItemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<MyERP.Inventory.Entities.Item, Guid>>();
+            foreach (var item in receipt.Items)
+            {
+                // Skip non-stock items
+                var itemEntity = await returnItemRepo.FindAsync(item.ItemId);
+                if (itemEntity != null && !itemEntity.MaintainStock)
+                    continue;
+
+                var originalItem = originalPr?.Items.FirstOrDefault(i => i.ItemId == item.ItemId);
+                var ratePerStockUnit = originalItem != null
+                    ? (originalItem.ConversionFactor != 0 ? originalItem.UnitPrice / originalItem.ConversionFactor : originalItem.UnitPrice)
+                    : (item.ConversionFactor != 0 ? item.UnitPrice / item.ConversionFactor : item.UnitPrice);
+
+                // Accepted stock return: moves stock out from accepted warehouse
+                if (item.Quantity < 0)
+                {
+                    var returnStockQty = Math.Abs(item.StockQty);
+                    var returnWarehouseId = originalItem?.WarehouseId ?? item.WarehouseId ?? receipt.WarehouseId;
+
+                    await _valuationService.CreateLedgerEntryAsync(
+                        receipt.CompanyId, item.ItemId, returnWarehouseId,
+                        receipt.PostingDate, -returnStockQty, ratePerStockUnit,
+                        voucherType: "PurchaseReceipt", voucherId: receipt.Id,
+                        tenantId: receipt.TenantId);
+
+                    await _binService.ApplyStockMovementAsync(
+                        item.ItemId, returnWarehouseId,
+                        -returnStockQty, -(returnStockQty * ratePerStockUnit), receipt.TenantId);
+
+                    // Restore ordered qty in stock UOM
+                    await _binService.UpdateOrderedQtyAsync(
+                        item.ItemId, returnWarehouseId, returnStockQty, receipt.TenantId);
+
+                    stockValueByWarehouse.TryGetValue(returnWarehouseId, out var priorReturnValue);
+                    stockValueByWarehouse[returnWarehouseId] = priorReturnValue + (returnStockQty * ratePerStockUnit);
+                }
+
+                // Rejected stock return (PR #59280 / commit b3d55db893): moves stock out from rejected warehouse
+                if (item.RejectedQty < 0)
+                {
+                    var rejectedWarehouseId = item.RejectedWarehouseId ?? originalItem?.RejectedWarehouseId;
+                    if (rejectedWarehouseId.HasValue)
+                    {
+                        var setValuationForRejected = await SettingProvider.IsTrueAsync(MyERP.Settings.MyERPSettings.Buying.SetValuationRateForRejectedMaterials);
+                        var rejectedRate = setValuationForRejected ? ratePerStockUnit : 0.0m;
+                        var returnRejectedStockQty = Math.Abs(item.RejectedStockQty);
+
+                        await _valuationService.CreateLedgerEntryAsync(
+                            receipt.CompanyId, item.ItemId, rejectedWarehouseId.Value,
+                            receipt.PostingDate, -returnRejectedStockQty, rejectedRate,
+                            voucherType: "PurchaseReceipt", voucherId: receipt.Id,
+                            tenantId: receipt.TenantId);
+
+                        await _binService.ApplyStockMovementAsync(
+                            item.ItemId, rejectedWarehouseId.Value,
+                            -returnRejectedStockQty, -(returnRejectedStockQty * rejectedRate), receipt.TenantId);
+
+                        stockValueByWarehouse.TryGetValue(rejectedWarehouseId.Value, out var priorVal);
+                        stockValueByWarehouse[rejectedWarehouseId.Value] = priorVal + (returnRejectedStockQty * rejectedRate);
+                    }
+                }
+
+                // Internal transfer return (PR #59280): puts returned material back into in-transit warehouse
+                var fromWarehouseId = item.FromWarehouseId ?? originalItem?.FromWarehouseId;
+                if (fromWarehouseId.HasValue)
+                {
+                    var returnedToSourceQty = (item.Quantity < 0 ? Math.Abs(item.StockQty) : 0m)
+                        + (item.RejectedQty < 0 ? Math.Abs(item.RejectedStockQty) : 0m);
+
+                    if (returnedToSourceQty > 0)
+                    {
+                        await _valuationService.CreateLedgerEntryAsync(
+                            receipt.CompanyId, item.ItemId, fromWarehouseId.Value,
+                            receipt.PostingDate, returnedToSourceQty, ratePerStockUnit,
+                            voucherType: "PurchaseReceipt", voucherId: receipt.Id,
+                            tenantId: receipt.TenantId);
+
+                        await _binService.ApplyStockMovementAsync(
+                            item.ItemId, fromWarehouseId.Value,
+                            returnedToSourceQty, returnedToSourceQty * ratePerStockUnit, receipt.TenantId);
+
+                        stockValueByWarehouse.TryGetValue(fromWarehouseId.Value, out var priorFromVal);
+                        stockValueByWarehouse[fromWarehouseId.Value] = priorFromVal + (returnedToSourceQty * ratePerStockUnit);
+                    }
+                }
+            }
+
+            // GL: reverse of normal receipt (DR SRBNB, CR Stock)
+            var warehouseAccountService = LazyServiceProvider
+                .LazyGetRequiredService<WarehouseAccountService>();
+            var returnStockAccountId = await warehouseAccountService
+                .ResolveStockAccountAsync(receipt.WarehouseId, receipt.CompanyId);
+            var returnStockSplit = await ResolveStockAccountSplitAsync(receipt, stockValueByWarehouse);
+            await _postingOrchestrator.PostPurchaseReceiptAsync(
+                receipt, returnStockAccountId, srbnbAccountId: null, warehouseStockSplit: returnStockSplit);
+
+            // Reduce linked PO ReceivedQty (with concurrency retry)
+            if (receipt.PurchaseOrderId.HasValue)
+            {
+                await UpdatePoFulfillmentWithRetryAsync(receipt.PurchaseOrderId.Value, receipt.Items, isReversal: true);
+            }
+        }
+        else
+        {
+            // NORMAL RECEIPT: Stock comes IN (positive SLE, positive Bin)
+            var itemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<MyERP.Inventory.Entities.Item, Guid>>();
+            foreach (var item in receipt.Items)
+            {
+                // Skip non-stock items (service items don't create SLE)
+                var itemEntity = await itemRepo.FindAsync(item.ItemId);
+                if (itemEntity != null && !itemEntity.MaintainStock)
+                    continue;
+
+                // Use StockQty for SLE (respects UOM conversion factor)
+                var stockQty = item.StockQty;
+                var ratePerStockUnit = item.ConversionFactor != 0
+                    ? item.UnitPrice / item.ConversionFactor
+                    : item.UnitPrice;
+
+                // Source warehouse for internal transfer (in-transit warehouse)
+                // Per ERPNext PR #59251 / #59256: deduct accepted + rejected qty from in-transit warehouse
+                if (item.FromWarehouseId.HasValue)
+                {
+                    var sourceStockQty = stockQty + item.RejectedStockQty;
+                    if (sourceStockQty > 0)
+                    {
+                        await _valuationService.CreateLedgerEntryAsync(
+                            receipt.CompanyId, item.ItemId, item.FromWarehouseId.Value,
+                            receipt.PostingDate, -sourceStockQty, ratePerStockUnit,
+                            voucherType: "PurchaseReceipt", voucherId: receipt.Id,
+                            tenantId: receipt.TenantId);
+
+                        await _binService.ApplyStockMovementAsync(
+                            item.ItemId, item.FromWarehouseId.Value,
+                            -sourceStockQty, -(sourceStockQty * ratePerStockUnit), receipt.TenantId);
+
+                        stockValueByWarehouse.TryGetValue(item.FromWarehouseId.Value, out var priorFromVal);
+                        stockValueByWarehouse[item.FromWarehouseId.Value] = priorFromVal - (sourceStockQty * ratePerStockUnit);
+                    }
+                }
+
+                // Item-level warehouse override (set by putaway allocation) wins over the
+                // receipt-level warehouse; null keeps the old single-warehouse behaviour.
+                var targetWarehouseId = item.WarehouseId ?? receipt.WarehouseId;
+
+                if (stockQty > 0)
+                {
+                    await _valuationService.CreateLedgerEntryAsync(
+                        receipt.CompanyId, item.ItemId, targetWarehouseId,
+                        receipt.PostingDate, stockQty, ratePerStockUnit,
+                        voucherType: "PurchaseReceipt", voucherId: receipt.Id,
+                        tenantId: receipt.TenantId);
+
+                    await _binService.ApplyStockMovementAsync(
+                        item.ItemId, targetWarehouseId,
+                        stockQty, stockQty * ratePerStockUnit, receipt.TenantId);
+
+                    // Reduce ordered qty (stock is no longer "on order" once received)
+                    await _binService.UpdateOrderedQtyAsync(
+                        item.ItemId, targetWarehouseId, -stockQty, receipt.TenantId);
+
+                    stockValueByWarehouse.TryGetValue(targetWarehouseId, out var priorValue);
+                    stockValueByWarehouse[targetWarehouseId] = priorValue + (stockQty * ratePerStockUnit);
+                }
+
+                // If rejected warehouse and rejected qty exist, post rejected stock SLE in stock UOM (PR #51968 / commit 343ee9695b)
+                if (item.RejectedWarehouseId.HasValue && item.RejectedQty > 0)
+                {
+                    // For internal transfers, rejected materials are always valued at the incoming transfer rate
+                    // (PR #59251 / commit c0f13b01de); otherwise check Buying Settings
+                    var setValuationForRejected = item.FromWarehouseId.HasValue ||
+                        await SettingProvider.IsTrueAsync(MyERP.Settings.MyERPSettings.Buying.SetValuationRateForRejectedMaterials);
+                    var rejectedRate = setValuationForRejected ? ratePerStockUnit : 0.0m;
+                    var rejectedStockQty = item.RejectedStockQty;
+                    await _valuationService.CreateLedgerEntryAsync(
+                        receipt.CompanyId, item.ItemId, item.RejectedWarehouseId.Value,
+                        receipt.PostingDate, rejectedStockQty, rejectedRate,
+                        voucherType: "PurchaseReceipt", voucherId: receipt.Id,
+                        tenantId: receipt.TenantId);
+
+                    await _binService.ApplyStockMovementAsync(
+                        item.ItemId, item.RejectedWarehouseId.Value,
+                        rejectedStockQty, rejectedStockQty * rejectedRate, receipt.TenantId);
+
+                    stockValueByWarehouse.TryGetValue(item.RejectedWarehouseId.Value, out var priorRejVal);
+                    stockValueByWarehouse[item.RejectedWarehouseId.Value] = priorRejVal + (rejectedStockQty * rejectedRate);
+                }
+            }
+
+            // GL posting (perpetual inventory): DR Stock, CR SRBNB
+            // Per ERPNext BaseStockGLComposer: uses warehouse-specific stock account for DR
+            var warehouseAccountService = LazyServiceProvider
+                .LazyGetRequiredService<WarehouseAccountService>();
+            var stockAccountId = await warehouseAccountService
+                .ResolveStockAccountAsync(receipt.WarehouseId, receipt.CompanyId);
+            var stockSplit = await ResolveStockAccountSplitAsync(receipt, stockValueByWarehouse);
+            await _postingOrchestrator.PostPurchaseReceiptAsync(
+                receipt, stockAccountId, srbnbAccountId: null, warehouseStockSplit: stockSplit);
+
+            // Update linked Purchase Order fulfillment tracking
+            // Update linked PO fulfillment (with concurrency retry)
+            if (receipt.PurchaseOrderId.HasValue)
+            {
+                await UpdatePoFulfillmentWithRetryAsync(receipt.PurchaseOrderId.Value, receipt.Items, isReversal: false);
+            }
+        }
+
+        // Update Material Request fulfillment tracking for received items (ERPNext PR #60208)
+        await UpdateMaterialRequestReceivedQtyAsync(receipt, isReversal: receipt.IsReturn);
+
+        await _repository.UpdateAsync(receipt, autoSave: true);
+
+        // Auto-evaluate supplier scorecard after goods receipt
+        // Per ERPNext supplier_scorecard.py: recalculates delivery performance on PR submit
+        try
+        {
+            var scorecardService = LazyServiceProvider
+                .LazyGetRequiredService<DomainServices.SupplierScorecardEvaluationService>();
+            await scorecardService.EvaluateAndUpdateAsync(receipt.SupplierId, receipt.CompanyId);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Supplier scorecard evaluation failed for supplier {SupplierId} — non-blocking", receipt.SupplierId);
+        }
+
+        // Auto-reserve stock for linked Sales Orders on receipt
+        // Per ERPNext Stock Settings.auto_reserve_stock_for_sales_order_on_purchase:
+        // When goods arrive, automatically reserve for pending SO items that need this stock
+        if (!receipt.IsReturn)
+        {
+            try
+            {
+                var reservationManager = LazyServiceProvider
+                    .LazyGetRequiredService<MyERP.Inventory.DomainServices.StockReservationManager>();
+                var soRepo = LazyServiceProvider
+                    .LazyGetRequiredService<IRepository<MyERP.Sales.Entities.SalesOrder, Guid>>();
+
+                var receivedItemIds = receipt.Items
+                    .Select(i => i.ItemId)
+                    .Distinct()
+                    .ToList();
+
+                // Find active SOs with pending delivery for received items
+                var soQuery = await soRepo.GetQueryableAsync();
+                var pendingSalesOrders = soQuery
+                    .Where(so => so.CompanyId == receipt.CompanyId
+                        && so.TenantId == receipt.TenantId
+                        && (so.Status == Core.DocumentStatus.ToDeliverAndBill
+                            || so.Status == Core.DocumentStatus.ToDeliver))
+                    .ToList();
+
+                foreach (var so in pendingSalesOrders)
+                {
+                    foreach (var soItem in so.Items.Where(i =>
+                        receivedItemIds.Contains(i.ItemId) && i.PendingDeliveryQty > 0))
+                    {
+                        var bin = await _binService.GetBalanceAsync(soItem.ItemId, receipt.WarehouseId);
+                        var existingReserved = await reservationManager
+                            .GetReservedQtyAsync(soItem.ItemId, receipt.WarehouseId);
+                        var reservableQty = Math.Min(
+                            soItem.PendingDeliveryQty * soItem.ConversionFactor,
+                            Math.Max(0, bin.ActualQty - existingReserved));
+
+                        if (reservableQty > 0)
+                        {
+                            await reservationManager.ReserveStockAsync(
+                                soItem.ItemId, receipt.WarehouseId, receipt.CompanyId,
+                                reservableQty, "SalesOrder", so.Id, receipt.TenantId);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning(ex, "Auto-reserve stock for SOs failed after PR {ReceiptId} — non-blocking", receipt.Id);
+            }
+        }
+
+        // Audit trail
+        await _activityLogRepository.InsertAsync(new DocumentActivityLog(
+            GuidGenerator.Create(), "PurchaseReceipt", receipt.Id, "Submitted",
+            receipt.CompanyId, receipt.ReceiptNumber, "Draft", "Submitted",
+            CurrentUser.Id, tenantId: receipt.TenantId));
+
+        return ObjectMapper.Map<PurchaseReceipt, PurchaseReceiptDto>(receipt);
+    }
+
+    [Authorize(MyERPPermissions.PurchaseReceipts.Cancel)]
+    public async Task<PurchaseReceiptDto> CancelAsync(Guid id)
+    {
+        var receipt = await _repository.GetAsync(id);
+
+        // Validate posting period is not frozen/closed
+        await _postingOrchestrator.ValidatePostingPeriodAsync(receipt.CompanyId, receipt.PostingDate, "PurchaseReceipt");
+
+        // Repost Guard: cannot cancel while an active valuation repost is in progress (gotcha #6183)
+        var repostGuard = LazyServiceProvider.LazyGetRequiredService<Inventory.DomainServices.StockRepostGuardService>();
+        await repostGuard.ValidateCanCancelVoucherAsync("PurchaseReceipt", receipt.Id);
+
+        // Guard: cannot cancel if submitted Purchase Invoices reference this receipt's items
+        var piRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Purchasing.Entities.PurchaseInvoice, Guid>>();
+        var piQuery = await piRepo.GetQueryableAsync();
+        var hasSubmittedPI = piQuery.Any(pi =>
+            pi.Items.Any(i => i.PurchaseReceiptItemId.HasValue
+                && receipt.Items.Select(ri => ri.Id).Contains(i.PurchaseReceiptItemId.Value))
+            && pi.Status != Core.DocumentStatus.Draft
+            && pi.Status != Core.DocumentStatus.Cancelled);
+        if (hasSubmittedPI)
+        {
+            throw new Volo.Abp.BusinessException("MyERP:01010")
+                .WithData("documentType", "Purchase Receipt")
+                .WithData("dependent", "Purchase Invoice");
+        }
+
+        // Guard: cannot cancel a PR whose linked PO has since been Closed — reversing received
+        // qty against a closed PO would corrupt its fulfillment tracking. The PO must be
+        // reopened first. (Exempt for return documents per upstream PR #58126)
+        if (receipt.PurchaseOrderId.HasValue && !receipt.IsReturn)
+        {
+            var poForCancelGuard = await _purchaseOrderRepository.FindAsync(receipt.PurchaseOrderId.Value);
+            if (poForCancelGuard != null && poForCancelGuard.Status == Core.DocumentStatus.Closed)
+            {
+                throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                    .WithData("detail", "Cannot cancel Purchase Receipt — its Purchase Order is Closed. Reopen the Purchase Order first.");
+            }
+        }
+
+        receipt.Cancel();
+
+        // Reverse the posted GL Journal Entry (DR Stock / CR SRBNB on submit)
+        await _postingOrchestrator.ReverseGlForDocumentAsync("PurchaseReceipt", receipt.Id);
+
+        // Reverse SLE + Bin for each item (in stock UOM) — skip non-stock items (matches SubmitAsync)
+        var cancelItemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<MyERP.Inventory.Entities.Item, Guid>>();
+        if (receipt.IsReturn)
+        {
+            Dictionary<Guid, PurchaseReceiptItem>? originalItems = null;
+            if (receipt.ReturnAgainstId.HasValue)
+            {
+                var originalReceipt = await _repository.FindAsync(receipt.ReturnAgainstId.Value);
+                if (originalReceipt != null)
+                {
+                    originalItems = originalReceipt.Items.ToDictionary(i => i.ItemId);
+                }
+            }
+
+            foreach (var item in receipt.Items)
+            {
+                var ratePerStockUnit = item.ConversionFactor != 0
+                    ? item.UnitPrice / item.ConversionFactor
+                    : item.UnitPrice;
+
+                var cancelWarehouseId = item.WarehouseId ?? receipt.WarehouseId;
+
+                var cancelReturnItemEntity = await cancelItemRepo.FindAsync(item.ItemId);
+                if (cancelReturnItemEntity != null && !cancelReturnItemEntity.MaintainStock)
+                    continue;
+
+                // Reverse accepted return: on submit we deducted stock, so on cancel we add it back
+                if (item.Quantity < 0)
+                {
+                    var reverseStockQty = Math.Abs(item.StockQty);
+                    await _valuationService.CreateLedgerEntryAsync(
+                        receipt.CompanyId, item.ItemId, cancelWarehouseId,
+                        receipt.PostingDate, reverseStockQty, ratePerStockUnit,
+                        voucherType: "PurchaseReceipt", voucherId: receipt.Id,
+                        tenantId: receipt.TenantId);
+
+                    await _binService.ApplyStockMovementAsync(
+                        item.ItemId, cancelWarehouseId,
+                        reverseStockQty, reverseStockQty * ratePerStockUnit, receipt.TenantId);
+                }
+
+                // Reverse rejected return: on submit we deducted rejected stock, so on cancel we add it back
+                var originalItem = originalItems?.GetValueOrDefault(item.ItemId);
+                var rejectedWarehouseId = item.RejectedWarehouseId ?? originalItem?.RejectedWarehouseId;
+                if (rejectedWarehouseId.HasValue && item.RejectedQty < 0)
+                {
+                    var setValuationForRejected = item.FromWarehouseId.HasValue || (originalItem?.FromWarehouseId.HasValue ?? false) ||
+                        await SettingProvider.IsTrueAsync(MyERP.Settings.MyERPSettings.Buying.SetValuationRateForRejectedMaterials);
+                    var rejectedRate = setValuationForRejected ? ratePerStockUnit : 0.0m;
+                    var reverseRejectedStockQty = Math.Abs(item.RejectedStockQty);
+
+                    await _valuationService.CreateLedgerEntryAsync(
+                        receipt.CompanyId, item.ItemId, rejectedWarehouseId.Value,
+                        receipt.PostingDate, reverseRejectedStockQty, rejectedRate,
+                        voucherType: "PurchaseReceipt", voucherId: receipt.Id,
+                        tenantId: receipt.TenantId);
+
+                    await _binService.ApplyStockMovementAsync(
+                        item.ItemId, rejectedWarehouseId.Value,
+                        reverseRejectedStockQty, reverseRejectedStockQty * rejectedRate, receipt.TenantId);
+                }
+
+                // Reverse internal transfer return: on submit we added material back into source warehouse,
+                // so on cancel we deduct it
+                var fromWarehouseId = item.FromWarehouseId ?? originalItem?.FromWarehouseId;
+                if (fromWarehouseId.HasValue)
+                {
+                    var returnedToSourceQty = (item.Quantity < 0 ? Math.Abs(item.StockQty) : 0m)
+                        + (item.RejectedQty < 0 ? Math.Abs(item.RejectedStockQty) : 0m);
+
+                    if (returnedToSourceQty > 0)
+                    {
+                        await _valuationService.CreateLedgerEntryAsync(
+                            receipt.CompanyId, item.ItemId, fromWarehouseId.Value,
+                            receipt.PostingDate, -returnedToSourceQty, ratePerStockUnit,
+                            voucherType: "PurchaseReceipt", voucherId: receipt.Id,
+                            tenantId: receipt.TenantId);
+
+                        await _binService.ApplyStockMovementAsync(
+                            item.ItemId, fromWarehouseId.Value,
+                            -returnedToSourceQty, -(returnedToSourceQty * ratePerStockUnit), receipt.TenantId);
+                    }
+                }
+            }
+        }
+        else
+        {
+            foreach (var item in receipt.Items)
+            {
+                var stockQty = item.StockQty;
+                var ratePerStockUnit = item.ConversionFactor != 0
+                    ? item.UnitPrice / item.ConversionFactor
+                    : item.UnitPrice;
+
+                var cancelItemEntity = await cancelItemRepo.FindAsync(item.ItemId);
+                if (cancelItemEntity != null && !cancelItemEntity.MaintainStock)
+                    continue;
+
+                // Reverse out of the warehouse the line actually went into on submit.
+                var cancelWarehouseId = item.WarehouseId ?? receipt.WarehouseId;
+
+                if (stockQty > 0)
+                {
+                    await _valuationService.CreateLedgerEntryAsync(
+                        receipt.CompanyId, item.ItemId, cancelWarehouseId,
+                        receipt.PostingDate, -stockQty, ratePerStockUnit,
+                        voucherType: "PurchaseReceipt", voucherId: receipt.Id,
+                        tenantId: receipt.TenantId);
+
+                    await _binService.ApplyStockMovementAsync(
+                        item.ItemId, cancelWarehouseId,
+                        -stockQty, -(stockQty * ratePerStockUnit), receipt.TenantId);
+
+                    // Restore ordered qty in stock UOM
+                    await _binService.UpdateOrderedQtyAsync(
+                        item.ItemId, cancelWarehouseId, stockQty, receipt.TenantId);
+                }
+
+                // Reverse in-transit warehouse deduction for internal transfers (PR #59251 / #59256)
+                if (item.FromWarehouseId.HasValue)
+                {
+                    var sourceStockQty = stockQty + item.RejectedStockQty;
+                    if (sourceStockQty > 0)
+                    {
+                        await _valuationService.CreateLedgerEntryAsync(
+                            receipt.CompanyId, item.ItemId, item.FromWarehouseId.Value,
+                            receipt.PostingDate, sourceStockQty, ratePerStockUnit,
+                            voucherType: "PurchaseReceipt", voucherId: receipt.Id,
+                            tenantId: receipt.TenantId);
+
+                        await _binService.ApplyStockMovementAsync(
+                            item.ItemId, item.FromWarehouseId.Value,
+                            sourceStockQty, sourceStockQty * ratePerStockUnit, receipt.TenantId);
+                    }
+                }
+
+                // If rejected warehouse and rejected qty exist, reverse rejected stock SLE (PR #51968 / commit 343ee9695b)
+                if (item.RejectedWarehouseId.HasValue && item.RejectedQty > 0)
+                {
+                    var setValuationForRejected = item.FromWarehouseId.HasValue ||
+                        await SettingProvider.IsTrueAsync(MyERP.Settings.MyERPSettings.Buying.SetValuationRateForRejectedMaterials);
+                    var rejectedRate = setValuationForRejected ? ratePerStockUnit : 0.0m;
+                    var rejectedStockQty = item.RejectedStockQty;
+                    await _valuationService.CreateLedgerEntryAsync(
+                        receipt.CompanyId, item.ItemId, item.RejectedWarehouseId.Value,
+                        receipt.PostingDate, -rejectedStockQty, rejectedRate,
+                        voucherType: "PurchaseReceipt", voucherId: receipt.Id,
+                        tenantId: receipt.TenantId);
+
+                    await _binService.ApplyStockMovementAsync(
+                        item.ItemId, item.RejectedWarehouseId.Value,
+                        -rejectedStockQty, -(rejectedStockQty * rejectedRate), receipt.TenantId);
+                }
+            }
+        }
+
+        // Reverse linked Purchase Order fulfillment tracking
+        // Cancel reversal: restore PO ReceivedQty (with concurrency retry)
+        if (receipt.PurchaseOrderId.HasValue)
+        {
+            await UpdatePoFulfillmentWithRetryAsync(receipt.PurchaseOrderId.Value, receipt.Items, isReversal: !receipt.IsReturn);
+        }
+
+        // Reverse Material Request fulfillment tracking for received items (ERPNext PR #60208)
+        await UpdateMaterialRequestReceivedQtyAsync(receipt, isReversal: !receipt.IsReturn);
+
+        await _repository.UpdateAsync(receipt, autoSave: true);
+
+        // Audit trail
+        await _activityLogRepository.InsertAsync(new DocumentActivityLog(
+            GuidGenerator.Create(), "PurchaseReceipt", receipt.Id, "Cancelled",
+            receipt.CompanyId, receipt.ReceiptNumber, "Submitted", "Cancelled",
+            CurrentUser.Id, tenantId: receipt.TenantId));
+
+        return ObjectMapper.Map<PurchaseReceipt, PurchaseReceiptDto>(receipt);
+    }
+
+    /// <summary>
+    /// Amend a cancelled Purchase Receipt — creates a new draft copy.
+    /// </summary>
+    [Authorize(MyERPPermissions.PurchaseReceipts.Create)]
+    public async Task<PurchaseReceiptDto> AmendAsync(Guid id)
+    {
+        var original = await _repository.GetAsync(id);
+        var amendService = LazyServiceProvider.LazyGetRequiredService<Core.DomainServices.DocumentAmendmentService>();
+
+        amendService.ValidateCanAmend(original.Status);
+        var newNumber = amendService.GenerateAmendedNumber(original.ReceiptNumber, original.AmendmentIndex + 1);
+
+        var amended = new PurchaseReceipt(
+            GuidGenerator.Create(), original.CompanyId, original.SupplierId,
+            original.WarehouseId, newNumber, DateTime.UtcNow.Date, CurrentTenant.Id);
+
+        amended.AmendedFromId = original.Id;
+        amended.AmendmentIndex = original.AmendmentIndex + 1;
+        amended.PurchaseOrderId = original.PurchaseOrderId;
+        amended.SupplierDeliveryNote = original.SupplierDeliveryNote;
+        amended.Notes = original.Notes;
+
+        foreach (var item in original.Items)
+        {
+            amended.AddItem(item.ItemId, item.Description, item.Quantity, item.UnitPrice, item.TaxAmount, item.Uom);
+        }
+
+        await _repository.InsertAsync(amended, autoSave: true);
+        return ObjectMapper.Map<PurchaseReceipt, PurchaseReceiptDto>(amended);
+    }
+
+    [Authorize(MyERPPermissions.PurchaseReceipts.Edit)]
+    public async Task<PurchaseReceiptDto> CloseAsync(Guid id)
+    {
+        var receipt = await _repository.GetAsync(id);
+        receipt.Close();
+        await _repository.UpdateAsync(receipt, autoSave: true);
+        return ObjectMapper.Map<PurchaseReceipt, PurchaseReceiptDto>(receipt);
+    }
+
+    [Authorize(MyERPPermissions.PurchaseReceipts.Edit)]
+    public async Task<PurchaseReceiptDto> ReopenAsync(Guid id)
+    {
+        var receipt = await _repository.GetAsync(id);
+        receipt.Reopen();
+        await _repository.UpdateAsync(receipt, autoSave: true);
+        return ObjectMapper.Map<PurchaseReceipt, PurchaseReceiptDto>(receipt);
+    }
+
+    [Authorize(MyERPPermissions.PurchaseReceipts.Edit)]
+    public async Task<PurchaseReceiptDto> CloseItemAsync(Guid id, Guid itemId)
+    {
+        var receipt = await _repository.GetAsync(id);
+        var item = receipt.Items.FirstOrDefault(i => i.Id == itemId);
+        if (item == null)
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.ItemNotFound);
+
+        receipt.CloseItem(itemId);
+        await _repository.UpdateAsync(receipt, autoSave: true);
+        return ObjectMapper.Map<PurchaseReceipt, PurchaseReceiptDto>(receipt);
+    }
+
+    [Authorize(MyERPPermissions.PurchaseReceipts.Edit)]
+    public async Task<PurchaseReceiptDto> ReopenItemAsync(Guid id, Guid itemId)
+    {
+        var receipt = await _repository.GetAsync(id);
+        var item = receipt.Items.FirstOrDefault(i => i.Id == itemId);
+        if (item == null)
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.ItemNotFound);
+
+        receipt.ReopenItem(itemId);
+        await _repository.UpdateAsync(receipt, autoSave: true);
+        return ObjectMapper.Map<PurchaseReceipt, PurchaseReceiptDto>(receipt);
+    }
+
+    private async Task UpdatePoFulfillmentWithRetryAsync(
+        Guid purchaseOrderId,
+        IReadOnlyCollection<PurchaseReceiptItem> prItems,
+        bool isReversal)
+    {
+        for (int attempt = 1; attempt <= 3; attempt++)
+        {
+            try
+            {
+                var po = await _purchaseOrderRepository.GetAsync(purchaseOrderId);
+                var prItemGroups = prItems
+                    .Where(i => i.PurchaseOrderItemId.HasValue)
+                    .GroupBy(i => i.PurchaseOrderItemId!.Value);
+
+                foreach (var group in prItemGroups)
+                {
+                    var poItem = po.Items.FirstOrDefault(i => i.Id == group.Key);
+                    if (poItem == null) continue;
+
+                    var totalStockQty = group.Sum(i => Math.Abs(i.Quantity) * (i.ConversionFactor > 0 ? i.ConversionFactor : 1m));
+                    var prQtyInPoUom = poItem.ConversionFactor > 0
+                        ? Math.Round(totalStockQty / poItem.ConversionFactor, 4)
+                        : totalStockQty;
+
+                    if (isReversal)
+                    {
+                        poItem.ReceivedQty = Math.Max(0, Math.Round(poItem.ReceivedQty - prQtyInPoUom, 4));
+                    }
+                    else
+                    {
+                        poItem.ReceivedQty = Math.Round(poItem.ReceivedQty + prQtyInPoUom, 4);
+                        // Track receipt dates for delivery performance analysis
+                        var receiptDate = DateTime.UtcNow.Date;
+                        poItem.FirstReceiptDate ??= receiptDate;
+                        poItem.LastReceiptDate = receiptDate;
+                    }
+                }
+                po.UpdateFulfillmentStatus();
+                await _purchaseOrderRepository.UpdateAsync(po, autoSave: true);
+                return;
+            }
+            catch (Volo.Abp.Data.AbpDbConcurrencyException) when (attempt < 3)
+            {
+                Logger.LogWarning("Concurrency conflict updating PO {PoId} ReceivedQty (attempt {Attempt}/3)", purchaseOrderId, attempt);
+                await Task.Delay(attempt * 10);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Turns "value moved per warehouse" into "value moved per stock account", so a receipt split
+    /// across warehouses posts its stock leg against each warehouse's own account. Returns null for
+    /// the ordinary single-warehouse case, leaving GL composition exactly as it was.
+    /// </summary>
+    private async Task<List<WarehouseStockSplitLine>?> ResolveStockAccountSplitAsync(
+        PurchaseReceipt receipt,
+        Dictionary<Guid, decimal> stockValueByWarehouse)
+    {
+        if (stockValueByWarehouse.Count < 2) return null;
+
+        var warehouseAccountService = LazyServiceProvider.LazyGetRequiredService<WarehouseAccountService>();
+        var split = new List<WarehouseStockSplitLine>();
+        foreach (var (warehouseId, value) in stockValueByWarehouse)
+        {
+            var accountId = await warehouseAccountService.ResolveStockAccountAsync(warehouseId, receipt.CompanyId);
+            split.Add(new WarehouseStockSplitLine(accountId, value));
+        }
+
+        // Warehouses sharing one stock account collapse back to a single line downstream, which the
+        // engine treats as "no split" — same GL as before.
+        return split;
+    }
+
+    /// <summary>
+    /// Item-level warehouse overrides must belong to the receipt's company — otherwise a putaway
+    /// allocation (or a hand-edited row) could land stock in another company's warehouse, which the
+    /// receipt-level warehouse check would never catch.
+    /// </summary>
+    private async Task ValidateItemWarehousesAsync(List<CreatePurchaseReceiptItemDto> items, Guid companyId)
+    {
+        var overrides = items
+            .SelectMany(i => new[] { i.WarehouseId, i.RejectedWarehouseId })
+            .Where(w => w.HasValue)
+            .Select(w => w!.Value)
+            .Distinct()
+            .ToList();
+        if (overrides.Count == 0) return;
+
+        var warehouseRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Inventory.Entities.Warehouse, Guid>>();
+        foreach (var warehouseId in overrides)
+        {
+            var warehouse = await warehouseRepo.GetAsync(warehouseId);
+            if (warehouse.CompanyId != companyId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.PutawayRuleWarehouseCompanyMismatch)
+                    .WithData("warehouse", warehouse.Name);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Resolves putaway warehouse allocations for incoming items.
+    /// Per ERPNext: putaway rules determine which warehouses receive stock based on priority + capacity.
+    /// Called before PR creation to suggest optimal warehouse distribution.
+    /// </summary>
+    [Authorize(MyERPPermissions.PurchaseReceipts.Create)]
+    public async Task<List<PutawayAllocationResultDto>> GetPutawayAllocationsAsync(
+        Guid companyId, List<PutawayItemInput> items)
+    {
+        var putawayService = LazyServiceProvider
+            .LazyGetRequiredService<MyERP.Inventory.DomainServices.PutawayService>();
+        var itemRepo = LazyServiceProvider
+            .LazyGetRequiredService<IRepository<MyERP.Inventory.Entities.Item, Guid>>();
+        var uomRepo = LazyServiceProvider
+            .LazyGetRequiredService<IRepository<MyERP.Inventory.Entities.Uom, Guid>>();
+
+        var uomQuery = await uomRepo.GetQueryableAsync();
+        var wholeNumberUoms = uomQuery
+            .Where(u => u.MustBeWholeNumber)
+            .Select(u => u.Name)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var batchRequests = new List<MyERP.Inventory.DomainServices.PutawayBatchItem>();
+        foreach (var input in items)
+        {
+            var item = await itemRepo.FindAsync(input.ItemId);
+            if (item == null || !item.MaintainStock) continue;
+
+            var mustBeWholeNumber = !string.IsNullOrWhiteSpace(item.Uom) && wholeNumberUoms.Contains(item.Uom);
+            batchRequests.Add(new MyERP.Inventory.DomainServices.PutawayBatchItem
+            {
+                ItemId = input.ItemId,
+                Qty = input.Qty,
+                RejectedQty = input.RejectedQty,
+                ItemGroupId = item.ItemGroupId,
+                MustBeWholeNumber = mustBeWholeNumber
+            });
+        }
+
+        var allocations = await putawayService.AllocateBatchAsync(companyId, batchRequests);
+
+        return allocations.Select(alloc => new PutawayAllocationResultDto
+        {
+            ItemId = alloc.ItemId,
+            WarehouseId = alloc.WarehouseId,
+            Qty = alloc.Qty,
+            RejectedQty = alloc.RejectedQty,
+            ReceivedQty = alloc.ReceivedQty,
+            IsUnallocated = alloc.IsUnallocated,
+        }).ToList();
+    }
+
+    [Authorize(MyERPPermissions.PurchaseReceipts.Submit)]
+    public async Task<BulkOperationResultDto> BulkSubmitAsync(List<Guid> ids)
+    {
+        var results = new BulkOperationResultDto();
+        foreach (var id in ids)
+        {
+            try
+            {
+                await SubmitAsync(id);
+                results.Succeeded++;
+            }
+            catch (Exception ex)
+            {
+                results.Failed++;
+                results.Errors.Add(new BulkOperationError { Id = id, Message = ex.Message });
+            }
+        }
+        return results;
+    }
+
+    /// <summary>
+    /// Updates Material Request items' ReceivedQuantity when Purchase Receipt is submitted or cancelled.
+    /// Supports combining receipt quantities on mixed receipts per ERPNext PR #60208 / commit ba48a9d0ad.
+    /// </summary>
+    private async Task UpdateMaterialRequestReceivedQtyAsync(PurchaseReceipt receipt, bool isReversal)
+    {
+        var mrManager = LazyServiceProvider.LazyGetRequiredService<MyERP.Purchasing.DomainServices.MaterialRequestManager>();
+
+        PurchaseOrder? po = null;
+        if (receipt.PurchaseOrderId.HasValue)
+        {
+            po = await _purchaseOrderRepository.FindAsync(receipt.PurchaseOrderId.Value);
+        }
+
+        var lines = new List<(Guid MaterialRequestItemId, decimal Quantity)>();
+        foreach (var item in receipt.Items)
+        {
+            var mrItemId = item.MaterialRequestItemId;
+            if (!mrItemId.HasValue && item.PurchaseOrderItemId.HasValue && po != null)
+            {
+                var poItem = po.Items.FirstOrDefault(i => i.Id == item.PurchaseOrderItemId.Value);
+                if (poItem?.MaterialRequestItemId != null)
+                {
+                    mrItemId = poItem.MaterialRequestItemId;
+                    item.MaterialRequestItemId = mrItemId;
+                }
+            }
+
+            if (mrItemId.HasValue)
+            {
+                var qty = Math.Abs(item.StockQty);
+                if (qty > 0)
+                {
+                    lines.Add((mrItemId.Value, qty));
+                }
+            }
+        }
+
+        if (lines.Count > 0)
+        {
+            await mrManager.UpdateReceiptFulfillmentForItemsAsync(lines, reverse: isReversal);
+        }
+    }
+}

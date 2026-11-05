@@ -1,0 +1,403 @@
+import { Component, OnInit, inject, signal, computed } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { ActivatedRoute, Router, RouterLink } from '@angular/router';
+import { FormsModule } from '@angular/forms';
+import { LocalizationPipe, LocalizationService } from '@abp/ng.core';
+import { Confirmation, ToasterService, ConfirmationService } from '@abp/ng.theme.shared';
+import { PickListService } from '../../proxy/inventory/pick-list.service';
+import type { PickAllocationResultDto, PickListDto, StockAvailabilityInsightDto } from '../../proxy/inventory/models';
+import { StatusBadgeComponent } from '../../shared/components/status-badge/status-badge.component';
+import { BreadcrumbComponent } from '../../shared/components/breadcrumb/breadcrumb.component';
+import { ActivityLogComponent } from '../../shared/components/activity-log/activity-log.component';
+
+@Component({
+  selector: 'app-pick-list-detail',
+  standalone: true,
+  imports: [CommonModule, RouterLink, LocalizationPipe, FormsModule, StatusBadgeComponent, BreadcrumbComponent, ActivityLogComponent],
+  template: `
+    <app-breadcrumb />
+    <div class="container-fluid py-3">
+      @if (!pickList()) {
+        <div class="text-center py-5"><i class="fa fa-spinner fa-spin fa-2x"></i></div>
+      } @else {
+        <div class="d-flex justify-content-between align-items-center mb-3">
+          <h4 class="mb-0">
+            <i class="fa fa-clipboard-list me-2 text-primary"></i>
+            {{ pickList()!.pickListNumber || 'Pick List' }}
+          </h4>
+          <div class="btn-group">
+            @if (pickList()!.status === 0) {
+              <a [routerLink]="['/inventory/pick-lists', pickListId, 'edit']" class="btn btn-outline-primary btn-sm">
+                <i class="fa fa-edit me-1"></i>{{ '::Edit' | abpLocalization }}
+              </a>
+              <button class="btn btn-outline-info btn-sm" [disabled]="checkingAvailability()" (click)="checkAvailability()">
+                <i class="fa fa-boxes-stacked me-1"></i>{{ '::CheckAvailability' | abpLocalization }}
+              </button>
+              <button class="btn btn-outline-success btn-sm" (click)="submit()">
+                <i class="fa fa-paper-plane me-1"></i>{{ '::Submit' | abpLocalization }}
+              </button>
+            }
+            @if (pickList()!.status === 1) {
+              @if (!pickList()!.isFullyTransferred) {
+                <button class="btn btn-outline-primary btn-sm" (click)="createDeliveryNote()">
+                  <i class="fa fa-truck me-1"></i>{{ '::CreateDeliveryNote' | abpLocalization }}
+                </button>
+              }
+              <button class="btn btn-outline-danger btn-sm" (click)="cancel()">
+                <i class="fa fa-ban me-1"></i>{{ '::Cancel' | abpLocalization }}
+              </button>
+            }
+            <button class="btn btn-outline-secondary btn-sm" (click)="goBack()">
+              <i class="fa fa-arrow-left me-1"></i>{{ '::Back' | abpLocalization }}
+            </button>
+          </div>
+        </div>
+
+        <!-- KPIs -->
+        <div class="row g-3 mb-3">
+          <div class="col-md-3">
+            <div class="card border-0 shadow-sm text-center py-3">
+              <div class="text-muted small">{{ '::Status' | abpLocalization }}</div>
+              <div class="mt-1"><app-status-badge [status]="getStatusLabel(pickList()!.status)" /></div>
+            </div>
+          </div>
+          <div class="col-md-3">
+            <div class="card border-0 shadow-sm text-center py-3">
+              <div class="text-muted small">{{ '::Purpose' | abpLocalization }}</div>
+              <div class="fw-bold mt-1">{{ pickList()!.purpose || 'Delivery' }}</div>
+            </div>
+          </div>
+          <div class="col-md-3">
+            <div class="card border-0 shadow-sm text-center py-3">
+              <div class="text-muted small">{{ '::Items' | abpLocalization }}</div>
+              <div class="fw-bold mt-1">{{ pickList()!.items?.length || 0 }}</div>
+            </div>
+          </div>
+          <div class="col-md-3">
+            <div class="card border-0 shadow-sm text-center py-3">
+              @if (pickList()!.purpose === 'Delivery') {
+                <div class="text-muted small">{{ '::DeliveryStatus' | abpLocalization }}</div>
+                <div class="mt-1">
+                  @if (pickList()!.deliveryStatus === 'Fully Delivered' || pickList()!.isFullyDelivered) {
+                    <span class="badge bg-success fs-6">{{ '::FullyDelivered' | abpLocalization }}</span>
+                  } @else if (pickList()!.deliveryStatus === 'Partly Delivered' || pickList()!.isPartiallyDelivered) {
+                    <span class="badge bg-warning fs-6">{{ '::PartlyDelivered' | abpLocalization }}</span>
+                  } @else {
+                    <span class="badge bg-light text-dark fs-6">{{ '::NotDelivered' | abpLocalization }}</span>
+                  }
+                </div>
+              } @else {
+                <div class="text-muted small">{{ '::TransferStatus' | abpLocalization }}</div>
+                <div class="mt-1">
+                  @if (pickList()!.isFullyTransferred) {
+                    <span class="badge bg-success fs-6">{{ '::FullyTransferred' | abpLocalization }}</span>
+                  } @else if (pickList()!.isPartiallyTransferred) {
+                    <span class="badge bg-warning fs-6">{{ '::PartiallyTransferred' | abpLocalization }}</span>
+                  } @else {
+                    <span class="badge bg-light text-dark fs-6">{{ '::Pending' | abpLocalization }}</span>
+                  }
+                </div>
+              }
+            </div>
+          </div>
+        </div>
+
+        <!-- Stock Availability Check Results & Insight -->
+        @if (allocationResult(); as ar) {
+          <div class="card shadow-sm mb-3" [class.border-warning]="ar.hasShortage" [class.border-success]="!ar.hasShortage">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <span class="fw-bold"><i class="fa fa-boxes-stacked me-2"></i>{{ '::StockAvailabilityInsight' | abpLocalization }}</span>
+              @if (ar.hasShortage) {
+                <span class="badge bg-warning text-dark"><i class="fa fa-triangle-exclamation me-1"></i>{{ '::StockShortage' | abpLocalization }}</span>
+              } @else {
+                <span class="badge bg-success"><i class="fa fa-check me-1"></i>{{ '::FullyAvailable' | abpLocalization }}</span>
+              }
+            </div>
+            <div class="card-body p-0">
+              @if (availabilityInsights().length > 0) {
+                <table class="table table-sm mb-0">
+                  <thead>
+                    <tr>
+                      <th>{{ '::Item' | abpLocalization }}</th>
+                      <th>{{ '::Warehouse' | abpLocalization }}</th>
+                      <th class="text-end">{{ '::ActualQty' | abpLocalization }}</th>
+                      <th class="text-end">{{ '::PickedQty' | abpLocalization }}</th>
+                      <th class="text-end">{{ '::ReservedQty' | abpLocalization }}</th>
+                      <th class="text-end">{{ '::FreeQty' | abpLocalization }}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    @for (ins of availabilityInsights(); track $index) {
+                      <tr [class.table-warning]="(ins.freeQty ?? 0) <= 0">
+                        <td>{{ ins.itemName || itemLabel(ins.itemId) }}</td>
+                        <td>{{ ins.warehouseName || ins.warehouseId }}</td>
+                        <td class="text-end">{{ ins.actualQty | number:'1.2-2' }}</td>
+                        <td class="text-end">{{ ins.pickedQty | number:'1.2-2' }}</td>
+                        <td class="text-end">{{ ins.reservedQty | number:'1.2-2' }}</td>
+                        <td class="text-end fw-bold" [class.text-danger]="(ins.freeQty ?? 0) <= 0">{{ ins.freeQty | number:'1.2-2' }}</td>
+                      </tr>
+                      @if (ins.holdingPickLists && ins.holdingPickLists.length > 0) {
+                        <tr>
+                          <td colspan="6" class="p-2 bg-light">
+                            <div class="small fw-bold text-muted mb-1">
+                              <i class="fa fa-info-circle me-1"></i>{{ '::HoldingPickLists' | abpLocalization }}:
+                            </div>
+                            <table class="table table-sm table-bordered bg-white mb-0">
+                              <thead>
+                                <tr class="table-light">
+                                  <th>{{ '::PickList' | abpLocalization }}</th>
+                                  <th>{{ '::Status' | abpLocalization }}</th>
+                                  <th class="text-end">{{ '::Quantity' | abpLocalization }}</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                @for (h of ins.holdingPickLists; track h.pickListId) {
+                                  <tr>
+                                    <td>
+                                      <a [routerLink]="['/inventory/pick-lists', h.pickListId]">
+                                        {{ h.pickListNumber || h.pickListId }}
+                                      </a>
+                                    </td>
+                                    <td><span class="badge bg-secondary">{{ h.status }}</span></td>
+                                    <td class="text-end">{{ h.holdingQty | number:'1.2-2' }}</td>
+                                  </tr>
+                                }
+                              </tbody>
+                            </table>
+                          </td>
+                        </tr>
+                      }
+                    }
+                  </tbody>
+                </table>
+              } @else {
+                <table class="table table-sm mb-0">
+                  <thead>
+                    <tr>
+                      <th>{{ '::Item' | abpLocalization }}</th>
+                      <th class="text-end">{{ '::RequestedQty' | abpLocalization }}</th>
+                      <th class="text-end">{{ '::AllocatedQty' | abpLocalization }}</th>
+                      <th class="text-end">{{ '::ShortageQty' | abpLocalization }}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    @for (a of ar.allocations || []; track $index) {
+                      <tr [class.table-warning]="(a.shortageQty ?? 0) > 0">
+                        <td>{{ itemLabel(a.itemId) }}</td>
+                        <td class="text-end">{{ a.requestedQty | number:'1.2-2' }}</td>
+                        <td class="text-end">{{ a.allocatedQty | number:'1.2-2' }}</td>
+                        <td class="text-end" [class.text-danger]="(a.shortageQty ?? 0) > 0">{{ a.shortageQty | number:'1.2-2' }}</td>
+                      </tr>
+                    }
+                  </tbody>
+                </table>
+              }
+            </div>
+          </div>
+        }
+
+        <!-- Barcode Scan Mode (for Submitted pick lists with pending items) -->
+        @if (pickList()!.status === 1 && !pickList()!.isFullyTransferred) {
+          <div class="card shadow-sm mb-3 border-primary">
+            <div class="card-header bg-primary bg-opacity-10 d-flex justify-content-between align-items-center">
+              <span class="fw-bold"><i class="fa fa-barcode me-2"></i>{{ '::ScanToPick' | abpLocalization }}</span>
+              <div>
+                @if (pickedProgress() > 0) {
+                  <span class="badge bg-success me-2">{{ pickedProgress() }}% {{ '::Picked' | abpLocalization }}</span>
+                }
+                <button class="btn btn-sm" [class.btn-primary]="!scanMode()" [class.btn-outline-primary]="scanMode()" (click)="toggleScanMode()">
+                  @if (scanMode()) { <i class="fa fa-times me-1"></i>{{ '::ExitScanMode' | abpLocalization }} }
+                  @else { <i class="fa fa-qrcode me-1"></i>{{ '::EnterScanMode' | abpLocalization }} }
+                </button>
+              </div>
+            </div>
+            @if (scanMode()) {
+              <div class="card-body">
+                <div class="input-group input-group-lg mb-2">
+                  <span class="input-group-text"><i class="fa fa-barcode"></i></span>
+                  <input type="text" class="form-control" [(ngModel)]="scanInput" (keydown)="onScanInput($event)"
+                    [placeholder]="'::ScanBarcode' | abpLocalization" autofocus />
+                </div>
+                <small class="text-muted">{{ '::ScanBarcodeHint' | abpLocalization }}</small>
+                @if (pickedProgress() === 100) {
+                  <div class="alert alert-success mt-2 mb-0"><i class="fa fa-check-circle me-1"></i>{{ '::AllItemsPicked' | abpLocalization }}</div>
+                }
+              </div>
+            }
+          </div>
+        }
+
+        <!-- Pick List Items -->
+        <div class="card shadow-sm mb-3">
+          <div class="card-header"><h6 class="mb-0">{{ '::PickListItems' | abpLocalization }}</h6></div>
+          <div class="card-body p-0">
+            <table class="table table-hover mb-0">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>{{ '::Item' | abpLocalization }}</th>
+                  <th>{{ '::Warehouse' | abpLocalization }}</th>
+                  <th class="text-end">{{ '::PickedQty' | abpLocalization }}</th>
+                  <th class="text-end">{{ '::TransferredQty' | abpLocalization }}</th>
+                  <th class="text-end">{{ '::PendingQty' | abpLocalization }}</th>
+                  <th>{{ '::Progress' | abpLocalization }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                @for (item of pickList()!.items || []; track $index; let i = $index) {
+                  <tr [class.table-success]="isItemScanned(item.itemId || '')">
+                    <td class="text-muted">
+                      @if (isItemScanned(item.itemId || '')) { <i class="fa fa-check-circle text-success"></i> }
+                      @else { {{ i + 1 }} }
+                    </td>
+                    <td>{{ item.itemName || item.itemId || '—' }}</td>
+                    <td>{{ item.warehouseId || '—' }}</td>
+                    <td class="text-end">{{ item.qty | number:'1.2-2' }}</td>
+                    <td class="text-end">{{ item.transferredQty | number:'1.2-2' }}</td>
+                    <td class="text-end" [class.text-warning]="(item.pendingQty ?? 0) > 0">
+                      {{ item.pendingQty | number:'1.2-2' }}
+                    </td>
+                    <td>
+                      @if ((item.qty ?? 0) > 0) {
+                        <div class="progress" style="height: 8px;">
+                          <div class="progress-bar" [class.bg-success]="(item.transferredQty ?? 0) >= (item.qty ?? 0)"
+                            [class.bg-warning]="(item.transferredQty ?? 0) > 0 && (item.transferredQty ?? 0) < (item.qty ?? 0)"
+                            [style.width.%]="((item.transferredQty ?? 0) / (item.qty ?? 1)) * 100"></div>
+                        </div>
+                      }
+                    </td>
+                  </tr>
+                } @empty {
+                  <tr><td colspan="7" class="text-center text-muted py-3">{{ '::NoItems' | abpLocalization }}</td></tr>
+                }
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        @if (pickList()!.customerId) {
+          <div class="card shadow-sm mb-3">
+            <div class="card-body">
+              <small class="text-muted">{{ '::Customer' | abpLocalization }}</small>
+              <div class="fw-bold">{{ pickList()!.customerId || '—' }}</div>
+            </div>
+          </div>
+        }
+
+        <app-activity-log documentType="PickList" [documentId]="pickListId" />
+      }
+    </div>
+  `,
+})
+export class PickListDetailComponent implements OnInit {
+  private route = inject(ActivatedRoute);
+  private confirmation = inject(ConfirmationService);
+  private router = inject(Router);
+  private service = inject(PickListService);
+  private toaster = inject(ToasterService);
+  private localization = inject(LocalizationService);
+
+  pickList = signal<PickListDto | null>(null);
+  pickListId = '';
+  scanInput = '';
+  scanMode = signal(false);
+  scannedItems = signal<Set<string>>(new Set());
+  allocationResult = signal<PickAllocationResultDto | null>(null);
+  availabilityInsights = signal<StockAvailabilityInsightDto[]>([]);
+  checkingAvailability = signal(false);
+
+  pickedProgress = computed(() => {
+    const items = this.pickList()?.items ?? [];
+    if (items.length === 0) return 0;
+    const picked = items.filter((i: any) => this.scannedItems().has(i.itemId)).length;
+    return Math.round((picked / items.length) * 100);
+  });
+
+  ngOnInit() {
+    this.pickListId = this.route.snapshot.params['id'];
+    this.loadData();
+  }
+
+  getStatusLabel(status: number | undefined): string {
+    return ['Draft', 'Submitted', 'Approved', 'Posted', 'Cancelled', 'Rejected'][status ?? 0] ?? 'Draft';
+  }
+
+  loadData() {
+    this.service.get(this.pickListId).subscribe({
+      next: (data) => this.pickList.set(data),
+      error: () => this.toaster.error(this.l('::FailedToLoad')),
+    });
+  }
+
+  submit() {
+    this.service.submit(this.pickListId).subscribe({
+      next: () => { this.toaster.success(this.l('::SuccessfullySubmitted')); this.loadData(); },
+      error: () => {},
+    });
+  }
+
+  checkAvailability() {
+    this.checkingAvailability.set(true);
+    this.service.allocateStock(this.pickListId).subscribe({
+      next: (result) => {
+        this.allocationResult.set(result);
+        if (result.hasShortage) this.toaster.warn(this.l('::StockShortage'));
+        else this.toaster.success(this.l('::FullyAvailable'));
+      },
+      error: () => this.checkingAvailability.set(false),
+    });
+    this.service.getStockAvailabilityInsight(this.pickListId).subscribe({
+      next: (insights) => {
+        this.availabilityInsights.set(insights || []);
+        this.checkingAvailability.set(false);
+      },
+      error: () => this.checkingAvailability.set(false),
+    });
+  }
+
+  itemLabel(itemId: string | undefined): string {
+    const item = (this.pickList()?.items ?? []).find(i => i.itemId === itemId);
+    return item?.itemName || itemId || '—';
+  }
+
+  createDeliveryNote() {
+    this.service.createDeliveryNoteFromPickList(this.pickListId).subscribe({
+      next: () => { this.toaster.success(this.l('::SuccessfullyCreated')); this.loadData(); },
+      error: () => {},
+    });
+  }
+
+  cancel() {
+    this.confirmation.warn('::CancelConfirmation', '::AreYouSure').subscribe(status => {
+      if (status !== Confirmation.Status.confirm) return;
+      this.service.cancel(this.pickListId).subscribe({
+        next: () => { this.toaster.success(this.l('::SuccessfullyCancelled')); this.loadData(); },
+        error: () => {},
+      });
+    });
+  }
+
+  goBack() { this.router.navigate(['/inventory/pick-lists']); }
+
+  toggleScanMode() { this.scanMode.set(!this.scanMode()); }
+
+  onScanInput(event: KeyboardEvent) {
+    if (event.key !== 'Enter' || !this.scanInput.trim()) return;
+    const barcode = this.scanInput.trim();
+    this.scanInput = '';
+    const items = this.pickList()?.items ?? [];
+    const match = items.find(i => i.itemId === barcode || i.itemName?.toLowerCase().includes(barcode.toLowerCase()));
+    if (match) {
+      const s = new Set(this.scannedItems());
+      s.add(match.itemId!);
+      this.scannedItems.set(s);
+      this.toaster.success(this.l('::ItemScanned') + ': ' + (match.itemName || match.itemId));
+    } else {
+      this.toaster.warn(this.l('::ItemNotFoundInPickList') + ': ' + barcode);
+    }
+  }
+
+  isItemScanned(itemId: string): boolean { return this.scannedItems().has(itemId); }
+
+  private l(key: string): string { return this.localization.instant(key); }
+}

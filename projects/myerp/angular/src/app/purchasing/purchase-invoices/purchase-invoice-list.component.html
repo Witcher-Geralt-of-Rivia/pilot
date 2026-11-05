@@ -1,0 +1,216 @@
+<abp-page [title]="'::PurchaseInvoices' | abpLocalization">
+  <!-- KPI Summary Cards (server-side aggregate — accurate across all invoices) -->
+  @if (summary()) {
+  <div class="row g-3 mb-3">
+    <div class="col-md-3">
+      <div class="card border-start border-4 border-danger h-100">
+        <div class="card-body py-2 px-3">
+          <div class="text-muted small">{{ '::TotalPayable' | abpLocalization }}</div>
+          <div class="fs-5 fw-bold text-danger">{{ summary().totalPayable | number:'1.2-2' }}</div>
+        </div>
+      </div>
+    </div>
+    <div class="col-md-3">
+      <div class="card border-start border-4 border-warning h-100">
+        <div class="card-body py-2 px-3">
+          <div class="text-muted small">{{ '::Overdue' | abpLocalization }}</div>
+          <div class="fs-5 fw-bold text-warning">{{ summary().overdueCount }}
+            <span class="fw-normal fs-6 text-muted ms-1">({{ summary().overdueAmount | number:'1.2-2' }})</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="col-md-3">
+      <div class="card border-start border-4 border-info h-100">
+        <div class="card-body py-2 px-3">
+          <div class="text-muted small">{{ '::MonthlySpend' | abpLocalization }}</div>
+          <div class="fs-5 fw-bold text-info">{{ summary().monthlySpend | number:'1.2-2' }}</div>
+          <div class="text-muted small">{{ summary().monthlyInvoiceCount }} {{ '::Invoices' | abpLocalization }}</div>
+        </div>
+      </div>
+    </div>
+    <div class="col-md-3">
+      <div class="card border-start border-4 border-primary h-100">
+        <div class="card-body py-2 px-3">
+          <div class="text-muted small">{{ '::PostedInvoices' | abpLocalization }}</div>
+          <div class="fs-5 fw-bold text-primary">{{ summary().postedInvoiceCount }}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  }
+
+  <!-- Due This Week Alert Banner (AP payment priority) -->
+  @if (dueThisWeekCount() > 0) {
+    <div class="alert alert-warning d-flex align-items-center mb-3" role="alert">
+      <i class="fa fa-clock me-2"></i>
+      <div>
+        <strong>{{ dueThisWeekCount() }}</strong> {{ '::InvoicesDueThisWeek' | abpLocalization }}
+        — {{ '::TotalAmount' | abpLocalization }}: <strong class="text-danger">{{ dueThisWeekTotal() | number:'1.2-2' }}</strong>
+      </div>
+    </div>
+  }
+  @if (overdueCount() > 0) {
+    <div class="alert alert-danger d-flex align-items-center mb-3" role="alert">
+      <i class="fa fa-exclamation-triangle me-2"></i>
+      <div>
+        <strong>{{ overdueCount() }}</strong> {{ '::OverdueInvoices' | abpLocalization }}
+        — {{ '::TotalAmount' | abpLocalization }}: <strong>{{ overdueTotal() | number:'1.2-2' }}</strong>
+      </div>
+    </div>
+  }
+
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <div class="d-flex gap-2 align-items-center">
+      <input type="text" class="form-control form-control-sm" style="width: 200px;"
+        [placeholder]="'::Search' | abpLocalization" [(ngModel)]="searchTerm" (keyup.enter)="onSearch()">
+      <div class="input-group input-group-sm" style="width: 260px;">
+        <span class="input-group-text"><i class="fa fa-calendar"></i></span>
+        <input type="date" class="form-control" [(ngModel)]="fromDate" (change)="onDateChange()">
+        <span class="input-group-text">–</span>
+        <input type="date" class="form-control" [(ngModel)]="toDate" (change)="onDateChange()">
+      </div>
+      <select class="form-select form-select-sm" style="width: 140px;" [(ngModel)]="statusFilter" (change)="onStatusChange()">
+        <option value="">{{ '::AllStatuses' | abpLocalization }}</option>
+        <option value="Draft">Draft</option>
+        <option value="Submitted">Submitted</option>
+        <option value="Posted">Posted</option>
+        <option value="Cancelled">Cancelled</option>
+      </select>
+      <span class="text-muted small">{{ store.totalCount() }} {{ '::Results' | abpLocalization }}</span>
+    </div>
+    <div class="d-flex gap-2">
+      <button class="btn btn-outline-success btn-sm" (click)="batchSubmitToLhdn()" [disabled]="isSubmittingLhdn">
+        @if (isSubmittingLhdn) { <span class="spinner-border spinner-border-sm me-1"></span> }
+        @else { <i class="fa fa-cloud-arrow-up me-1"></i> }
+        {{ '::SubmitToLHDN' | abpLocalization }}
+      </button>
+      <button class="btn btn-outline-secondary btn-sm" (click)="exportCsv()">
+        <i class="fa fa-download me-1"></i> {{ '::ExportCSV' | abpLocalization }}
+      </button>
+      <button class="btn btn-primary btn-sm" (click)="createInvoice()">
+        <i class="fa fa-plus me-1"></i> {{ '::NewPurchaseInvoice' | abpLocalization }}
+      </button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-body">
+      @if (store.isLoading()) {
+        <div class="text-center py-5">
+          <div class="spinner-border text-primary" role="status">
+            <span class="visually-hidden">Loading...</span>
+          </div>
+        </div>
+      } @else if (!store.hasInvoices()) {
+        <div class="text-center py-5">
+          <i class="fa fa-inbox fa-3x text-muted mb-3 d-block"></i>
+          <h6 class="text-muted">{{ '::NoRecordsFound' | abpLocalization }}</h6>
+          <p class="text-muted small mb-3">{{ '::NoPurchaseInvoicesYet' | abpLocalization }}</p>
+          <button class="btn btn-primary btn-sm" routerLink="new">
+            <i class="fa fa-plus me-1"></i>{{ '::NewPurchaseInvoice' | abpLocalization }}
+          </button>
+        </div>
+      } @else {
+        <div class="table-responsive">
+                    <table class="table table-hover w-100">
+            <thead>
+              <tr>
+                <th>
+                  <app-sortable-header field="invoiceNumber" [currentField]="sortField" [currentDirection]="sortDirection" (sort)="onSort($event)">
+                    {{ '::InvoiceNumber' | abpLocalization }}
+                  </app-sortable-header>
+                </th>
+                <th>
+                  <app-sortable-header field="issueDate" [currentField]="sortField" [currentDirection]="sortDirection" (sort)="onSort($event)">
+                    {{ '::Date' | abpLocalization }}
+                  </app-sortable-header>
+                </th>
+                <th style="min-width: 150px;">{{ '::Supplier' | abpLocalization }}</th>
+                <th>
+                  <app-sortable-header field="grandTotal" [currentField]="sortField" [currentDirection]="sortDirection" (sort)="onSort($event)">
+                    {{ '::Total' | abpLocalization }} (MYR)
+                  </app-sortable-header>
+                </th>
+                <th class="text-end" style="width: 130px;">{{ '::Outstanding' | abpLocalization }}</th>
+                <th style="width: 110px;">{{ '::MatchStatus' | abpLocalization }}</th>
+                <th>
+                  <app-sortable-header field="status" [currentField]="sortField" [currentDirection]="sortDirection" (sort)="onSort($event)">
+                    {{ '::Status' | abpLocalization }}
+                  </app-sortable-header>
+                </th>
+                <th>{{ '::EInvoice' | abpLocalization }}</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (inv of store.entities(); track inv.id ?? $index) {
+                <tr>
+                  <td class="fw-medium">
+                    <a [routerLink]="['/purchasing/invoices', inv.id]" class="text-decoration-none">{{ inv.invoiceNumber }}</a>
+                    @if (inv.supplierInvoiceNumber) {
+                      <div class="text-muted small">{{ '::SupplierInvoiceNumber' | abpLocalization }}: {{ inv.supplierInvoiceNumber }}</div>
+                    }
+                  </td>
+                  <td>{{ inv.issueDate | date:'dd/MM/yyyy' }}</td>
+                  <td class="text-truncate" style="max-width: 200px;" [title]="inv.supplierName ?? inv.supplierId">{{ inv.supplierName ?? inv.supplierId }}</td>
+                  <td class="text-end font-monospace">{{ inv.grandTotal | number:'1.2-2' }}</td>
+                  <td class="text-end">
+                    @if (inv.status === 'Posted' && getOutstanding(inv) > 0.01) {
+                      <span class="font-monospace" [class.text-danger]="isInvoiceOverdue(inv)" [class.fw-bold]="isInvoiceOverdue(inv)">
+                        {{ getOutstanding(inv) | number:'1.2-2' }}
+                      </span>
+                      @if (isInvoiceOverdue(inv)) {
+                        <span class="badge bg-danger ms-1">{{ inv.daysOverdue || '' }} {{ '::Overdue' | abpLocalization }}</span>
+                      }
+                    } @else if (inv.status === 'Posted') {
+                      <span class="text-success"><i class="fa fa-check-circle"></i></span>
+                    } @else {
+                      <span class="text-muted">—</span>
+                    }
+                  </td>
+                  <td>
+                    @if (inv.status === 'Posted' || inv.status === 'Submitted') {
+                      @switch (inv.matchingStatus) {
+                        @case ('FullyMatched') { <span class="badge bg-success"><i class="fa fa-check-double me-1"></i>3-Way</span> }
+                        @case ('PartiallyMatched') { <span class="badge bg-warning text-dark"><i class="fa fa-exclamation me-1"></i>Partial</span> }
+                        @case ('Unmatched') { <span class="badge bg-danger"><i class="fa fa-times me-1"></i>No PR</span> }
+                        @case ('DirectPurchase') { <span class="badge bg-secondary">Direct</span> }
+                        @default { <span class="text-muted">—</span> }
+                      }
+                      @if (inv.isReadyForPayment) {
+                        <i class="fa fa-money-bill-wave text-success ms-1" title="Ready for Payment"></i>
+                      }
+                    } @else {
+                      <span class="text-muted">—</span>
+                    }
+                  </td>
+                  <td><app-status-badge [status]="inv.status ?? ''" /></td>
+                  <td><app-lhdn-status-badge [status]="inv.eInvoiceStatus ?? ''" /></td>
+                  <td>
+                    <div class="d-flex gap-1">
+                    @if (inv.status === 'Draft') {
+                    <button class="btn btn-outline-primary btn-sm" (click)="submit(inv.id)"><i class="fa fa-paper-plane me-1"></i>{{ '::Submit' | abpLocalization }}</button>
+                    }
+                    @if (inv.status === 'Submitted') {
+                    <button class="btn btn-success btn-sm" (click)="post(inv.id)"><i class="fa fa-check-double me-1"></i>{{ '::Post' | abpLocalization }}</button>
+                    }
+                    @if (inv.status === 'Posted') {
+                    <button class="btn btn-outline-danger btn-sm" (click)="cancel(inv.id)"><i class="fa fa-ban me-1"></i>{{ '::Cancel' | abpLocalization }}</button>
+                    }
+                    </div>
+                  </td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        </div>
+      }
+    </div>
+  </div>
+  <app-pagination
+    [totalCount]="store.totalCount()"
+    [pageSize]="pageSize"
+    [currentPage]="currentPage"
+    (pageChange)="onPageChange($event)" />
+</abp-page>

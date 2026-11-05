@@ -1,0 +1,191 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Volo.Abp;
+using Volo.Abp.Domain.Entities.Auditing;
+using Volo.Abp.MultiTenancy;
+
+
+namespace MyERP.Manufacturing.Entities;
+
+/// <summary>
+/// Production Plan — MRP planning document that generates Work Orders and Material Requests.
+/// </summary>
+public class ProductionPlan : FullAuditedAggregateRoot<Guid>, IMultiTenant
+{
+    public Guid? TenantId { get; set; }
+
+    public string PlanNumber { get; set; } = null!;
+    public ProductionPlanStatus Status { get; private set; }
+
+    public Guid CompanyId { get; set; }
+    public DateTime PostingDate { get; set; }
+
+    /// <summary>If true, groups items by (item_code, warehouse, planned_start_date).</summary>
+    public bool CombineItems { get; set; }
+
+    /// <summary>If true, deducts existing ordered qty from required qty.</summary>
+    public bool IgnoreExistingOrderedQty { get; set; }
+
+    /// <summary>If true, applies MIN_ORDER_QTY rounding to material requirements.</summary>
+    public bool ConsiderMinimumOrderQty { get; set; }
+
+    /// <summary>If true, includes item safety stock in material requirement calculation.</summary>
+    public bool IncludeSafetyStock { get; set; }
+
+    /// <summary>If true, skips WO creation for sub-assemblies with sufficient stock.</summary>
+    public bool SkipAvailableSubAssemblyItem { get; set; }
+
+    /// <summary>Optional group warehouse to widen material availability scope.</summary>
+    public Guid? RawMaterialGroupWarehouseId { get; set; }
+
+    /// <summary>Target warehouse for material receipt.</summary>
+    public Guid? ForWarehouseId { get; set; }
+
+    /// <summary>Target warehouse for sub-assemblies; pools child warehouse stock if group warehouse (ERPNext PR #60210).</summary>
+    public Guid? SubAssemblyWarehouseId { get; set; }
+
+    /// <summary>If true, automatically reserves stock for work orders generated from this plan.</summary>
+    public bool ReserveStock { get; set; }
+
+    public string? Notes { get; set; }
+
+    public List<ProductionPlanItem> PlannedItems { get; private set; } = new();
+    public List<ProductionPlanMrItem> MaterialRequirements { get; private set; } = new();
+
+    protected ProductionPlan() { }
+
+    public ProductionPlan(Guid id, Guid companyId, string planNumber, DateTime postingDate, Guid? tenantId = null)
+        : base(id)
+    {
+        CompanyId = companyId;
+        PlanNumber = planNumber;
+        PostingDate = postingDate;
+        Status = ProductionPlanStatus.Draft;
+        TenantId = tenantId;
+    }
+
+    public void Submit()
+    {
+        if (Status != ProductionPlanStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        if (PlannedItems.Count == 0)
+            throw new BusinessException(MyERPDomainErrorCodes.ProductionPlanHasNoItems);
+        // Per ERPNext PR #59555: Planned Qty must be strictly greater than 0
+        if (PlannedItems.Any(i => i.PlannedQty <= 0))
+            throw new BusinessException(MyERPDomainErrorCodes.AmountMustBePositive)
+                .WithData("field", "PlannedQty");
+        Status = ProductionPlanStatus.Submitted;
+        AddLocalEvent(new MyERP.Manufacturing.Events.ProductionPlanSubmittedEvent(Id, TenantId));
+    }
+
+    public void MarkMaterialRequested()
+    {
+        if (Status == ProductionPlanStatus.Submitted)
+            Status = ProductionPlanStatus.MaterialRequested;
+    }
+
+    public void MarkInProgress()
+    {
+        if (Status is not (ProductionPlanStatus.Submitted or ProductionPlanStatus.MaterialRequested))
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = ProductionPlanStatus.InProgress;
+    }
+
+    public void Complete()
+    {
+        if (Status is not (ProductionPlanStatus.Submitted or ProductionPlanStatus.InProgress or ProductionPlanStatus.MaterialRequested))
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = ProductionPlanStatus.Completed;
+        AddLocalEvent(new MyERP.Manufacturing.Events.ProductionPlanCompletedEvent(Id, TenantId));
+    }
+
+    public void RevertCompletion(ProductionPlanStatus fallbackStatus = ProductionPlanStatus.InProgress)
+    {
+        if (Status != ProductionPlanStatus.Completed)
+            return;
+        Status = fallbackStatus;
+        AddLocalEvent(new MyERP.Manufacturing.Events.ProductionPlanCompletionRevertedEvent(Id, TenantId));
+    }
+
+    public void Close()
+    {
+        if (Status is ProductionPlanStatus.Draft or ProductionPlanStatus.Cancelled or ProductionPlanStatus.Closed)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = ProductionPlanStatus.Closed;
+        AddLocalEvent(new MyERP.Manufacturing.Events.ProductionPlanClosedEvent(Id, TenantId));
+    }
+
+    public void Reopen()
+    {
+        if (Status != ProductionPlanStatus.Closed)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = MaterialRequirements.Count > 0 ? ProductionPlanStatus.MaterialRequested : ProductionPlanStatus.Submitted;
+        AddLocalEvent(new MyERP.Manufacturing.Events.ProductionPlanReopenedEvent(Id, TenantId));
+    }
+
+    /// <summary>
+    /// Updates status based on production progress and releases/restores reservations.
+    /// Per PR #59454: closed plans stay closed until reopened.
+    /// Per PR #59449: plan reservations are released when completed and restored if reverted.
+    /// </summary>
+    public void UpdateProducedStatus(bool allCompleted, bool hasProduction)
+    {
+        if (Status is ProductionPlanStatus.Closed or ProductionPlanStatus.Cancelled or ProductionPlanStatus.Draft)
+            return;
+
+        if (allCompleted)
+        {
+            if (Status != ProductionPlanStatus.Completed)
+            {
+                Complete();
+            }
+        }
+        else
+        {
+            if (Status == ProductionPlanStatus.Completed)
+            {
+                var fallback = hasProduction
+                    ? ProductionPlanStatus.InProgress
+                    : (MaterialRequirements.Any(m => m.MaterialRequestId.HasValue) ? ProductionPlanStatus.MaterialRequested : ProductionPlanStatus.Submitted);
+                RevertCompletion(fallback);
+            }
+            else if (hasProduction)
+            {
+                if (Status is ProductionPlanStatus.Submitted or ProductionPlanStatus.MaterialRequested)
+                {
+                    Status = ProductionPlanStatus.InProgress;
+                }
+            }
+        }
+    }
+
+
+    public void Cancel()
+    {
+        if (Status is ProductionPlanStatus.Cancelled or ProductionPlanStatus.Completed or ProductionPlanStatus.Closed)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = ProductionPlanStatus.Cancelled;
+        MaterialRequirements.Clear();
+        AddLocalEvent(new MyERP.Manufacturing.Events.ProductionPlanCancelledEvent(Id, TenantId));
+    }
+
+    public void ClearPlannedItems()
+    {
+        if (Status != ProductionPlanStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        PlannedItems.Clear();
+    }
+
+    public void AddPlannedItem(ProductionPlanItem item)
+    {
+        if (Status != ProductionPlanStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        PlannedItems.Add(item);
+    }
+
+    public void AddMaterialRequirement(ProductionPlanMrItem item)
+    {
+        MaterialRequirements.Add(item);
+    }
+}

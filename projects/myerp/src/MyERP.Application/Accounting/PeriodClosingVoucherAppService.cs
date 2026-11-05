@@ -1,0 +1,262 @@
+using System;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Accounting.DomainServices;
+using MyERP.Accounting.Entities;
+using MyERP.Core;
+using MyERP.Core.Entities;
+using MyERP.Permissions;
+using MyERP.Shared;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+
+namespace MyERP.Accounting;
+
+[Authorize(MyERPPermissions.Accounts.Default)]
+public class PeriodClosingVoucherAppService : ApplicationService, IPeriodClosingVoucherAppService
+{
+    private readonly IRepository<PeriodClosingVoucher, Guid> _repository;
+    private readonly AccountClosingBalanceService _closingBalanceService;
+    private readonly DocumentPostingOrchestrator _postingOrchestrator;
+
+    public PeriodClosingVoucherAppService(
+        IRepository<PeriodClosingVoucher, Guid> repository,
+        AccountClosingBalanceService closingBalanceService,
+        DocumentPostingOrchestrator postingOrchestrator)
+    {
+        _repository = repository;
+        _closingBalanceService = closingBalanceService;
+        _postingOrchestrator = postingOrchestrator;
+    }
+
+    public async Task<PagedResultDto<PeriodClosingVoucherDto>> GetListAsync(CompanyFilteredPagedRequestDto input)
+    {
+        var query = (await _repository.WithDetailsAsync()).AsQueryable();
+
+        if (input.CompanyId.HasValue)
+            query = query.Where(x => x.CompanyId == input.CompanyId.Value);
+
+        if (!string.IsNullOrWhiteSpace(input.Filter))
+        {
+            var filter = input.Filter;
+            query = query.Where(x => x.VoucherNumber != null && x.VoucherNumber.Contains(filter));
+        }
+
+        if (!string.IsNullOrWhiteSpace(input.Status) && Enum.TryParse<DocumentStatus>(input.Status, true, out var status))
+            query = query.Where(x => x.Status == status);
+
+        var totalCount = query.Count();
+        var items = query.OrderByDescending(p => p.PostingDate)
+            .Skip(input.SkipCount).Take(input.MaxResultCount).ToList();
+        return new PagedResultDto<PeriodClosingVoucherDto>(totalCount, items.Select(ObjectMapper.Map<PeriodClosingVoucher, PeriodClosingVoucherDto>).ToList());
+    }
+
+    public async Task<PeriodClosingVoucherDto> GetAsync(Guid id)
+    {
+        var pcv = (await _repository.WithDetailsAsync()).First(p => p.Id == id);
+        return ObjectMapper.Map<PeriodClosingVoucher, PeriodClosingVoucherDto>(pcv);
+    }
+
+    /// <summary>
+    /// Gets the GL entries (Journal Entry lines) created by a Period Closing Voucher.
+    /// Per ERPNext: PCV creates one JE with per-P&amp;L-account per-dimension reversing entries.
+    /// This enables the audit trail: users can see exactly what GL postings the PCV made.
+    /// </summary>
+    public async Task<PcvGlEntryDto[]> GetGlEntriesAsync(Guid id)
+    {
+        var jeRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<JournalEntry, Guid>>();
+        var accountRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Account, Guid>>();
+
+        var linkedJes = (await jeRepo.WithDetailsAsync())
+            .Where(je => je.ReferenceType == "PeriodClosingVoucher" && je.ReferenceId == id)
+            .ToList();
+
+        if (!linkedJes.Any())
+            return [];
+
+        // Resolve account names for display
+        var accountIds = linkedJes.SelectMany(je => je.Lines).Select(l => l.AccountId).Distinct().ToList();
+        var accountQuery = await accountRepo.GetQueryableAsync();
+        var accountNames = accountQuery
+            .Where(a => accountIds.Contains(a.Id))
+            .Select(a => new { a.Id, a.AccountName, a.AccountCode })
+            .ToDictionary(a => a.Id, a => $"{a.AccountCode} - {a.AccountName}");
+
+        return linkedJes.SelectMany(je => je.Lines.Select(line => new PcvGlEntryDto
+        {
+            AccountId = line.AccountId,
+            AccountName = accountNames.TryGetValue(line.AccountId, out var name) ? name : line.AccountId.ToString(),
+            Debit = line.IsDebit ? line.Amount : 0,
+            Credit = !line.IsDebit ? line.Amount : 0,
+            CostCenterId = line.CostCenterId,
+            PostingDate = je.PostingDate,
+        })).OrderBy(e => e.AccountName).ToArray();
+    }
+
+    [Authorize(MyERPPermissions.Accounts.Create)]
+    public async Task<PeriodClosingVoucherDto> CreateAsync(CreatePeriodClosingVoucherDto input)
+    {
+        var pcv = new PeriodClosingVoucher(GuidGenerator.Create(), input.CompanyId,
+            input.FiscalYearId, input.PostingDate, input.TransactionDate,
+            input.ClosingAccountId, CurrentTenant.Id)
+        { Remarks = input.Remarks };
+        await _repository.InsertAsync(pcv);
+        return ObjectMapper.Map<PeriodClosingVoucher, PeriodClosingVoucherDto>(pcv);
+    }
+
+    public async Task<PeriodClosingStockDifferenceDto> GetStockValueDifferenceAsync(Guid id)
+    {
+        var pcv = await _repository.GetAsync(id);
+        var pcvPostingService = LazyServiceProvider.LazyGetRequiredService<PeriodClosingPostingService>();
+        var (accountBalance, stockValue, difference, tolerance, withinTolerance, hasStockTransactions) =
+            await pcvPostingService.GetStockValueDifferenceAsync(pcv.CompanyId, pcv.PostingDate);
+
+        return new PeriodClosingStockDifferenceDto
+        {
+            AccountBalance = accountBalance,
+            StockValue = stockValue,
+            Difference = difference,
+            Tolerance = tolerance,
+            WithinTolerance = withinTolerance,
+            HasStockTransactions = hasStockTransactions,
+        };
+    }
+
+    [Authorize(MyERPPermissions.Accounts.Create)]
+    public async Task<PeriodClosingVoucherDto> SubmitAsync(Guid id, SubmitPeriodClosingVoucherDto? input = null)
+    {
+        var pcv = (await _repository.WithDetailsAsync()).First(p => p.Id == id);
+
+        if (input?.StockValueDifference.HasValue == true)
+        {
+            pcv.SetStockValueDifference(input.StockValueDifference.Value);
+        }
+
+        // Validate posting period is not frozen/closed
+        await _postingOrchestrator.ValidatePostingPeriodAsync(
+            pcv.CompanyId, pcv.PostingDate, "PeriodClosingVoucher");
+
+        // Block if a future PCV already exists for this company
+        var allPcvs = await _repository.GetListAsync(p =>
+            p.CompanyId == pcv.CompanyId && p.Status == DocumentStatus.Submitted
+            && p.PostingDate > pcv.PostingDate);
+        if (allPcvs.Any())
+            throw new BusinessException("MyERP:02034")
+                .WithData("existingDate", allPcvs.First().PostingDate.ToString("dd/MM/yyyy"));
+
+        await ValidatePreviousYearClosedAsync(pcv);
+
+        // Validate closing account via dedicated domain service (type + currency checks, stock tolerance)
+        var pcvPostingService = LazyServiceProvider.LazyGetRequiredService<PeriodClosingPostingService>();
+        await pcvPostingService.ValidateForSubmitAsync(pcv, input?.StockValueDifference);
+
+        // Calculate P&L closing entries via domain service (per-account per-CC aggregation)
+        var result = await pcvPostingService.CalculateClosingEntriesAsync(
+            pcv.CompanyId, pcv.PostingDate, CurrentTenant.Id);
+
+        if (!result.Balances.Any())
+        {
+            pcv.Submit();
+            await _repository.UpdateAsync(pcv);
+            return ObjectMapper.Map<PeriodClosingVoucher, PeriodClosingVoucherDto>(pcv);
+        }
+
+        // Create reversing JE via domain service (proper per-dimension entries)
+        var je = await pcvPostingService.CreateClosingJournalEntryAsync(pcv, result);
+
+        pcv.Submit();
+        await _repository.UpdateAsync(pcv);
+
+        // Build Account Closing Balances — enables O(1) Trial Balance queries
+        var period = AccountClosingBalanceService.GetPeriodFromDate(pcv.PostingDate);
+        await _closingBalanceService.RebuildAsync(
+            pcv.CompanyId, pcv.PostingDate, period, CurrentTenant.Id);
+
+        return ObjectMapper.Map<PeriodClosingVoucher, PeriodClosingVoucherDto>(pcv);
+    }
+
+    [Authorize(MyERPPermissions.Accounts.Delete)]
+    public async Task<PeriodClosingVoucherDto> CancelAsync(Guid id)
+    {
+        var pcv = await _repository.GetAsync(id);
+
+        // Per PR b3c2ba5381: validate account frozen date on cancel (uses today since reversals post at current date)
+        await _postingOrchestrator.ValidatePostingPeriodAsync(
+            pcv.CompanyId, DateTime.UtcNow.Date, "PeriodClosingVoucher");
+
+        // Block cancel if a future PCV exists for this company
+        var futurePcvs = await _repository.GetListAsync(p =>
+            p.CompanyId == pcv.CompanyId && p.Status == DocumentStatus.Submitted
+            && p.PostingDate > pcv.PostingDate);
+        if (futurePcvs.Any())
+            throw new BusinessException("MyERP:02036")
+                .WithData("existingDate", futurePcvs.First().PostingDate.ToString("dd/MM/yyyy"));
+
+        pcv.Cancel();
+        await _repository.UpdateAsync(pcv);
+
+        // Cancel the linked Journal Entry
+        var jeRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<JournalEntry, Guid>>();
+        var linkedJe = (await jeRepo.GetListAsync(je =>
+            je.ReferenceType == "PeriodClosingVoucher" && je.ReferenceId == pcv.Id
+            && je.Status == DocumentStatus.Posted)).FirstOrDefault();
+        if (linkedJe != null)
+        {
+            linkedJe.Cancel();
+            await jeRepo.UpdateAsync(linkedJe);
+        }
+
+        // Delete closing balances for the cancelled period
+        var period = AccountClosingBalanceService.GetPeriodFromDate(pcv.PostingDate);
+        await _closingBalanceService.DeleteForPeriodAsync(pcv.CompanyId, period);
+
+        return ObjectMapper.Map<PeriodClosingVoucher, PeriodClosingVoucherDto>(pcv);
+    }
+
+    /// <summary>
+    /// Per ERPNext Period Closing Voucher validate_previous_year_closed: block closing a fiscal
+    /// year while the immediately prior one still has un-closed GL activity. Without this, a
+    /// company could close year 2 before year 1, leaving year 1's P&L never rolled into retained
+    /// earnings while year 2's opening balances are already locked in.
+    /// </summary>
+    private async Task ValidatePreviousYearClosedAsync(PeriodClosingVoucher pcv)
+    {
+        var fiscalYearRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<FiscalYear, Guid>>();
+        var currentFy = await fiscalYearRepo.GetAsync(pcv.FiscalYearId);
+
+        var fyQuery = await fiscalYearRepo.GetQueryableAsync();
+        var previousFy = fyQuery
+            .Where(f => f.CompanyId == pcv.CompanyId && f.EndDate < currentFy.StartDate)
+            .OrderByDescending(f => f.EndDate)
+            .FirstOrDefault();
+        if (previousFy == null)
+        {
+            return; // No earlier fiscal year for this company — nothing to have closed.
+        }
+
+        var pcvQuery = await _repository.GetQueryableAsync();
+        var previousYearClosed = pcvQuery.Any(p =>
+            p.CompanyId == pcv.CompanyId && p.Status == DocumentStatus.Submitted
+            && p.PostingDate >= previousFy.StartDate && p.PostingDate <= previousFy.EndDate);
+        if (previousYearClosed)
+        {
+            return;
+        }
+
+        var jeRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<JournalEntry, Guid>>();
+        var jeQuery = await jeRepo.GetQueryableAsync();
+        var hasGlActivityInPreviousYear = jeQuery.Any(je =>
+            je.CompanyId == pcv.CompanyId && je.Status == DocumentStatus.Posted
+            && je.PostingDate >= previousFy.StartDate && je.PostingDate <= previousFy.EndDate);
+
+        if (hasGlActivityInPreviousYear)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"Previous fiscal year {previousFy.Name} is not closed. Please close it first.");
+        }
+    }
+}
+

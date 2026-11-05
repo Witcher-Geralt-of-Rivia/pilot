@@ -1,0 +1,347 @@
+<abp-page [title]="isEditMode ? ('::EditItem' | abpLocalization) : ('::NewItem' | abpLocalization)">
+  <div class="card mb-4">
+    <div class="card-header">
+      <h5 class="card-title mb-0"><i class="fa fa-box me-2"></i>{{ '::Item' | abpLocalization }}</h5>
+    </div>
+    <div class="card-body">
+      <form [formGroup]="form" (ngSubmit)="save()" (appSaveShortcut)="save()">
+        <div class="row">
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::ItemCode' | abpLocalization }}</label>
+            <input type="text" class="form-control" formControlName="itemCode" [class.is-invalid]="form.get('itemCode')?.invalid && form.get('itemCode')?.touched" />
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::ItemName' | abpLocalization }}</label>
+            <input type="text" class="form-control" formControlName="itemName" [class.is-invalid]="form.get('itemName')?.invalid && form.get('itemName')?.touched" />
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::ItemType' | abpLocalization }}</label>
+            <select class="form-select" formControlName="itemType" [class.is-invalid]="form.get('itemType')?.invalid && form.get('itemType')?.touched">
+              @for (t of itemTypes; track t.value) {
+                <option [value]="t.value">{{ t.label }}</option>
+              }
+            </select>
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::ItemGroup' | abpLocalization }}</label>
+            <input type="text" class="form-control" formControlName="itemGroup" [class.is-invalid]="form.get('itemGroup')?.invalid && form.get('itemGroup')?.touched" />
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::UOM' | abpLocalization }}</label>
+            <select class="form-select" formControlName="uom">
+              <option value="Unit">Unit</option>
+              <option value="Kg">Kg</option>
+              <option value="Gram">Gram</option>
+              <option value="Litre">Litre</option>
+              <option value="ml">ml</option>
+              <option value="Metre">Metre</option>
+              <option value="cm">cm</option>
+              <option value="Box">Box</option>
+              <option value="Dozen">Dozen</option>
+              <option value="Pair">Pair</option>
+              <option value="Set">Set</option>
+              <option value="Roll">Roll</option>
+              <option value="Bag">Bag</option>
+              <option value="Pallet">Pallet</option>
+              <option value="Case">Case</option>
+              <option value="Pack">Pack</option>
+            </select>
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::Company' | abpLocalization }}</label>
+            <select class="form-select" formControlName="companyId" [class.is-invalid]="form.get('companyId')?.invalid && form.get('companyId')?.touched">
+              <option value="">{{ '::SelectCompany' | abpLocalization }}</option>
+              @for (c of companies(); track c.id) {
+                <option [value]="c.id">{{ c.name }}</option>
+              }
+            </select>
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::ValuationMethod' | abpLocalization }}</label>
+            <select class="form-select" formControlName="valuationMethod">
+              @for (v of valuationMethodOptions; track v.value) { <option [ngValue]="v.value">{{ v.key }}</option> }
+            </select>
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::SellingPrice' | abpLocalization }}</label>
+            <input type="number" class="form-control" formControlName="standardSellingPrice" [class.is-invalid]="form.get('standardSellingPrice')?.invalid && form.get('standardSellingPrice')?.touched" />
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::BuyingPrice' | abpLocalization }}</label>
+            <input type="number" class="form-control" formControlName="standardBuyingPrice" [class.is-invalid]="form.get('standardBuyingPrice')?.invalid && form.get('standardBuyingPrice')?.touched" />
+          </div>
+          <div class="col-12 mb-3">
+            <label class="form-label">{{ '::Description' | abpLocalization }}</label>
+            <textarea class="form-control" formControlName="description" [class.is-invalid]="form.get('description')?.invalid && form.get('description')?.touched" rows="3"></textarea>
+          </div>
+          <div class="col-12 mb-3">
+            <div class="d-flex gap-3">
+              <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" formControlName="maintainStock" id="maintainStock" />
+                <label class="form-check-label" for="maintainStock">{{ '::MaintainStock' | abpLocalization }}</label>
+              </div>
+              <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" formControlName="isActive" id="isActive" />
+                <label class="form-check-label" for="isActive">{{ '::Active' | abpLocalization }}</label>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Reorder Settings -->
+        <div class="card mt-3">
+          <div class="card-header py-2">
+            <h6 class="card-title mb-0"><i class="fa fa-arrows-rotate me-2"></i>{{ '::ReorderSettings' | abpLocalization }}</h6>
+          </div>
+          <div class="card-body">
+            <div class="row">
+              <div class="col-12 col-md-4 mb-3">
+                <label class="form-label">{{ '::ReorderLevel' | abpLocalization }}</label>
+                <input type="number" class="form-control" formControlName="reorderLevel" min="0" step="1" />
+                <small class="form-text text-muted">{{ '::ReorderLevelHelp' | abpLocalization }}</small>
+              </div>
+              <div class="col-12 col-md-4 mb-3">
+                <label class="form-label">{{ '::ReorderQty' | abpLocalization }}</label>
+                <input type="number" class="form-control" formControlName="reorderQty" min="0" step="1" />
+              </div>
+              <div class="col-12 col-md-4 mb-3">
+                <label class="form-label">{{ '::SafetyStock' | abpLocalization }}</label>
+                <input type="number" class="form-control" formControlName="safetyStock" min="0" step="1" />
+              </div>
+              <div class="col-12 col-md-4 mb-3">
+                <label class="form-label">{{ '::MinOrderQty' | abpLocalization }}</label>
+                <input type="number" class="form-control" formControlName="minOrderQty" min="0" step="1" />
+                <small class="form-text text-muted">{{ '::MinOrderQtyHelp' | abpLocalization }}</small>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Barcodes -->
+        <div class="card border mb-3">
+          <div class="card-header py-2 d-flex justify-content-between align-items-center">
+            <h6 class="card-title mb-0"><i class="fa fa-barcode me-2"></i>{{ '::Barcodes' | abpLocalization }}</h6>
+            <button type="button" class="btn btn-sm btn-outline-primary" (click)="addBarcode()">
+              <i class="fa fa-plus me-1"></i>{{ '::AddBarcode' | abpLocalization }}
+            </button>
+          </div>
+          <div class="card-body" formArrayName="barcodes">
+            @if (barcodesArray.length === 0) {
+              <p class="text-muted small mb-0">{{ '::NoBarcodesYet' | abpLocalization }}</p>
+            }
+            @for (row of barcodesArray.controls; track $index) {
+              <div class="row align-items-center mb-2" [formGroupName]="$index">
+                <div class="col-5">
+                  <input type="text" class="form-control form-control-sm" formControlName="barcode" [placeholder]="'::Barcode' | abpLocalization" />
+                </div>
+                <div class="col-4">
+                  <select class="form-select form-select-sm" formControlName="barcodeType">
+                    @for (o of barcodeTypeOptions; track o.value) { <option [ngValue]="o.value">{{ o.key }}</option> }
+                  </select>
+                </div>
+                <div class="col-2">
+                  <div class="form-check">
+                    <input class="form-check-input" type="checkbox" formControlName="isDefault" [id]="'barcodeDefault' + $index" />
+                    <label class="form-check-label small" [for]="'barcodeDefault' + $index">{{ '::Default' | abpLocalization }}</label>
+                  </div>
+                </div>
+                <div class="col-1">
+                  <button type="button" class="btn btn-sm btn-outline-danger" (click)="removeBarcode($index)">
+                    <i class="fa fa-trash"></i>
+                  </button>
+                </div>
+              </div>
+            }
+          </div>
+        </div>
+
+        <!-- Preferred Suppliers -->
+        <div class="card border mb-3">
+          <div class="card-header py-2 d-flex justify-content-between align-items-center">
+            <h6 class="card-title mb-0"><i class="fa fa-truck me-2"></i>{{ '::Suppliers' | abpLocalization }}</h6>
+            <button type="button" class="btn btn-sm btn-outline-primary" (click)="addSupplier()">
+              <i class="fa fa-plus me-1"></i>{{ '::AddSupplier' | abpLocalization }}
+            </button>
+          </div>
+          <div class="card-body" formArrayName="suppliers">
+            @if (suppliersArray.length === 0) {
+              <p class="text-muted small mb-0">{{ '::NoSuppliersYet' | abpLocalization }}</p>
+            }
+            @for (row of suppliersArray.controls; track $index) {
+              <div class="row align-items-center mb-2" [formGroupName]="$index">
+                <div class="col-6">
+                  <select class="form-select form-select-sm" formControlName="supplierId">
+                    <option value="" disabled>{{ '::SelectSupplier' | abpLocalization }}</option>
+                    @for (s of suppliers(); track s.id) { <option [ngValue]="s.id">{{ s.name }}</option> }
+                  </select>
+                </div>
+                <div class="col-5">
+                  <input type="text" class="form-control form-control-sm" formControlName="supplierPartNo" [placeholder]="'::SupplierPartNo' | abpLocalization" />
+                </div>
+                <div class="col-1">
+                  <button type="button" class="btn btn-sm btn-outline-danger" (click)="removeSupplier($index)">
+                    <i class="fa fa-trash"></i>
+                  </button>
+                </div>
+              </div>
+            }
+          </div>
+        </div>
+
+        <!-- Customer Item Codes -->
+        <div class="card border mb-3">
+          <div class="card-header py-2 d-flex justify-content-between align-items-center">
+            <h6 class="card-title mb-0"><i class="fa fa-address-card me-2"></i>{{ '::CustomerItemCodes' | abpLocalization }}</h6>
+            <button type="button" class="btn btn-sm btn-outline-primary" (click)="addCustomerDetail()">
+              <i class="fa fa-plus me-1"></i>{{ '::AddCustomerItemCode' | abpLocalization }}
+            </button>
+          </div>
+          <div class="card-body" formArrayName="customerDetails">
+            @if (customerDetailsArray.length === 0) {
+              <p class="text-muted small mb-0">{{ '::NoCustomerItemCodesYet' | abpLocalization }}</p>
+            }
+            @for (row of customerDetailsArray.controls; track $index) {
+              <div class="row align-items-center mb-2" [formGroupName]="$index">
+                <div class="col-6">
+                  <select class="form-select form-select-sm" formControlName="customerId">
+                    <option value="" disabled>{{ '::SelectCustomer' | abpLocalization }}</option>
+                    @for (c of customers(); track c.id) { <option [ngValue]="c.id">{{ c.name }}</option> }
+                  </select>
+                </div>
+                <div class="col-5">
+                  <input type="text" class="form-control form-control-sm" formControlName="refCode" [placeholder]="'::CustomerRefCode' | abpLocalization" />
+                </div>
+                <div class="col-1">
+                  <button type="button" class="btn btn-sm btn-outline-danger" (click)="removeCustomerDetail($index)">
+                    <i class="fa fa-trash"></i>
+                  </button>
+                </div>
+              </div>
+            }
+          </div>
+        </div>
+
+        <!-- Per-Warehouse Reorder Overrides -->
+        <div class="card border mb-3">
+          <div class="card-header py-2 d-flex justify-content-between align-items-center">
+            <h6 class="card-title mb-0"><i class="fa fa-warehouse me-2"></i>{{ '::WarehouseReorders' | abpLocalization }}</h6>
+            <button type="button" class="btn btn-sm btn-outline-primary" (click)="addReorder()">
+              <i class="fa fa-plus me-1"></i>{{ '::AddWarehouseReorder' | abpLocalization }}
+            </button>
+          </div>
+          <div class="card-body" formArrayName="reorders">
+            @if (reordersArray.length === 0) {
+              <p class="text-muted small mb-0">{{ '::NoWarehouseReordersYet' | abpLocalization }}</p>
+            }
+            @for (row of reordersArray.controls; track $index) {
+              <div class="row align-items-center mb-2" [formGroupName]="$index">
+                <div class="col-3">
+                  <select class="form-select form-select-sm" formControlName="warehouseId">
+                    <option value="" disabled>{{ '::SelectWarehouse' | abpLocalization }}</option>
+                    @for (w of warehouses(); track w.id) { <option [ngValue]="w.id">{{ w.name }}</option> }
+                  </select>
+                </div>
+                <div class="col-3">
+                  <select class="form-select form-select-sm" formControlName="warehouseGroupId">
+                    <option value="">{{ '::CheckAvailabilityInWarehouse' | abpLocalization }}</option>
+                    @for (w of warehouses(); track w.id) { <option [ngValue]="w.id">{{ w.name }}</option> }
+                  </select>
+                </div>
+                <div class="col-2">
+                  <input type="number" class="form-control form-control-sm" formControlName="warehouseReorderLevel" [placeholder]="'::ReorderLevel' | abpLocalization" />
+                </div>
+                <div class="col-2">
+                  <input type="number" class="form-control form-control-sm" formControlName="warehouseReorderQty" [placeholder]="'::ReorderQty' | abpLocalization" />
+                </div>
+                <div class="col-1">
+                  <select class="form-select form-select-sm" formControlName="materialRequestType">
+                    @for (o of materialRequestTypeOptions; track o.value) { <option [ngValue]="o.value">{{ o.key }}</option> }
+                  </select>
+                </div>
+                <div class="col-1">
+                  <button type="button" class="btn btn-sm btn-outline-danger" (click)="removeReorder($index)">
+                    <i class="fa fa-trash"></i>
+                  </button>
+                </div>
+              </div>
+            }
+          </div>
+        </div>
+
+        <!-- Quality Inspection Settings -->
+        <div class="card border mb-3">
+          <div class="card-header py-2">
+            <h6 class="card-title mb-0"><i class="fa fa-clipboard-check me-2"></i>{{ '::QualityInspection' | abpLocalization }}</h6>
+          </div>
+          <div class="card-body">
+            <div class="row">
+              <div class="col-12 col-md-6 mb-3">
+                <div class="form-check">
+                  <input type="checkbox" class="form-check-input" formControlName="inspectionRequiredBeforePurchase" id="qiPurchase" />
+                  <label class="form-check-label" for="qiPurchase">{{ '::InspectionRequiredBeforePurchase' | abpLocalization }}</label>
+                </div>
+                <small class="form-text text-muted">{{ '::InspectionRequiredBeforePurchaseHelp' | abpLocalization }}</small>
+              </div>
+              <div class="col-12 col-md-6 mb-3">
+                <div class="form-check">
+                  <input type="checkbox" class="form-check-input" formControlName="inspectionRequiredBeforeDelivery" id="qiDelivery" />
+                  <label class="form-check-label" for="qiDelivery">{{ '::InspectionRequiredBeforeDelivery' | abpLocalization }}</label>
+                </div>
+                <small class="form-text text-muted">{{ '::InspectionRequiredBeforeDeliveryHelp' | abpLocalization }}</small>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Stock Levels (edit mode only) -->
+        @if (isEditMode && stockLevels().length > 0) {
+          <div class="card border mb-3">
+            <div class="card-header py-2">
+              <h6 class="card-title mb-0"><i class="fa fa-warehouse me-2"></i>{{ '::StockLevels' | abpLocalization }}</h6>
+            </div>
+            <div class="card-body">
+              <table class="table table-sm">
+                <thead>
+                  <tr>
+                    <th>{{ '::Warehouse' | abpLocalization }}</th>
+                    <th class="text-end">{{ '::ActualQty' | abpLocalization }}</th>
+                    <th class="text-end">{{ '::ReservedQty' | abpLocalization }}</th>
+                    <th class="text-end">{{ '::OrderedQty' | abpLocalization }}</th>
+                    <th class="text-end">{{ '::ProjectedQty' | abpLocalization }}</th>
+                    <th class="text-end">{{ '::ValuationRate' | abpLocalization }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  @for (bin of stockLevels(); track bin.id) {
+                    <tr>
+                      <td>{{ bin.warehouseName || '—' }}</td>
+                      <td class="text-end font-monospace">{{ bin.actualQty | number:'1.2-2' }}</td>
+                      <td class="text-end font-monospace">{{ bin.reservedQty | number:'1.2-2' }}</td>
+                      <td class="text-end font-monospace">{{ bin.orderedQty | number:'1.2-2' }}</td>
+                      <td class="text-end font-monospace" [class.text-danger]="bin.projectedQty < 0" [class.text-success]="bin.projectedQty > 0">
+                        {{ bin.projectedQty | number:'1.2-2' }}
+                      </td>
+                      <td class="text-end font-monospace">{{ bin.valuationRate | number:'1.2-2' }}</td>
+                    </tr>
+                  }
+                </tbody>
+              </table>
+            </div>
+          </div>
+        }
+
+        @if (isEditMode && entityId) {
+          <app-company-restriction parentType="Item" [parentId]="entityId" />
+        }
+
+        <div class="d-flex justify-content-end gap-2 pt-3">
+          <button type="button" class="btn btn-outline-secondary" routerLink="/inventory/items"><i class="fa fa-times me-1"></i>{{ '::Cancel' | abpLocalization }}
+          </button>
+          <button type="submit" class="btn btn-primary">
+            <i class="fa fa-save me-1"></i> {{ '::Save' | abpLocalization }}
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+</abp-page>

@@ -1,0 +1,308 @@
+import { useEffect, useState } from 'react';
+import { Link, useSearchParams } from 'react-router-dom';
+import { Plus, RefreshCw } from 'lucide-react';
+import { useAuth } from '../auth/AuthContext';
+import { PermissionDeniedCard, ReadOnlyModuleBanner, useTenantContext } from '../components/Gating';
+import { HeaderButton, PageHeader } from '../components/PageHeader';
+import { currencySymbol } from '../lib/currency';
+import {
+  journalVoucherTypeLabel,
+  PRIOR_PERIOD_ADJUSTMENT,
+  SELECTABLE_JOURNAL_VOUCHER_TYPES,
+} from '../lib/journalVoucherTypes';
+import { withConfirmReconciledPeriod } from '../lib/reconciledPeriod';
+import { useReconciledPeriodConfirm } from '../lib/useReconciledPeriodConfirm';
+import { getDateRange } from './Reports';
+
+interface JournalLine { id: number; accountId: number; drCr: number; amount: number; memo: string | null }
+export interface JournalEntry {
+  id: number;
+  journalDate: string;
+  voucherType: number;
+  adjustsFiscalYearId?: number | null;
+  adjustsFiscalYearCode?: string | null;
+  referenceNo: string | null;
+  memo: string | null;
+  posted: boolean | null;
+  journalEntryLines: JournalLine[];
+}
+interface JournalAccount { id: number; accountCode: string; accountName: string; canPost: boolean; archived?: boolean; childAccounts: JournalAccount[] }
+interface ClosedFiscalYear { id: number; fiscalYearCode: string; status: number | string }
+type Fetcher = (url: string, init?: RequestInit) => Promise<Response>;
+
+export function journalTotals(entry: JournalEntry) {
+  const sum = (side: number) => entry.journalEntryLines.filter(line => line.drCr === side)
+    .reduce((total, line) => total + Math.round((line.amount + Number.EPSILON) * 100), 0);
+  return { debit: sum(1), credit: sum(2) };
+}
+export function canPostJournal(entry: JournalEntry) {
+  const totals = journalTotals(entry);
+  return !entry.posted && entry.journalEntryLines.length >= 2 && totals.debit > 0 && totals.debit === totals.credit
+    && entry.journalEntryLines.every(line => line.accountId > 0 && Number.isFinite(line.amount) && line.amount > 0 && [1, 2].includes(line.drCr));
+}
+const JOURNAL_POST_OPERATION_KEY = 'financials.journal.post';
+const APPROVAL_REQUEST_HEADER = 'X-Approval-Request-Id';
+const APPROVER_USER_HEADER = 'X-Approved-By-User-Id';
+const ACCESS_APPROVALS_PATH = '/api/organizations/current/members/access-approvals';
+
+/** Headers that carry an independent reviewer's recorded approval when posting a journal. */
+export function journalApprovalHeaders(approvalRequestId: string, approverUserId: string): Record<string, string> {
+  const requestId = approvalRequestId.trim();
+  const approverId = approverUserId.trim();
+  return requestId && approverId ? { [APPROVAL_REQUEST_HEADER]: requestId, [APPROVER_USER_HEADER]: approverId } : {};
+}
+
+async function problemText(response: Response): Promise<string> {
+  const text = await response.text();
+  try {
+    const problem: { detail?: string; title?: string } = JSON.parse(text);
+    return problem.detail || problem.title || text;
+  } catch {
+    return text;
+  }
+}
+
+async function read<T>(fetcher: Fetcher, path: string, init?: RequestInit): Promise<T> {
+  const response = await fetcher(path, init);
+  if (!response.ok) throw new Error(`Journal request failed (HTTP ${response.status}): ${await response.text()}`);
+  return response.json();
+}
+const inputClass = 'w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-surface)] px-3 py-2 text-sm text-[var(--text-main)] focus:ring-2 focus:ring-[var(--brand-ring)]';
+
+const PPA_HELP =
+  'For a material error in a closed year whose statements were already filed. Post the correction against account 30820 and the balance-sheet accounts. Immaterial corrections go through this year\'s accounts as a normal entry. Unfiled closed years can be reopened under Year-end instead.';
+
+export function JournalEditor({ initial, accounts, closedYears, canCreate, canPost, fetcher, onSaved, currency, independentReview = false, canReview = false }: {
+  initial: JournalEntry; accounts: JournalAccount[]; closedYears: ClosedFiscalYear[];
+  canCreate: boolean; canPost: boolean;
+  fetcher: Fetcher; onSaved: (id: number) => void; currency: string | undefined;
+  independentReview?: boolean; canReview?: boolean;
+}) {
+  const [entry, setEntry] = useState(initial);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [dirty, setDirty] = useState(false);
+  const [approvalRequestId, setApprovalRequestId] = useState('');
+  const [approverUserId, setApproverUserId] = useState('');
+  const [reviewNotice, setReviewNotice] = useState('');
+  const editable = canCreate && !entry.posted && !busy;
+  const totals = journalTotals(entry);
+  const isPpa = entry.voucherType === PRIOR_PERIOD_ADJUSTMENT;
+  const update = (next: JournalEntry) => { setEntry(next); setDirty(true); setError(''); };
+  const updateLine = (index: number, values: Partial<JournalLine>) =>
+    update({ ...entry, journalEntryLines: entry.journalEntryLines.map((line, i) => i === index ? { ...line, ...values } : line) });
+  const periodConfirm = useReconciledPeriodConfirm();
+  const voucherOptions = SELECTABLE_JOURNAL_VOUCHER_TYPES.slice();
+  // Keep displaying Closing entries (2) for existing system journals even though it is not selectable.
+  if (entry.voucherType === 2 && !voucherOptions.some(o => o.value === 2)) {
+    voucherOptions.unshift({ value: 2, label: journalVoucherTypeLabel(2) });
+  }
+  const submit = async (post: boolean, confirmReconciledPeriod = false) => {
+    setBusy(true); setError('');
+    try {
+      const path = post
+        ? withConfirmReconciledPeriod('/api/Financials/PostJournalEntry', confirmReconciledPeriod)
+        : '/api/Financials/SaveJournalEntry';
+      const payload = {
+        ...entry,
+        adjustsFiscalYearId: isPpa ? entry.adjustsFiscalYearId : null,
+      };
+      const approvalHeaders = post && independentReview ? journalApprovalHeaders(approvalRequestId, approverUserId) : {};
+      const response = await fetcher(path, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', ...approvalHeaders }, body: JSON.stringify(payload),
+      });
+      if (post && await periodConfirm.handleConflict(response, () => void submit(true, true))) {
+        setBusy(false);
+        return;
+      }
+      if (!response.ok) throw new Error(`Journal request failed (HTTP ${response.status}): ${await problemText(response)}`);
+      const result: { id: number } = await response.json();
+      onSaved(post ? entry.id : result.id);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : 'Unable to save journal.');
+      setBusy(false);
+    }
+  };
+  const recordReview = async () => {
+    setBusy(true); setError(''); setReviewNotice('');
+    try {
+      const response = await fetcher(ACCESS_APPROVALS_PATH, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ operationKey: JOURNAL_POST_OPERATION_KEY, resourceId: String(entry.id) }),
+      });
+      if (!response.ok) throw new Error(await problemText(response));
+      const approval: { approvalRequestId: string; approverUserId: string } = await response.json();
+      setReviewNotice(`Approval recorded. Give the preparer approval request ID ${approval.approvalRequestId} and approver user ID ${approval.approverUserId}. It is valid for a limited time.`);
+    } catch (reviewError) {
+      setError(reviewError instanceof Error ? reviewError.message : 'Unable to record the review.');
+    } finally {
+      setBusy(false);
+    }
+  };
+  const showReviewPanel = independentReview && !entry.posted && !!entry.id && !dirty && (canPost || canReview);
+  const money = (cents: number) => `${currencySymbol(currency)}${(cents / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  return <>
+  <section aria-label="Journal entry" className="space-y-4 rounded-2xl bg-[var(--bg-surface)] p-5">
+    <h2 className="text-lg font-semibold">{entry.id ? `Journal #${entry.id}` : 'New Journal Entry'} - {entry.posted ? 'Posted (read-only)' : 'Draft'}</h2>
+    <form className="space-y-4" onSubmit={event => { event.preventDefault(); void submit(false); }}>
+      <fieldset disabled={!editable} className="grid gap-4 sm:grid-cols-2">
+        <label className="grid gap-1 text-sm">Journal date<input type="date" required className={inputClass} value={entry.journalDate.slice(0, 10)}
+          onChange={event => update({ ...entry, journalDate: event.target.value })} /></label>
+        <label className="grid gap-1 text-sm">Voucher type<select className={inputClass} value={entry.voucherType}
+          onChange={event => {
+            const voucherType = Number(event.target.value);
+            update({
+              ...entry,
+              voucherType,
+              adjustsFiscalYearId: voucherType === PRIOR_PERIOD_ADJUSTMENT ? entry.adjustsFiscalYearId : null,
+            });
+          }}>
+          {voucherOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+        </select></label>
+        <label className="grid gap-1 text-sm">Reference<input className={inputClass} value={entry.referenceNo || ''} onChange={event => update({ ...entry, referenceNo: event.target.value })} /></label>
+        <label className="grid gap-1 text-sm">Memo<input className={inputClass} value={entry.memo || ''} onChange={event => update({ ...entry, memo: event.target.value })} required={isPpa} /></label>
+        {isPpa && <>
+          <label className="grid gap-1 text-sm sm:col-span-2">Corrects fiscal year
+            <select
+              className={inputClass}
+              required
+              disabled={!editable || closedYears.length === 0}
+              value={entry.adjustsFiscalYearId ?? ''}
+              onChange={event => update({ ...entry, adjustsFiscalYearId: Number(event.target.value) || null })}>
+              <option value="">{closedYears.length === 0 ? 'No closed years yet' : 'Select closed year'}</option>
+              {closedYears.map(year => <option key={year.id} value={year.id}>{year.fiscalYearCode}</option>)}
+            </select>
+          </label>
+          {closedYears.length === 0
+            ? <p className="text-sm text-[var(--text-secondary)] sm:col-span-2">Close a fiscal year under Year-end before posting a prior-period adjustment.</p>
+            : <p className="text-sm text-[var(--text-secondary)] sm:col-span-2">{PPA_HELP}</p>}
+        </>}
+      </fieldset>
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <caption className="sr-only">Manual journal debit and credit lines</caption>
+          <thead><tr>{['Account', 'Side', 'Amount', 'Line memo', 'Actions'].map(label => <th scope="col" className="p-2 text-left" key={label}>{label}</th>)}</tr></thead>
+          <tbody>{entry.journalEntryLines.map((line, index) => <tr key={index}>
+            <td className="min-w-56 p-2"><select aria-label={`Account line ${index + 1}`} required disabled={!editable} className={inputClass} value={line.accountId || ''}
+              onChange={event => updateLine(index, { accountId: Number(event.target.value) })}>
+              <option value="">Select account</option>{accounts.filter(a => (a.canPost || a.id === line.accountId) && (!a.archived || a.id === line.accountId)).map(account =>
+                <option key={account.id} value={account.id}>{account.accountCode} - {account.accountName}</option>)}
+            </select></td>
+            <td className="p-2"><select aria-label={`Side line ${index + 1}`} disabled={!editable} className={inputClass} value={line.drCr} onChange={event => updateLine(index, { drCr: Number(event.target.value) })}>
+              <option value={1}>Debit</option><option value={2}>Credit</option></select></td>
+            <td className="min-w-32 p-2"><input aria-label={`Amount line ${index + 1}`} type="number" min="0.01" step="0.01" required disabled={!editable}
+              className={inputClass} value={line.amount || ''} onChange={event => updateLine(index, { amount: Number(event.target.value) })} /></td>
+            <td className="min-w-40 p-2"><input aria-label={`Memo line ${index + 1}`} disabled={!editable} className={inputClass} value={line.memo || ''} onChange={event => updateLine(index, { memo: event.target.value })} /></td>
+            <td className="p-2">{editable && <button type="button" disabled={entry.journalEntryLines.length <= 2} className="rounded p-2 underline disabled:opacity-50"
+              aria-label={`Remove line ${index + 1}`} onClick={() => update({ ...entry, journalEntryLines: entry.journalEntryLines.filter((_, i) => i !== index) })}>Remove</button>}</td>
+          </tr>)}</tbody>
+        </table>
+      </div>
+      {editable && <HeaderButton label="Add line" icon={Plus} onClick={() => update({ ...entry, journalEntryLines: [...entry.journalEntryLines, { id: 0, accountId: 0, drCr: 1, amount: 0, memo: '' }] })} />}
+      <p role="status" className={totals.debit === totals.credit ? 'text-emerald-600' : 'text-red-500'}>
+        Debit {money(totals.debit)} / Credit {money(totals.credit)} - {totals.debit === totals.credit ? 'In balance' : 'Out of balance'}
+      </p>
+      {error && <p role="alert" className="text-red-500">{error}</p>}
+      {!entry.posted && <div className="flex flex-wrap gap-3">
+        {canCreate && <button type="submit" disabled={!editable} className="rounded-lg bg-[var(--brand-primary)] px-4 py-2 font-semibold text-[var(--brand-text)] disabled:opacity-50">{busy ? 'Saving...' : 'Save draft'}</button>}
+        {canPost && <HeaderButton label="Post journal" disabled={busy || !entry.id || dirty || !canPostJournal(entry)} onClick={() => void submit(true)} />}
+      </div>}
+      {!entry.posted && canPost && (!entry.id || dirty) && <p className="text-sm text-[var(--text-secondary)]">Save the draft before posting.</p>}
+      {showReviewPanel && <fieldset className="space-y-3 rounded-lg border border-[var(--border-subtle)] p-4">
+        <legend className="px-1 text-sm font-semibold">Independent review required</legend>
+        <p className="text-sm text-[var(--text-secondary)]">A different Owner or Admin who can post journals must approve this entry before it can be posted. You cannot approve a journal you prepared.</p>
+        {canReview && <div className="space-y-2">
+          <HeaderButton label="Record my review approval" disabled={busy} onClick={() => void recordReview()} />
+          {reviewNotice && <p role="status" className="text-sm text-emerald-600">{reviewNotice}</p>}
+        </div>}
+        {canPost && <div className="grid gap-3 sm:grid-cols-2">
+          <label className="text-sm">Approval request ID
+            <input className="mt-1 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-base)] p-2" value={approvalRequestId} onChange={e => setApprovalRequestId(e.target.value)} />
+          </label>
+          <label className="text-sm">Approver user ID
+            <input className="mt-1 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-base)] p-2" value={approverUserId} onChange={e => setApproverUserId(e.target.value)} />
+          </label>
+        </div>}
+      </fieldset>}
+    </form>
+  </section>
+  {periodConfirm.dialog}
+  </>;
+}
+
+export default function JournalEntries() {
+  const { currentOrg, hasPermission, canWrite } = useTenantContext();
+  const { authFetch } = useAuth();
+  const [params, setParams] = useSearchParams();
+  const [status, setStatus] = useState('draft');
+  const [revision, setRevision] = useState(0);
+  const [result, setResult] = useState<{ key: string; entries: JournalEntry[]; accounts: JournalAccount[]; closedYears: ClosedFiscalYear[] } | null>(null);
+  const [failure, setFailure] = useState<{ key: string; message: string } | null>(null);
+  const allowed = hasPermission('financials.journal.view');
+  const financialsWritable = canWrite('financials');
+  // Journals are not a metered create resource; gate on canWrite(financials) ∧ permission.
+  const canCreate = hasPermission('financials.journal.create') && financialsWritable;
+  const canPost = hasPermission('financials.journal.post') && financialsWritable;
+  const key = JSON.stringify([currentOrg.slug, revision]);
+  const data = result?.key === key ? result : null;
+  const error = failure?.key === key ? failure.message : null;
+  useEffect(() => {
+    if (!allowed) return;
+    let cancelled = false;
+    Promise.all([
+      read<JournalEntry[]>(authFetch, '/api/Financials/JournalEntries'),
+      read<JournalAccount[]>(authFetch, '/api/Financials/Accounts'),
+      read<ClosedFiscalYear[]>(authFetch, '/api/Financials/YearEnd').catch(() => [] as ClosedFiscalYear[]),
+    ]).then(([entries, accounts, years]) => {
+      if (!Array.isArray(entries) || !Array.isArray(accounts)) throw new Error('The journals API returned an invalid response.');
+      const closedYears = (Array.isArray(years) ? years : []).filter(y => y.status === 3 || y.status === 'Closed');
+      if (!cancelled) setResult({ key, entries, accounts, closedYears });
+    }).catch(error => {
+      if (!cancelled) setFailure({ key, message: error instanceof Error ? error.message : 'Unable to load manual journals.' });
+    });
+    return () => { cancelled = true; };
+  }, [allowed, authFetch, key]);
+  if (!allowed) return <PermissionDeniedCard permission="financials.journal.view" />;
+  const isNew = params.has('new');
+  const selected = data?.entries.find(entry => String(entry.id) === params.get('id'));
+  const initial: JournalEntry | undefined = isNew ? {
+    id: 0, journalDate: getDateRange('all', new Date()).to, memo: '', referenceNo: '', voucherType: 6,
+    adjustsFiscalYearId: null, posted: false,
+    journalEntryLines: [1, 2].map(drCr => ({ id: 0, accountId: 0, drCr, amount: 0, memo: '' })),
+  } : selected;
+  const flatten = (accounts: JournalAccount[]): JournalAccount[] => accounts.flatMap(account => [account, ...flatten(account.childAccounts || [])]);
+  return <div className="space-y-6 text-[var(--text-main)]">
+    <ReadOnlyModuleBanner module="financials" orgSlug={currentOrg.slug} />
+    <PageHeader title="Manual Journal Entries" subtitle="Draft vouchers are separate from the posted General Ledger"
+      back={{ to: `/org/${currentOrg.slug}/financials`, label: 'General Ledger' }} actions={<>
+        <HeaderButton label="Refresh" icon={RefreshCw} disabled={!data && !error} onClick={() => setRevision(r => r + 1)} />
+        {canCreate && <HeaderButton label="New Journal Entry" icon={Plus} variant="primary" onClick={() => setParams({ new: '1' })} />}
+      </>} />
+    {error ? <p role="alert" className="text-red-500">{error} Use Refresh to retry.</p>
+      : !data ? <p role="status">Loading manual journals...</p>
+      : <>
+        {isNew && !canCreate ? <PermissionDeniedCard permission="financials.journal.create" />
+          : initial ? <JournalEditor key={`${key}-${isNew ? 'new' : initial.id}`} initial={initial} accounts={flatten(data.accounts)}
+            closedYears={data.closedYears} canCreate={canCreate} canPost={canPost}
+            independentReview={currentOrg.operatingPolicy?.journalWorkflow !== 'SingleActorAllowed'}
+            canReview={canPost && (currentOrg.role === 'Owner' || currentOrg.role === 'Admin')}
+            fetcher={authFetch} currency={currentOrg.currency} onSaved={id => { setParams({ id: String(id) }); setRevision(r => r + 1); }} />
+            : params.has('id') && <p role="alert">Journal entry not found in this workspace.</p>}
+        <nav aria-label="Manual journal status" className="flex gap-3">{['draft', 'posted'].map(value =>
+          <button type="button" key={value} aria-pressed={status === value} className="rounded-lg border border-[var(--border-subtle)] px-4 py-2" onClick={() => setStatus(value)}>{value === 'draft' ? 'Drafts' : 'Posted manual journals'}</button>)}</nav>
+        <div className="overflow-x-auto rounded-2xl bg-[var(--bg-surface)]">
+          <table className="w-full text-sm"><caption className="sr-only">{status === 'draft' ? 'Draft journals (not in posted books)' : 'Posted manual journals'}</caption>
+            <thead><tr>{['Journal', 'Date', 'Type', 'Corrected year', 'Reference', 'Memo', 'Status'].map(label => <th scope="col" key={label} className="p-4 text-left">{label}</th>)}</tr></thead>
+            <tbody>{data.entries.filter(entry => !!entry.posted === (status === 'posted')).map(entry => <tr key={entry.id} className="border-t border-[var(--border-subtle)]">
+              <th scope="row" className="p-4 text-left"><Link className="underline" to={`?id=${entry.id}`}>Open #{entry.id}</Link></th>
+              <td className="p-4">{entry.journalDate.slice(0, 10)}</td>
+              <td className="p-4">{journalVoucherTypeLabel(entry.voucherType)}</td>
+              <td className="p-4">{entry.adjustsFiscalYearCode || '—'}</td>
+              <td className="p-4">{entry.referenceNo}</td><td className="p-4">{entry.memo}</td><td className="p-4">{entry.posted ? 'Posted' : 'Draft'}</td>
+            </tr>)}</tbody>
+          </table>
+          {!data.entries.some(entry => !!entry.posted === (status === 'posted')) && <p role="status" className="p-4">No {status} manual journals.</p>}
+        </div>
+      </>}
+  </div>;
+}

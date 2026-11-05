@@ -1,0 +1,127 @@
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using Volo.Abp.Application.Dtos;
+
+namespace MyERP.Purchasing;
+
+public class PurchaseReceiptDto : EntityDto<Guid>
+{
+    public Guid CompanyId { get; set; }
+    public string ReceiptNumber { get; set; } = null!;
+    public DateTime PostingDate { get; set; }
+    public Guid SupplierId { get; set; }
+    public string? SupplierName { get; set; }
+    public Guid? PurchaseOrderId { get; set; }
+    public Guid WarehouseId { get; set; }
+    public string? WarehouseName { get; set; }
+    public string? SupplierDeliveryNote { get; set; }
+    public string CurrencyCode { get; set; } = null!;
+    public decimal ExchangeRate { get; set; } = 1m;
+    public bool UseTransactionDateExchangeRate { get; set; }
+    public decimal NetTotal { get; set; }
+    public decimal TaxAmount { get; set; }
+    public decimal GrandTotal { get; set; }
+    public bool IsReturn { get; set; }
+    public Guid? ReturnAgainstId { get; set; }
+    public string Status { get; set; } = null!;
+    /// <summary>Billing completion %. 0 = not billed, 100 = fully billed.</summary>
+    public decimal PerBilled { get; set; }
+    public string? BillingStatus { get; set; }
+    public List<PurchaseReceiptItemDto> Items { get; set; } = new();
+}
+
+public class PurchaseReceiptItemDto
+{
+    public Guid Id { get; set; }
+    public Guid ItemId { get; set; }
+    public string? ItemName { get; set; }
+    public string Description { get; set; } = null!;
+    public string Uom { get; set; } = null!;
+    public decimal Quantity { get; set; }
+    public decimal ReceivedQty { get; set; }
+    public decimal RejectedQty { get; set; }
+    public Guid? RejectedWarehouseId { get; set; }
+    public string? RejectedWarehouseName { get; set; }
+    public bool ReturnQtyFromRejectedWarehouse { get; set; }
+    public decimal StockQty { get; set; }
+    public string StockUom { get; set; } = "Unit";
+    public decimal ConversionFactor { get; set; } = 1m;
+    public decimal PendingBillingQty { get; set; }
+    public decimal UnitPrice { get; set; }
+    public decimal TaxAmount { get; set; }
+    public decimal LineTotal { get; set; }
+    public decimal BilledQty { get; set; }
+    public decimal AmountDifferenceWithPurchaseInvoice { get; set; }
+    public bool IsClosed { get; set; }
+    public Guid? PurchaseOrderItemId { get; set; }
+    public Guid? MaterialRequestItemId { get; set; }
+
+    /// <summary>Item-level target warehouse override; null means the receipt's own warehouse.</summary>
+    public Guid? WarehouseId { get; set; }
+
+    /// <summary>Source/in-transit warehouse for internal transfers (PR #59251).</summary>
+    public Guid? FromWarehouseId { get; set; }
+    public string? FromWarehouseName { get; set; }
+}
+
+public class CreatePurchaseReceiptDto
+{
+    [Required] public Guid CompanyId { get; set; }
+    [Required] public Guid SupplierId { get; set; }
+    [Required] public Guid WarehouseId { get; set; }
+    [Required] public DateTime PostingDate { get; set; }
+    public Guid? PurchaseOrderId { get; set; }
+    [StringLength(100)] public string? SupplierDeliveryNote { get; set; }
+    public bool IsReturn { get; set; }
+    public Guid? ReturnAgainstId { get; set; }
+    public string? Notes { get; set; }
+    [StringLength(3)] public string CurrencyCode { get; set; } = "MYR";
+    public decimal ExchangeRate { get; set; } = 1m;
+    public bool UseTransactionDateExchangeRate { get; set; }
+    [Required][MinLength(1)] public List<CreatePurchaseReceiptItemDto> Items { get; set; } = new();
+}
+
+public class CreatePurchaseReceiptItemDto
+{
+    [Required] public Guid ItemId { get; set; }
+    [Required][StringLength(500)] public string Description { get; set; } = null!;
+    public decimal Quantity { get; set; }
+    [Required][Range(0, double.MaxValue)] public decimal UnitPrice { get; set; }
+    [Range(0, double.MaxValue)] public decimal TaxAmount { get; set; }
+    [StringLength(50)] public string Uom { get; set; } = "Unit";
+    public decimal? ConversionFactor { get; set; }
+    public Guid? PurchaseOrderItemId { get; set; }
+    public Guid? MaterialRequestItemId { get; set; }
+
+    /// <summary>
+    /// Item-level target warehouse. Null falls back to the receipt's warehouse. Set by putaway
+    /// allocation, which splits one ordered qty across several warehouses by capacity.
+    /// </summary>
+    public Guid? WarehouseId { get; set; }
+
+    /// <summary>Source/in-transit warehouse for internal transfers (PR #59251).</summary>
+    public Guid? FromWarehouseId { get; set; }
+    public decimal ReceivedQty { get; set; }
+    public decimal RejectedQty { get; set; }
+    public Guid? RejectedWarehouseId { get; set; }
+    public bool ReturnQtyFromRejectedWarehouse { get; set; }
+}
+
+public class PutawayItemInput
+{
+    public Guid ItemId { get; set; }
+    public decimal Qty { get; set; }
+    public decimal RejectedQty { get; set; }
+}
+
+public class PutawayAllocationResultDto
+{
+    public Guid ItemId { get; set; }
+    public Guid WarehouseId { get; set; }
+    public decimal Qty { get; set; }
+    public decimal RejectedQty { get; set; }
+    public decimal ReceivedQty { get; set; }
+    public bool IsUnallocated { get; set; }
+}
+

@@ -1,0 +1,53 @@
+using System;
+using Volo.Abp.Domain.Entities;
+
+namespace MyERP.Purchasing.Entities;
+
+/// <summary>
+/// Line item in a Material Request.
+/// </summary>
+public class MaterialRequestItem : Entity<Guid>
+{
+    public Guid MaterialRequestId { get; set; }
+    public Guid ItemId { get; set; }
+    public string ItemName { get; set; } = null!;
+    public decimal Quantity { get; set; }
+    public decimal OrderedQuantity { get; set; }
+    public decimal ReceivedQuantity { get; set; }
+    public string Uom { get; set; } = "Unit";
+    public decimal ConversionFactor { get; set; } = 1m;
+    public decimal StockQty => Quantity * (ConversionFactor > 0 ? ConversionFactor : 1m);
+    public Guid? WarehouseId { get; set; }
+
+    /// <summary>Sales Order ID when MR was created from SO→MR conversion.</summary>
+    public Guid? SalesOrderId { get; set; }
+
+    /// <summary>Sales Order Item ID when MR was created from SO→MR conversion.</summary>
+    public Guid? SalesOrderItemId { get; set; }
+
+    /// <summary>Linked project for budgeting and tracking (ERPNext commit 9eab434ae8).</summary>
+    public Guid? ProjectId { get; set; }
+
+    /// <summary>Production Plan ID when MR was created from Production Plan.</summary>
+    public Guid? ProductionPlanId { get; set; }
+
+    /// <summary>Production Plan Material Requirement Item ID when MR was created from Production Plan (ERPNext PR #59615).</summary>
+    public Guid? ProductionPlanMrItemId { get; set; }
+
+    /// <summary>Job Card raw material item ID when MR was created from Job Card transfer.</summary>
+    public Guid? JobCardItemId { get; set; }
+
+    protected MaterialRequestItem() { }
+
+    public MaterialRequestItem(Guid id, Guid materialRequestId, Guid itemId,
+        string itemName, decimal quantity, string uom, Guid? warehouseId = null)
+        : base(id)
+    {
+        MaterialRequestId = materialRequestId;
+        ItemId = itemId;
+        ItemName = itemName;
+        Quantity = quantity;
+        Uom = uom;
+        WarehouseId = warehouseId;
+    }
+}

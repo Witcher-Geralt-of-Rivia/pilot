@@ -1,0 +1,252 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using MyERP.Core;
+using Volo.Abp;
+using Volo.Abp.Domain.Entities.Auditing;
+using Volo.Abp.MultiTenancy;
+
+namespace MyERP.Sales.Entities;
+
+/// <summary>
+/// Blanket Order — framework agreement for a fixed quantity/amount with a customer/supplier.
+/// Sales Orders and Purchase Orders draw from the blanket order allocation.
+/// Quantity cannot exceed (qty × (1 + allowance_pct / 100)).
+/// Maps to ERPNext selling/doctype/blanket_order.
+/// </summary>
+public class BlanketOrder : FullAuditedAggregateRoot<Guid>, IMultiTenant
+{
+    public Guid? TenantId { get; set; }
+    public Guid CompanyId { get; set; }
+
+    public string OrderNumber { get; set; } = null!;
+
+    /// <summary>Selling or Buying.</summary>
+    public string OrderType { get; set; } = "Selling";
+
+    /// <summary>Customer (for Selling) or Supplier (for Buying).</summary>
+    public Guid PartyId { get; set; }
+    public string? PartyName { get; set; }
+
+    public DateTime FromDate { get; set; }
+    public DateTime ToDate { get; set; }
+
+    /// <summary>Currency of the agreement (per ERPNext PR #58472).</summary>
+    public string Currency { get; set; } = "MYR";
+
+    /// <summary>Exchange rate: agreement currency -> base company currency.</summary>
+    public decimal ExchangeRate { get; set; } = 1m;
+
+    public DocumentStatus Status { get; private set; } = DocumentStatus.Draft;
+
+    private readonly List<BlanketOrderItem> _items = new();
+    public IReadOnlyList<BlanketOrderItem> Items => _items.AsReadOnly();
+
+    protected BlanketOrder() { }
+
+    public BlanketOrder(Guid id, Guid companyId, string orderNumber,
+        string orderType, Guid partyId, DateTime fromDate, DateTime toDate, Guid? tenantId = null)
+        : base(id)
+    {
+        CompanyId = companyId;
+        OrderNumber = orderNumber;
+        OrderType = orderType;
+        PartyId = partyId;
+        FromDate = fromDate;
+        ToDate = toDate;
+        TenantId = tenantId;
+    }
+
+    public void AddItem(Guid itemId, decimal qty, decimal rate, string? itemName = null, string? partyItemCode = null, string? stockUom = null)
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        if (qty <= 0)
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Quantity must be greater than zero.");
+        if (_items.Any(x => x.ItemId == itemId))
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("itemId", itemId)
+                .WithData("detail", "Cannot add duplicate items in a Blanket Order.");
+
+        var item = new BlanketOrderItem(Guid.NewGuid(), Id, itemId, qty, rate, itemName)
+        {
+            PartyItemCode = partyItemCode,
+            StockUom = stockUom,
+            BaseRate = Math.Round(rate * ExchangeRate, 4)
+        };
+        _items.Add(item);
+    }
+
+    public void Submit()
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        if (!_items.Any())
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        if (ToDate < FromDate)
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "To Date cannot be before From Date.");
+        Status = DocumentStatus.Submitted;
+    }
+
+    public void Cancel()
+    {
+        if (Status != DocumentStatus.Submitted)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = DocumentStatus.Cancelled;
+    }
+
+    /// <summary>
+    /// Closes the blanket order (ERPNext PR #59341 / commit df4a9f8d9f).
+    /// </summary>
+    public void Close()
+    {
+        if (Status != DocumentStatus.Submitted)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = DocumentStatus.Closed;
+    }
+
+    /// <summary>
+    /// Re-opens a closed blanket order (ERPNext PR #59341 / commit df4a9f8d9f).
+    /// </summary>
+    public void Reopen()
+    {
+        if (Status != DocumentStatus.Closed)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        if (_items.Count > 0 && _items.All(x => x.IsClosed))
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Cannot reopen Blanket Order as all items are closed.");
+        Status = DocumentStatus.Submitted;
+    }
+
+    /// <summary>
+    /// Closes an individual item row on the blanket order (ERPNext PR #59343 / commit 775b019c30).
+    /// If all rows become closed, the blanket order itself is closed.
+    /// </summary>
+    public void CloseItem(Guid itemId)
+    {
+        var item = _items.FirstOrDefault(x => x.Id == itemId || x.ItemId == itemId);
+        if (item == null)
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Item not found in Blanket Order.");
+        item.Close();
+        if (_items.Count > 0 && _items.All(x => x.IsClosed))
+        {
+            Status = DocumentStatus.Closed;
+        }
+    }
+
+    /// <summary>
+    /// Re-opens a closed individual item row on the blanket order (ERPNext PR #59343 / commit 775b019c30).
+    /// If the blanket order was closed, reopening any row reopens the blanket order.
+    /// </summary>
+    public void ReopenItem(Guid itemId)
+    {
+        var item = _items.FirstOrDefault(x => x.Id == itemId || x.ItemId == itemId);
+        if (item == null)
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Item not found in Blanket Order.");
+        item.Reopen();
+        if (Status == DocumentStatus.Closed)
+        {
+            Status = DocumentStatus.Submitted;
+        }
+    }
+
+    /// <summary>
+    /// Validates that an order can be placed against this Blanket Order per ERPNext PR #59341, #59346 &amp; #60557.
+    /// Must be submitted (not closed or cancelled), within [FromDate, ToDate], and match type/party/currency when specified.
+    /// </summary>
+    public void ValidateCanBeOrdered(DateTime orderDate, string? expectedOrderType = null, Guid? partyId = null, string? currency = null)
+    {
+        if (Status == DocumentStatus.Closed)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("detail", $"Blanket Order {OrderNumber} is closed.");
+        if (Status != DocumentStatus.Submitted)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("detail", $"Blanket Order {OrderNumber} is not submitted.");
+        if (orderDate.Date < FromDate.Date)
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"Blanket Order {OrderNumber} is valid from {FromDate:yyyy-MM-dd}.");
+        if (orderDate.Date > ToDate.Date)
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"Blanket Order {OrderNumber} expired on {ToDate:yyyy-MM-dd}.");
+        if (!string.IsNullOrWhiteSpace(expectedOrderType) && !string.Equals(OrderType, expectedOrderType, StringComparison.OrdinalIgnoreCase))
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"Blanket Order {OrderNumber} is of type {OrderType}, expected {expectedOrderType}.");
+        if (partyId.HasValue && PartyId != partyId.Value)
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"Party does not match Blanket Order {OrderNumber}.");
+        if (!string.IsNullOrWhiteSpace(currency) && !string.Equals(Currency, currency, StringComparison.OrdinalIgnoreCase))
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"Currency {currency} does not match Blanket Order {OrderNumber} currency ({Currency}).");
+    }
+}
+
+public class BlanketOrderItem : FullAuditedEntity<Guid>
+{
+    public Guid BlanketOrderId { get; set; }
+    public Guid ItemId { get; set; }
+    public string? ItemName { get; set; }
+    public string? PartyItemCode { get; set; }
+    public string? StockUom { get; set; }
+    public bool IsClosed { get; private set; }
+    public decimal Qty { get; set; }
+    public decimal Rate { get; set; }
+
+    /// <summary>Rate in company base currency = Rate * ExchangeRate (per ERPNext PR #58472).</summary>
+    public decimal BaseRate { get; set; }
+
+    /// <summary>Qty already ordered against this line.</summary>
+    public decimal OrderedQty { get; set; }
+
+    /// <summary>Remaining qty = Qty - OrderedQty.</summary>
+    public decimal RemainingQty => Qty - OrderedQty;
+
+    protected BlanketOrderItem() { }
+
+    public BlanketOrderItem(Guid id, Guid blanketOrderId, Guid itemId,
+        decimal qty, decimal rate, string? itemName) : base(id)
+    {
+        BlanketOrderId = blanketOrderId;
+        ItemId = itemId;
+        Qty = qty;
+        Rate = rate;
+        ItemName = itemName;
+        BaseRate = rate;
+    }
+
+    public void Close()
+    {
+        if (OrderedQty >= Qty)
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Cannot close item as it is already fully ordered.");
+        IsClosed = true;
+    }
+
+    public void Reopen()
+    {
+        IsClosed = false;
+    }
+
+    /// <summary>Record an order against this blanket line. Validates allowance.</summary>
+    public void RecordOrder(decimal qty, decimal allowancePct = 0)
+    {
+        if (IsClosed)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("detail", "Cannot order against a closed Blanket Order item.");
+
+        var maxAllowed = Qty * (1 + allowancePct / 100);
+        if (OrderedQty + qty > maxAllowed)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("detail", $"Exceeds blanket order allowance. Max: {maxAllowed}, Current: {OrderedQty}, Requested: {qty}");
+        OrderedQty += qty;
+    }
+
+    /// <summary>Reverse a previously recorded order (e.g. on cancel). Never goes below zero.</summary>
+    public void UnrecordOrder(decimal qty)
+    {
+        OrderedQty = Math.Max(0, OrderedQty - qty);
+    }
+}

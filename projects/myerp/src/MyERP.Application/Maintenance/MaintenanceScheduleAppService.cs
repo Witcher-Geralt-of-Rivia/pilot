@@ -1,0 +1,378 @@
+using System;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+using MyERP.Maintenance.Entities;
+using MyERP.Permissions;
+
+namespace MyERP.Maintenance;
+
+[Authorize(MyERPPermissions.MaintenanceSchedules.Default)]
+public class MaintenanceScheduleAppService : ApplicationService, IMaintenanceScheduleAppService
+{
+    private readonly IRepository<MaintenanceSchedule, Guid> _repository;
+
+    public MaintenanceScheduleAppService(IRepository<MaintenanceSchedule, Guid> repository)
+    {
+        _repository = repository;
+    }
+
+    public async Task<MaintenanceScheduleDto> GetAsync(Guid id)
+    {
+        var entity = await _repository.GetAsync(id);
+        return MapToDto(entity);
+    }
+
+    public async Task<PagedResultDto<MaintenanceScheduleDto>> GetListAsync(GetMaintenanceScheduleListDto input)
+    {
+        var queryable = await _repository.GetQueryableAsync();
+        queryable = queryable.WhereIf(input.CustomerId.HasValue,
+            s => s.CustomerId == input.CustomerId!.Value);
+        queryable = queryable.WhereIf(input.Status.HasValue,
+            s => (int)s.Status == input.Status!.Value);
+
+        var totalCount = queryable.Count();
+        var items = queryable
+            .OrderByDescending(s => s.CreationTime)
+            .Skip(input.SkipCount)
+            .Take(input.MaxResultCount)
+            .ToList();
+
+        return new PagedResultDto<MaintenanceScheduleDto>(
+            totalCount, items.Select(MapToDto).ToList());
+    }
+
+    [Authorize(MyERPPermissions.MaintenanceSchedules.Create)]
+    public async Task<MaintenanceScheduleDto> CreateAsync(CreateMaintenanceScheduleDto input)
+    {
+        if (input.Items == null || input.Items.Count == 0)
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.DocumentMustHaveItems);
+        }
+
+        var firstItem = input.Items.First();
+        if (firstItem.EndDate < firstItem.StartDate)
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.InvalidDateRange);
+        }
+
+        var customerRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.Customer, Guid>>();
+        var customer = await customerRepo.FindAsync(input.CustomerId);
+        if (customer != null && customer.CompanyId != input.CompanyId)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                .WithData("customerCompany", customer.CompanyId)
+                .WithData("scheduleCompany", input.CompanyId);
+        }
+
+        if (input.SalesOrderId.HasValue)
+        {
+            var soRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.SalesOrder, Guid>>();
+            var so = await soRepo.FindAsync(input.SalesOrderId.Value);
+            if (so != null && so.CompanyId != input.CompanyId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("salesOrderCompany", so.CompanyId)
+                    .WithData("scheduleCompany", input.CompanyId);
+            }
+        }
+
+        var itemIds = input.Items.Select(i => i.ItemId).Distinct().ToArray();
+        var itemValidation = LazyServiceProvider.LazyGetRequiredService<MyERP.Inventory.DomainServices.ItemTransactionValidationService>();
+        await itemValidation.ValidateItemsForTransactionAsync(itemIds);
+
+        var companyRestriction = LazyServiceProvider.LazyGetRequiredService<MyERP.Core.DomainServices.CompanyRestrictionValidationService>();
+        await companyRestriction.ValidateTransactionCompanyAsync(
+            "MaintenanceSchedule", input.CompanyId,
+            itemIds: itemIds,
+            customerIds: new[] { input.CustomerId });
+
+        var entity = new MaintenanceSchedule(
+            GuidGenerator.Create(), input.CompanyId,
+            firstItem.StartDate, firstItem.EndDate,
+            firstItem.Periodicity.ToString(), CurrentTenant.Id)
+        {
+            CustomerId = input.CustomerId,
+            SalesOrderId = input.SalesOrderId
+        };
+
+        if (input.Items.Any())
+        {
+            entity.ItemId = firstItem.ItemId;
+            entity.SerialNoId = firstItem.SerialNoId;
+            entity.SalesPersonId = firstItem.SalesPersonId;
+        }
+
+        await _repository.InsertAsync(entity, autoSave: true);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "MaintenanceSchedule", entity.Id,
+            "Created", entity.CompanyId,
+            entity.Id.ToString()[..8], "Draft", "Draft", CurrentUser.Id,
+            $"Maintenance Schedule {entity.Id.ToString()[..8]} created", CurrentTenant.Id));
+
+        return MapToDto(entity);
+    }
+
+    [Authorize(MyERPPermissions.MaintenanceSchedules.Edit)]
+    public async Task<MaintenanceScheduleDto> UpdateAsync(Guid id, CreateMaintenanceScheduleDto input)
+    {
+        var entity = await _repository.GetAsync(id);
+
+        if (input.CustomerId != Guid.Empty)
+        {
+            var customerRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.Customer, Guid>>();
+            var customer = await customerRepo.FindAsync(input.CustomerId);
+            if (customer != null && customer.CompanyId != entity.CompanyId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("customerCompany", customer.CompanyId)
+                    .WithData("scheduleCompany", entity.CompanyId);
+            }
+        }
+
+        if (input.SalesOrderId.HasValue)
+        {
+            var soRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.SalesOrder, Guid>>();
+            var so = await soRepo.FindAsync(input.SalesOrderId.Value);
+            if (so != null && so.CompanyId != entity.CompanyId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("salesOrderCompany", so.CompanyId)
+                    .WithData("scheduleCompany", entity.CompanyId);
+            }
+        }
+
+        if (input.CustomerId != Guid.Empty)
+        {
+            var companyRestriction = LazyServiceProvider.LazyGetRequiredService<MyERP.Core.DomainServices.CompanyRestrictionValidationService>();
+            await companyRestriction.ValidateTransactionCompanyAsync(
+                "MaintenanceSchedule", entity.CompanyId,
+                customerIds: new[] { input.CustomerId });
+        }
+
+        entity.CustomerId = input.CustomerId;
+        entity.SalesOrderId = input.SalesOrderId;
+        await _repository.UpdateAsync(entity, autoSave: true);
+        return MapToDto(entity);
+    }
+
+    [Authorize(MyERPPermissions.MaintenanceSchedules.Delete)]
+    public async Task DeleteAsync(Guid id)
+    {
+        await _repository.DeleteAsync(id);
+    }
+
+    [Authorize(MyERPPermissions.MaintenanceSchedules.Edit)]
+    public async Task<MaintenanceScheduleDto> GenerateScheduleAsync(Guid id)
+    {
+        var entity = await _repository.GetAsync(id);
+
+        var generator = LazyServiceProvider.LazyGetRequiredService<MyERP.Maintenance.DomainServices.MaintenanceScheduleGenerator>();
+        var noOfVisits = await generator.GenerateAsync(entity);
+
+        await _repository.UpdateAsync(entity, autoSave: true);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "MaintenanceSchedule", entity.Id,
+            "ScheduleGenerated", entity.CompanyId,
+            entity.Id.ToString()[..8], "Draft", "Draft", CurrentUser.Id,
+            $"Maintenance Schedule {entity.Id.ToString()[..8]} generated {noOfVisits} visits", CurrentTenant.Id));
+
+        return MapToDto(entity);
+    }
+
+    [Authorize(MyERPPermissions.MaintenanceSchedules.Submit)]
+    public async Task<MaintenanceScheduleDto> SubmitAsync(Guid id)
+    {
+        var entity = await _repository.GetAsync(id);
+        entity.Submit();
+        await _repository.UpdateAsync(entity, autoSave: true);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "MaintenanceSchedule", entity.Id,
+            "Submitted", entity.CompanyId,
+            entity.Id.ToString()[..8], "Draft", "Submitted", CurrentUser.Id,
+            $"Maintenance Schedule {entity.Id.ToString()[..8]} submitted", CurrentTenant.Id));
+
+        return MapToDto(entity);
+    }
+
+    [Authorize(MyERPPermissions.MaintenanceSchedules.Submit)]
+    public async Task<MaintenanceScheduleDto> CancelAsync(Guid id)
+    {
+        var entity = await _repository.GetAsync(id);
+        entity.Cancel();
+        await _repository.UpdateAsync(entity, autoSave: true);
+
+        var activityLogRepo = LazyServiceProvider?.LazyGetService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        if (activityLogRepo != null)
+        {
+            await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+                GuidGenerator.Create(), "MaintenanceSchedule", entity.Id,
+                "Cancelled", entity.CompanyId,
+                entity.Id.ToString()[..8], entity.Status.ToString(), "Cancelled", CurrentUser?.Id,
+                $"Maintenance Schedule {entity.Id.ToString()[..8]} cancelled", CurrentTenant?.Id));
+        }
+
+        return MapToDto(entity);
+    }
+
+    /// <summary>
+    /// Creates a pre-populated draft Maintenance Visit DTO from a submitted Maintenance Schedule (Gotcha #6009).
+    /// </summary>
+    public async Task<CreateMaintenanceVisitDto> MakeMaintenanceVisitAsync(Guid id, MakeMaintenanceVisitInput? input = null)
+    {
+        var schedule = await _repository.GetAsync(id);
+        if (schedule.Status != MaintenanceScheduleStatus.Submitted)
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Maintenance visits can only be generated from submitted Maintenance Schedules.");
+        }
+
+        MaintenanceScheduleDetail? targetDetail = null;
+        if (input?.ScheduleDetailId.HasValue == true)
+        {
+            targetDetail = schedule.Details.FirstOrDefault(d => d.Id == input.ScheduleDetailId.Value);
+        }
+        else
+        {
+            targetDetail = schedule.Details.FirstOrDefault(d => !d.IsCompleted);
+        }
+
+        var visitDate = input?.VisitDate 
+            ?? targetDetail?.ScheduledDate 
+            ?? DateTime.UtcNow;
+
+        var result = new CreateMaintenanceVisitDto
+        {
+            CompanyId = schedule.CompanyId,
+            CustomerId = schedule.CustomerId ?? Guid.Empty,
+            VisitDate = visitDate,
+            MaintenanceType = input?.MaintenanceType ?? 0, // 0 = Scheduled
+            MaintenanceScheduleId = schedule.Id,
+            MaintenanceScheduleDetailId = targetDetail?.Id,
+            Purposes = new System.Collections.Generic.List<CreateMaintenanceVisitPurposeDto>
+            {
+                new()
+                {
+                    ItemId = schedule.ItemId ?? Guid.Empty,
+                    SerialNoId = schedule.SerialNoId,
+                    ServicePersonId = schedule.SalesPersonId,
+                    WorkDone = targetDetail != null 
+                        ? $"Scheduled visit on {targetDetail.ScheduledDate:yyyy-MM-dd}" 
+                        : "Preventive maintenance visit",
+                    Status = 0 // Pending
+                }
+            }
+        };
+
+        return result;
+    }
+
+    /// <summary>
+    /// Creates a draft Maintenance Schedule DTO pre-populated from a submitted Sales Order (Gotcha #6009).
+    /// </summary>
+    public async Task<CreateMaintenanceScheduleDto> CreateFromSalesOrderAsync(Guid salesOrderId)
+    {
+        var salesOrderRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.SalesOrder, Guid>>();
+        var soQuery = await salesOrderRepo.WithDetailsAsync(so => so.Items);
+        var so = soQuery.FirstOrDefault(s => s.Id == salesOrderId);
+        if (so == null)
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.EntityNotFound);
+        }
+
+        if (so.Status != Core.DocumentStatus.Submitted)
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"Sales Order '{so.OrderNumber}' must be submitted to create Maintenance Schedule.");
+        }
+
+        var startDate = DateTime.UtcNow.Date;
+        var endDate = startDate.AddYears(1);
+
+        var result = new CreateMaintenanceScheduleDto
+        {
+            CompanyId = so.CompanyId,
+            CustomerId = so.CustomerId,
+            SalesOrderId = so.Id,
+            Items = so.Items.Select(item => new CreateMaintenanceScheduleItemDto
+            {
+                ItemId = item.ItemId,
+                StartDate = startDate,
+                EndDate = endDate,
+                Periodicity = MaintenancePeriodicity.Quarterly,
+                NoOfVisits = 4
+            }).ToList()
+        };
+
+        return result;
+    }
+
+    /// <summary>
+    /// Computes summary metrics for the given Maintenance Schedule (Gotcha #6009).
+    /// </summary>
+    public async Task<MaintenanceScheduleSummaryDto> GetSummaryAsync(Guid id)
+    {
+        var entity = await _repository.GetAsync(id);
+        var total = entity.Details.Count;
+        var completed = entity.Details.Count(d => d.IsCompleted);
+        var pending = total - completed;
+        var percent = total > 0 ? Math.Round((decimal)completed / total * 100m, 2) : 0m;
+        var nextDate = entity.Details
+            .Where(d => !d.IsCompleted && d.ScheduledDate >= DateTime.UtcNow.Date)
+            .OrderBy(d => d.ScheduledDate)
+            .Select(d => (DateTime?)d.ScheduledDate)
+            .FirstOrDefault();
+
+        return new MaintenanceScheduleSummaryDto
+        {
+            ScheduleId = entity.Id,
+            TotalVisits = total,
+            CompletedVisits = completed,
+            PendingVisits = pending,
+            CompletionPercentage = percent,
+            NextScheduledDate = nextDate
+        };
+    }
+
+    private static MaintenanceScheduleDto MapToDto(MaintenanceSchedule entity) => new()
+    {
+        Id = entity.Id,
+        CompanyId = entity.CompanyId,
+        CustomerId = entity.CustomerId ?? Guid.Empty,
+        SalesOrderId = entity.SalesOrderId,
+        Status = (int)entity.Status,
+        Items = new()
+        {
+            new MaintenanceScheduleItemDto
+            {
+                Id = entity.Id,
+                ItemId = entity.ItemId ?? Guid.Empty,
+                SerialNoId = entity.SerialNoId,
+                SalesPersonId = entity.SalesPersonId,
+                StartDate = entity.StartDate,
+                EndDate = entity.EndDate,
+                NoOfVisits = entity.Details.Count,
+                Periodicity = 0
+            }
+        },
+        ScheduleDetails = entity.Details.Select(d => new MaintenanceScheduleDetailDto
+        {
+            Id = d.Id,
+            ItemId = entity.ItemId ?? Guid.Empty,
+            ScheduledDate = d.ScheduledDate,
+            ActualDate = d.ActualDate,
+            SalesPersonId = entity.SalesPersonId,
+            Status = d.IsCompleted ? 1 : 0
+        }).ToList()
+    };
+}

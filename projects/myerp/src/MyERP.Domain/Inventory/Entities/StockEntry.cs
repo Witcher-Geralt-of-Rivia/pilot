@@ -1,0 +1,289 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using MyERP.Accounting.DomainServices;
+using MyERP.Core;
+using MyERP.Manufacturing;
+using Volo.Abp;
+using Volo.Abp.Domain.Entities.Auditing;
+using Volo.Abp.MultiTenancy;
+
+namespace MyERP.Inventory.Entities;
+
+/// <summary>
+/// Stock Entry — records stock movements (receipt, issue, transfer, adjustment).
+/// Maps to ERPNext stock/doctype/stock_entry.
+/// </summary>
+public class StockEntry : FullAuditedAggregateRoot<Guid>, IMultiTenant, IAccountableDocument
+{
+    public Guid? TenantId { get; set; }
+    public Guid CompanyId { get; set; }
+
+    public string? EntryNumber { get; set; }
+    public StockEntryType EntryType { get; set; }
+    public DateTime PostingDate { get; set; }
+    DateTime IAccountableDocument.PostingDate => PostingDate;
+
+    /// <summary>Source document type (e.g., "SalesInvoice", "PurchaseInvoice").</summary>
+    public string? ReferenceType { get; set; }
+
+    /// <summary>Linked Work Order ID (for material transfer/manufacture stock entries).</summary>
+    public Guid? WorkOrderId { get; set; }
+
+    /// <summary>Linked Job Card ID (for operation-specific material transfer entries).</summary>
+    public Guid? JobCardId { get; set; }
+
+    /// <summary>Linked Subcontracting Order ID (for SendToSubcontractor stock entries).</summary>
+    public Guid? SubcontractingOrderId { get; set; }
+
+    /// <summary>Source Manufacture Stock Entry ID (for Disassemble purpose — links to the original production).</summary>
+    public Guid? SourceStockEntryId { get; set; }
+
+    /// <summary>Finished goods quantity produced/consumed (Manufacture/Disassemble).</summary>
+    public decimal FgCompletedQty { get; set; }
+
+    /// <summary>Process loss quantity in this stock entry.</summary>
+    public decimal ProcessLossQty { get; set; }
+
+    /// <summary>Process loss percentage (for Manufacture/Repack).</summary>
+    public decimal ProcessLossPercentage { get; set; }
+
+    /// <summary>
+    /// Hidden flag marking excess/additional material transfer entries beyond standard WO required qty (gotcha #179).
+    /// </summary>
+    public bool IsAdditionalTransferEntry { get; set; }
+
+    /// <summary>
+    /// Finished Good Conversion flag (upstream PR #58479):
+    /// Converts produced FG of a Work Order to alternative finished goods via Repack entry.
+    /// </summary>
+    public bool IsFgConversion { get; set; }
+
+    /// <summary>
+    /// Weight/Quantity per piece for Batch Split Repack operation (upstream PR #58530).
+    /// When set (> 0), splits produced finished goods into child batches of this unit size.
+    /// </summary>
+    public decimal WeightPerPiece { get; set; }
+
+    /// <summary>
+    /// Indicates whether this stock entry represents an opening stock balance entry.
+    /// </summary>
+    public bool IsOpening { get; set; }
+
+    /// <summary>
+    /// Indicates whether this stock entry is a return entry (e.g. returning unconsumed materials to stores).
+    /// Per ERPNext make_stock_return_entry.
+    /// </summary>
+    public bool IsReturn { get; set; }
+
+    /// <summary>
+    /// Whether any item row in this Stock Entry has both a source and target warehouse (i.e. is an internal transfer row).
+    /// Per ERPNext PR #62287 / commit 81940327fe: used to detect transfer stock entries.
+    /// </summary>
+    public bool HasTransferRow => _items.Any(i => i.SourceWarehouseId.HasValue && i.TargetWarehouseId.HasValue);
+
+    /// <summary>
+    /// Total additional costs for this stock entry (per ERPNext commit 074c84e880 / PR #58433).
+    /// Distributed across all incoming rows.
+    /// </summary>
+    public decimal TotalAdditionalCosts { get; set; }
+
+    // IAccountableDocument implementation
+    string IAccountableDocument.DocumentType => "StockEntry";
+    public string CurrencyCode { get; set; } = "MYR";
+    public decimal ExchangeRate { get; set; } = 1m;
+    decimal IAccountableDocument.NetTotal => _items.Sum(i => i.Quantity * (i.ValuationRate ?? 0));
+    decimal IAccountableDocument.GrandTotal => _items.Sum(i => i.Quantity * (i.ValuationRate ?? 0));
+    decimal IAccountableDocument.TaxAmount => 0;
+    Guid? IAccountableDocument.CustomerId => null;
+    Guid? IAccountableDocument.SupplierId => null;
+    public Guid? ReferenceId { get; set; }
+
+    public string? Notes { get; set; }
+    public DocumentStatus Status { get; private set; } = DocumentStatus.Draft;
+
+    /// <summary>Cost center for this stock entry (per ERPNext PR #53246).</summary>
+    public Guid? CostCenterId { get; set; }
+
+    /// <summary>Project for this stock entry.</summary>
+    public Guid? ProjectId { get; set; }
+
+    /// <summary>Total value of incoming (stock-in) items. Computed from items with TargetWarehouseId.</summary>
+    public decimal TotalIncomingValue => _items
+        .Where(i => i.TargetWarehouseId.HasValue)
+        .Sum(i => i.Quantity * (i.ValuationRate ?? 0));
+
+    /// <summary>Total value of outgoing (stock-out) items. Computed from items with SourceWarehouseId.</summary>
+    public decimal TotalOutgoingValue => _items
+        .Where(i => i.SourceWarehouseId.HasValue)
+        .Sum(i => i.Quantity * (i.ValuationRate ?? 0));
+
+    /// <summary>Net value difference (incoming - outgoing). Zero for balanced transfers.</summary>
+    public decimal TotalValueDifference => TotalIncomingValue - TotalOutgoingValue;
+
+    private readonly List<StockEntryItem> _items = new();
+    public IReadOnlyList<StockEntryItem> Items => _items.AsReadOnly();
+
+    protected StockEntry() { }
+
+    public StockEntry(Guid id, Guid companyId, StockEntryType entryType, DateTime postingDate, Guid? tenantId = null)
+        : base(id)
+    {
+        CompanyId = Check.NotDefaultOrNull<Guid>(companyId, nameof(companyId));
+        EntryType = entryType;
+        PostingDate = postingDate;
+        TenantId = tenantId;
+    }
+
+    public StockEntryItem AddItem(
+        Guid itemId, decimal quantity, Guid? sourceWarehouseId = null, Guid? targetWarehouseId = null,
+        decimal? valuationRate = null, bool isFinishedItem = false, Guid? batchId = null,
+        string? secondaryItemType = null, decimal processLossPercentage = 0,
+        decimal conversionFactor = 1m, string stockUom = "Unit",
+        SecondaryItemValuationType? valuationType = null, Guid? bomSecondaryItemId = null,
+        bool allowZeroValuationRate = false, bool setBasicRateManually = false,
+        Guid? originalItemId = null, bool allowAlternativeItem = false)
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        var item = new StockEntryItem(
+            Guid.NewGuid(), Id, itemId, quantity, sourceWarehouseId, targetWarehouseId, valuationRate)
+        {
+            IsFinishedItem = isFinishedItem,
+            SetBasicRateManually = setBasicRateManually,
+            AllowZeroValuationRate = allowZeroValuationRate,
+            BatchId = batchId,
+            SecondaryItemType = secondaryItemType,
+            ProcessLossPercentage = processLossPercentage,
+            ConversionFactor = conversionFactor > 0 ? conversionFactor : 1m,
+            StockUom = stockUom,
+            ValuationType = valuationType,
+            BomSecondaryItemId = bomSecondaryItemId,
+            OriginalItemId = originalItemId,
+            AllowAlternativeItem = allowAlternativeItem
+        };
+        _items.Add(item);
+        return item;
+    }
+
+    /// <summary>
+    /// Returns total qty of received finished good rows whose rate is derived from consumed cost.
+    /// Manual and zero-valued rows take no share, so the others carry the whole cost (PR #59881 / commit 37f16db9d8).
+    /// </summary>
+    public decimal GetFinishedItemsQty()
+    {
+        return _items
+            .Where(d => (d.IsFinishedItem || (!d.SourceWarehouseId.HasValue && string.IsNullOrWhiteSpace(d.SecondaryItemType)))
+                && d.TargetWarehouseId.HasValue
+                && !d.SetBasicRateManually
+                && !d.AllowZeroValuationRate)
+            .Sum(d => d.Quantity);
+    }
+
+    /// <summary>Clear all items (Draft only). Used during edit to replace items.</summary>
+    public void ClearItems()
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        _items.Clear();
+    }
+
+    /// <summary>
+    /// Secondary rows without a BOM link choose their own costing: valuation rate or manual.
+    /// There is no percentage to allocate without a BOM row, so % of Component Cost is rejected.
+    /// Per ERPNext PR #59021 / commit bec627c3eb.
+    /// </summary>
+    public void SetBomlessSecondaryValuationTypes()
+    {
+        for (int i = 0; i < _items.Count; i++)
+        {
+            var d = _items[i];
+            if (d.BomSecondaryItemId.HasValue)
+                continue;
+
+            if (string.IsNullOrWhiteSpace(d.SecondaryItemType))
+            {
+                if (d.ValuationType.HasValue)
+                {
+                    d.ValuationType = null;
+                    d.SetBasicRateManually = false;
+                }
+                continue;
+            }
+
+            if (d.ValuationType == SecondaryItemValuationType.PercentageOfComponentCost)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Row #{i + 1}: % of Component Cost needs a BOM secondary item. Choose Valuation Rate or Manual.");
+            }
+        }
+    }
+
+    public void Submit()
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        if (!_items.Any())
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        SetBomlessSecondaryValuationTypes();
+
+        // Validate source and target warehouses cannot be identical (gotcha #6179)
+        foreach (var item in _items)
+        {
+            if (item.SourceWarehouseId.HasValue && item.TargetWarehouseId.HasValue
+                && item.SourceWarehouseId.Value == item.TargetWarehouseId.Value)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.SameWarehouseTransfer);
+            }
+        }
+
+        Status = DocumentStatus.Submitted;
+    }
+
+    public void Post()
+    {
+        if (Status != DocumentStatus.Submitted)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = DocumentStatus.Posted;
+    }
+
+    public void Cancel()
+    {
+        if (Status != DocumentStatus.Posted)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = DocumentStatus.Cancelled;
+    }
+
+    /// <summary>
+    /// Synchronizes ProcessLossQty and ProcessLossPercentage based on FgCompletedQty.
+    /// Per ERPNext PR #57063: when ProcessLossQty is specified, recomputes ProcessLossPercentage;
+    /// otherwise derives ProcessLossQty from ProcessLossPercentage.
+    /// </summary>
+    public void SyncProcessLoss()
+    {
+        if (FgCompletedQty <= 0) return;
+
+        if (ProcessLossQty > 0)
+        {
+            ProcessLossPercentage = Math.Round((ProcessLossQty / FgCompletedQty) * 100m, 4);
+        }
+        else if (ProcessLossPercentage > 0)
+        {
+            ProcessLossQty = Math.Round((FgCompletedQty * ProcessLossPercentage) / 100m, 4);
+        }
+    }
+
+    /// <summary>
+    /// Clears FgCompletedQty when neither BOM nor Work Order is linked.
+    /// Per ERPNext PR #60421 / commit 00ca106bf5: keeps FgCompletedQty on Work Order entries without FromBOM.
+    /// </summary>
+    public void RemoveFgCompletedQtyIfUnapplicable(bool hasBom, bool hasWorkOrder)
+    {
+        if (!hasBom && !hasWorkOrder && FgCompletedQty != 0)
+        {
+            FgCompletedQty = 0;
+        }
+    }
+}

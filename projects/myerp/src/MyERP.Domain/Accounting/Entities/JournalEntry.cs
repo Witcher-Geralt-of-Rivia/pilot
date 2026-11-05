@@ -1,0 +1,464 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using MyERP.Core;
+using Volo.Abp;
+using Volo.Abp.Domain.Entities.Auditing;
+using Volo.Abp.MultiTenancy;
+
+namespace MyERP.Accounting.Entities;
+
+/// <summary>
+/// Journal Entry — the core of double-entry accounting.
+/// Every financial transaction must produce a balanced JournalEntry.
+/// Maps to ERPNext accounts/doctype/journal_entry.
+/// </summary>
+public class JournalEntry : FullAuditedAggregateRoot<Guid>, IMultiTenant
+{
+    public Guid? TenantId { get; set; }
+    public Guid CompanyId { get; set; }
+    public Guid FiscalYearId { get; set; }
+
+    public string? EntryNumber { get; set; }
+    public Guid? AmendedFromId { get; set; }
+    public int AmendmentIndex { get; set; }
+    public DateTime PostingDate { get; set; }
+
+    /// <summary>Source document type (e.g., "SalesInvoice", "PurchaseInvoice", "Manual").</summary>
+    public string? ReferenceType { get; set; }
+
+    /// <summary>Source document ID.</summary>
+    public Guid? ReferenceId { get; set; }
+
+    /// <summary>Human-readable reference number.</summary>
+    public string? ReferenceNumber { get; set; }
+
+    public string? Narration { get; set; }
+
+    /// <summary>
+    /// Voucher type determines validation rules and GL behavior.
+    /// Per ERPNext: 18 voucher types with type-specific account restrictions.
+    /// </summary>
+    public JournalEntryVoucherType VoucherType { get; set; } = JournalEntryVoucherType.JournalEntry;
+
+    /// <summary>If this is a reversal, references the original JE being reversed.</summary>
+    public Guid? ReversalOfId { get; set; }
+
+    /// <summary>Indicates this is an opening balance entry (auto-forces IsOpening on lines).</summary>
+    public bool IsOpening { get; set; }
+
+    /// <summary>Multi-currency: whether this JE involves foreign currency accounts.</summary>
+    public bool IsMultiCurrency { get; set; }
+
+    /// <summary>Inter-company: the other company in an inter-company JE.</summary>
+    public Guid? InterCompanyJournalEntryId { get; set; }
+
+    /// <summary>
+    /// Date the bank confirmed this entry cleared (from Bank Clearance / Bank Reconciliation).
+    /// Null = outstanding (not yet cleared at the bank). Only meaningful for BankEntry/ContraEntry/
+    /// CreditCardEntry voucher types that touch a bank GL account.
+    /// Maps to ERPNext accounts/doctype/bank_clearance clearance_date.
+    /// </summary>
+    public DateTime? ClearanceDate { get; private set; }
+
+    public DocumentStatus Status { get; private set; } = DocumentStatus.Draft;
+
+    public decimal TotalDebit { get; private set; }
+    public decimal TotalCredit { get; private set; }
+    /// <summary>Difference between TotalDebit and TotalCredit, rounded to field precision (ERPNext PR #58629).</summary>
+    public decimal Difference => Math.Round(TotalDebit - TotalCredit, 2);
+
+    private readonly List<JournalEntryLine> _lines = new();
+    public IReadOnlyList<JournalEntryLine> Lines => _lines.AsReadOnly();
+
+    protected JournalEntry() { }
+
+    public JournalEntry(Guid id, Guid companyId, Guid fiscalYearId, DateTime postingDate, Guid? tenantId = null)
+        : base(id)
+    {
+        CompanyId = Check.NotDefaultOrNull<Guid>(companyId, nameof(companyId));
+        FiscalYearId = Check.NotDefaultOrNull<Guid>(fiscalYearId, nameof(fiscalYearId));
+        PostingDate = postingDate;
+        TenantId = tenantId;
+    }
+
+    public void SetCompany(Guid companyId)
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        CompanyId = Check.NotDefaultOrNull<Guid>(companyId, nameof(companyId));
+    }
+
+    public void ClearLines()
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        _lines.Clear();
+        RecalculateTotals();
+    }
+
+    public void AddLine(
+        Guid accountId,
+        decimal amount,
+        bool isDebit,
+        string? description = null,
+        Guid? partyId = null,
+        string? partyType = null,
+        Guid? costCenterId = null,
+        Guid? projectId = null)
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        if (amount <= 0)
+            throw new ArgumentException("Amount must be positive.", nameof(amount));
+
+        var line = new JournalEntryLine(
+            Guid.NewGuid(),
+            Id,
+            accountId,
+            amount,
+            isDebit,
+            description)
+        {
+            PartyId = partyId,
+            PartyType = partyType,
+            CostCenterId = costCenterId,
+            ProjectId = projectId
+        };
+
+        _lines.Add(line);
+        RecalculateTotals();
+    }
+
+    public void AddLine(JournalEntryLine line)
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        _lines.Add(line);
+        RecalculateTotals();
+    }
+
+    /// <summary>
+    /// Adds a GL line with dimension support (cost center, project, finance book).
+    /// Per ERPNext gotcha #24: accounting dimensions must propagate to exchange gain/loss JEs.
+    /// </summary>
+    public void AddLineWithDimensions(Guid accountId, decimal amount, bool isDebit,
+        Guid? costCenterId = null, Guid? projectId = null, string? financeBook = null,
+        string? description = null)
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        if (amount <= 0)
+            throw new ArgumentException("Amount must be positive.", nameof(amount));
+
+        var line = new JournalEntryLine(
+            Guid.NewGuid(), Id, accountId, amount, isDebit, description);
+        line.CostCenterId = costCenterId;
+        line.ProjectId = projectId;
+        line.FinanceBook = financeBook;
+        _lines.Add(line);
+
+        RecalculateTotals();
+    }
+
+    /// <summary>
+    /// Adds a line with optional party and dimension references.
+    /// Used for programmatic JE generation (e.g. Bank Reconciliation create_journal_entry_bts).
+    /// </summary>
+    public void AddFullLine(Guid accountId, decimal amount, bool isDebit,
+        string? description = null, Guid? partyId = null, string? partyType = null,
+        Guid? costCenterId = null, Guid? projectId = null)
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        if (amount <= 0)
+            throw new ArgumentException("Amount must be positive.", nameof(amount));
+
+        var line = new JournalEntryLine(Guid.NewGuid(), Id, accountId, amount, isDebit, description)
+        {
+            PartyId = partyId,
+            PartyType = partyType,
+            CostCenterId = costCenterId,
+            ProjectId = projectId,
+        };
+        _lines.Add(line);
+
+        RecalculateTotals();
+    }
+
+    /// <summary>
+    /// Adds a line with party reference. Validates account type compatibility.
+    /// Per DO-NOT: "Allow party on non-Receivable/Payable/Equity accounts in GL entries"
+    /// </summary>
+    public void AddLineWithParty(Guid accountId, decimal amount, bool isDebit,
+        Guid partyId, string partyType, AccountSubType? accountSubType, string? description = null)
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        if (amount <= 0)
+            throw new ArgumentException("Amount must be positive.", nameof(amount));
+
+        // Validate: party can only be set on Receivable, Payable, or Equity accounts
+        if (accountSubType.HasValue &&
+            accountSubType != AccountSubType.AccountsReceivable &&
+            accountSubType != AccountSubType.AccountsPayable &&
+            accountSubType != AccountSubType.ShareCapital &&
+            accountSubType != AccountSubType.RetainedEarnings)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.PartyNotAllowedOnAccount)
+                .WithData("partyType", partyType)
+                .WithData("accountSubType", accountSubType.Value.ToString());
+        }
+
+        var line = new JournalEntryLine(Guid.NewGuid(), Id, accountId, amount, isDebit, description);
+        line.PartyId = partyId;
+        line.PartyType = partyType;
+        _lines.Add(line);
+
+        RecalculateTotals();
+    }
+
+    /// <summary>
+    /// Adds a contra line reversing a source line from another (typically cancelled) JournalEntry —
+    /// same account/amount/currency/party/dimensions, direction flipped. Used to build a reversal
+    /// JE that nets a cancelled document's GL impact to zero while preserving full line fidelity
+    /// (party, cost center, project) for subledger reports that key off JournalEntryLine fields.
+    /// </summary>
+    public void AddReversalLine(JournalEntryLine sourceLine)
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        var line = new JournalEntryLine(
+            Guid.NewGuid(), Id, sourceLine.AccountId, sourceLine.Amount, !sourceLine.IsDebit, sourceLine.Description)
+        {
+            AccountCurrency = sourceLine.AccountCurrency,
+            AmountInAccountCurrency = sourceLine.AmountInAccountCurrency,
+            ExchangeRate = sourceLine.ExchangeRate,
+            PartyId = sourceLine.PartyId,
+            PartyType = sourceLine.PartyType,
+            CostCenterId = sourceLine.CostCenterId,
+            ProjectId = sourceLine.ProjectId,
+            AgainstVoucherType = sourceLine.AgainstVoucherType,
+            AgainstVoucherId = sourceLine.AgainstVoucherId,
+            IsAdvance = sourceLine.IsAdvance,
+            FinanceBook = sourceLine.FinanceBook,
+        };
+        _lines.Add(line);
+
+        RecalculateTotals();
+    }
+
+    /// <summary>
+    /// Adds a line carrying party, dimension, multi-currency, and against-voucher context in one call.
+    /// Used by cross-aggregate reconciliation flows (e.g. Common Party Accounting) that need the
+    /// full line shape AddLineWithParty/AddLineWithDimensions each only cover part of.
+    /// </summary>
+    public void AddReconciliationLine(
+        Guid accountId, decimal amount, bool isDebit,
+        Guid partyId, string partyType,
+        Guid? costCenterId, Guid? projectId,
+        string? accountCurrency, decimal amountInAccountCurrency, decimal exchangeRate,
+        string? againstVoucherType, Guid? againstVoucherId, bool isAdvance,
+        string? description = null)
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        if (amount <= 0)
+            throw new ArgumentException("Amount must be positive.", nameof(amount));
+
+        var line = new JournalEntryLine(Guid.NewGuid(), Id, accountId, amount, isDebit, description)
+        {
+            PartyId = partyId,
+            PartyType = partyType,
+            CostCenterId = costCenterId,
+            ProjectId = projectId,
+            AccountCurrency = accountCurrency,
+            AmountInAccountCurrency = amountInAccountCurrency,
+            ExchangeRate = exchangeRate,
+            AgainstVoucherType = againstVoucherType,
+            AgainstVoucherId = againstVoucherId,
+            IsAdvance = isAdvance,
+        };
+        _lines.Add(line);
+
+        RecalculateTotals();
+    }
+
+    /// <summary>
+    /// Merges lines with identical account, debit/credit direction, party, currency, and dimensions
+    /// when AccountsSettings.MergeSimilarAccountHeads is enabled (per ERPNext PR #51453 / commit 59f5ee7b63).
+    /// </summary>
+    public void MergeSimilarLines()
+    {
+        if (Status != DocumentStatus.Draft || _lines.Count <= 1)
+            return;
+
+        var merged = new List<JournalEntryLine>();
+        foreach (var group in _lines.GroupBy(l => new
+        {
+            l.AccountId,
+            l.IsDebit,
+            l.PartyType,
+            l.PartyId,
+            l.CostCenterId,
+            l.ProjectId,
+            l.AccountCurrency,
+            l.ExchangeRate,
+            l.FinanceBook,
+            l.AgainstVoucherType,
+            l.AgainstVoucherId,
+            l.IsAdvance
+        }))
+        {
+            var first = group.First();
+            if (group.Count() == 1)
+            {
+                merged.Add(first);
+            }
+            else
+            {
+                var totalAmount = group.Sum(x => x.Amount);
+                var totalAmountInAccountCurrency = group.Sum(x => x.AmountInAccountCurrency);
+                var combinedLine = new JournalEntryLine(
+                    first.Id, Id, first.AccountId, totalAmount, first.IsDebit, first.Description)
+                {
+                    PartyType = first.PartyType,
+                    PartyId = first.PartyId,
+                    CostCenterId = first.CostCenterId,
+                    ProjectId = first.ProjectId,
+                    AccountCurrency = first.AccountCurrency,
+                    AmountInAccountCurrency = totalAmountInAccountCurrency,
+                    ExchangeRate = first.ExchangeRate,
+                    FinanceBook = first.FinanceBook,
+                    AgainstVoucherType = first.AgainstVoucherType,
+                    AgainstVoucherId = first.AgainstVoucherId,
+                    IsAdvance = first.IsAdvance
+                };
+                merged.Add(combinedLine);
+            }
+        }
+
+        _lines.Clear();
+        _lines.AddRange(merged);
+        RecalculateTotals();
+    }
+
+    /// <summary>
+    /// Validates that Total Debit = Total Credit (double-entry requirement).
+    /// </summary>
+    public void Validate()
+    {
+        if (!_lines.Any())
+            throw new BusinessException(MyERPDomainErrorCodes.UnbalancedJournalEntry);
+
+        RecalculateTotals();
+
+        if (TotalDebit != TotalCredit)
+            throw new BusinessException(MyERPDomainErrorCodes.UnbalancedJournalEntry)
+                .WithData("totalDebit", TotalDebit)
+                .WithData("totalCredit", TotalCredit);
+    }
+
+    public void Post()
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        Validate();
+        ValidateVoucherTypeRules();
+        Status = DocumentStatus.Posted;
+        AddLocalEvent(new JournalEntryPostedEvent(this));
+    }
+
+    /// <summary>
+    /// Validates voucher type-specific rules per ERPNext journal_entry.py.
+    /// Per gotcha #2614: JE has 18 voucher types with distinct validation paths.
+    /// </summary>
+    private void ValidateVoucherTypeRules()
+    {
+        switch (VoucherType)
+        {
+            case JournalEntryVoucherType.OpeningEntry:
+                // Per ERPNext: opening entries auto-force is_opening on all lines
+                IsOpening = true;
+                break;
+
+            case JournalEntryVoucherType.Reversal:
+                // Per ERPNext: reversal JEs MUST reference the original
+                if (!ReversalOfId.HasValue)
+                    throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                        .WithData("detail", "Reversal JE must reference the original journal entry.");
+                break;
+
+            case JournalEntryVoucherType.CreditNote:
+            case JournalEntryVoucherType.DebitNote:
+                // Per ERPNext: Credit/Debit Note JE must reference an invoice or document
+                if (!ReferenceId.HasValue && string.IsNullOrWhiteSpace(ReferenceNumber))
+                    throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                        .WithData("detail", $"{VoucherType} must reference an invoice or document.");
+                break;
+
+            case JournalEntryVoucherType.DepreciationEntry:
+                // Per ERPNext: depreciation entries skip certain validations
+                // (party mandatory check, reference duplication check)
+                break;
+
+            case JournalEntryVoucherType.ExchangeGainOrLoss:
+                // Per gotcha #591: Exchange GL allows same-row DR+CR with multi_currency
+                // No additional validation needed — standard balance check suffices
+                break;
+
+            case JournalEntryVoucherType.PeriodClosing:
+                // Per gotcha #317: closing account must be Liability or Equity
+                // Validated externally by PeriodClosingPostingService
+                break;
+        }
+    }
+
+    public void Cancel()
+    {
+        if (Status != DocumentStatus.Posted)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        Status = DocumentStatus.Cancelled;
+        AddLocalEvent(new JournalEntryCancelledEvent(this));
+    }
+
+    /// <summary>
+    /// Sets or clears the bank clearance date. Pass null to un-clear (reversible).
+    /// Per ERPNext bank_clearance.py: clearance_date must not precede PostingDate.
+    /// Opening entries (IsOpening) are excluded from clearance per ERPNext bank_clearance.py.
+    /// </summary>
+    public void SetClearanceDate(DateTime? clearanceDate)
+    {
+        if (IsOpening)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("detail", "Opening journal entries cannot be bank-cleared.");
+
+        if (clearanceDate.HasValue && clearanceDate.Value.Date < PostingDate.Date)
+            throw new BusinessException(MyERPDomainErrorCodes.ClearanceDateBeforePostingDate)
+                .WithData("clearanceDate", clearanceDate.Value)
+                .WithData("postingDate", PostingDate);
+
+        ClearanceDate = clearanceDate;
+    }
+
+    private void RecalculateTotals()
+    {
+        TotalDebit = Math.Round(_lines.Where(l => l.IsDebit).Sum(l => l.Amount), 2);
+        TotalCredit = Math.Round(_lines.Where(l => !l.IsDebit).Sum(l => l.Amount), 2);
+    }
+}
+
+// Domain Events
+public record JournalEntryPostedEvent(JournalEntry JournalEntry);
+public record JournalEntryCancelledEvent(JournalEntry JournalEntry);

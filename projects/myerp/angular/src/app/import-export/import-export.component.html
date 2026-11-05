@@ -1,0 +1,102 @@
+<abp-page [title]="'::ImportExport' | abpLocalization">
+  <div class="row g-4">
+    <!-- Import Card -->
+    <div class="col-12 col-md-6">
+      <div class="card">
+        <div class="card-header">
+          <h5 class="card-title mb-0">
+            <i class="fa fa-upload align-middle me-1"></i>
+            {{ '::ImportData' | abpLocalization }}
+          </h5>
+        </div>
+        <div class="card-body pt-3">
+          <form [formGroup]="importForm" (ngSubmit)="startImport()">
+            <label class="form-label">{{ '::EntityType' | abpLocalization }}</label>
+            <select class="form-select"></select>
+
+            <div class="mb-3">
+              <input type="file" accept=".csv,.xlsx" (change)="onFileSelected($event)" class="d-none" #fileInput />
+              <button class="btn btn-outline-secondary" type="button" (click)="fileInput.click()">
+                <i class="fa fa-paperclip"></i> Choose File
+              </button>
+              @if (selectedFileName) {
+                <span class="ms-2 small text-muted">{{ selectedFileName }}</span>
+              }
+            </div>
+
+            @if (isImporting()) {
+              <div class="progress mb-3"><div class="progress-bar progress-bar-striped progress-bar-animated w-100"></div></div>
+            }
+
+            <button class="btn btn-primary" type="submit"
+              [disabled]="importForm.invalid || isImporting()">
+              <i class="fa fa-cloud-arrow-up"></i> {{ '::StartImport' | abpLocalization }}
+            </button>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <!-- Export Card -->
+    <div class="col-12 col-md-6">
+      <div class="card">
+        <div class="card-header">
+          <h5 class="card-title mb-0">
+            <i class="fa fa-download align-middle me-1"></i>
+            {{ '::ExportData' | abpLocalization }}
+          </h5>
+        </div>
+        <div class="card-body pt-3">
+          <label class="form-label">{{ '::EntityType' | abpLocalization }}</label>
+            <select class="form-select"></select>
+
+          @if (isExporting()) {
+            <div class="progress mb-3"><div class="progress-bar progress-bar-striped progress-bar-animated w-100"></div></div>
+          }
+
+          <button class="btn btn-success" (click)="exportData()" [disabled]="isExporting()">
+            <i class="fa fa-download"></i> {{ '::ExportCSV' | abpLocalization }}
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Import History -->
+  @if (importHistory().length > 0) {
+    <div class="card mt-4">
+      <div class="card-header"><h5 class="card-title mb-0">{{ '::ImportHistory' | abpLocalization }}</h5></div>
+      <div class="card-body">
+        <div class="table-responsive">
+                    <table class="table table-hover w-100">
+            <thead>
+              <tr>
+                <th>{{ '::FileName' | abpLocalization }}</th>
+                <th>{{ '::EntityType' | abpLocalization }}</th>
+                <th>{{ '::Status' | abpLocalization }}</th>
+                <th>{{ '::Results' | abpLocalization }}</th>
+                <th>{{ '::CreatedDate' | abpLocalization }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (row of importHistory(); track row.id ?? $index) {
+                <tr>
+                  <td>{{ row.fileName }}</td>
+                  <td>{{ row.entityType }}</td>
+                  <td><span class="badge" [class]="getStatusColor(row.status!)">{{ getStatusLabel(row.status!) }}</span></td>
+                  <td>
+                    {{ row.successCount }}/{{ row.totalRows }} rows
+                    @if ((row.failureCount ?? 0) > 0) {
+                    <span class="text-danger ms-1">({{ row.failureCount }} failed)</span>
+                    }
+                  </td>
+                  <td>{{ row.creationTime | date:'short' }}</td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  }
+</abp-page>

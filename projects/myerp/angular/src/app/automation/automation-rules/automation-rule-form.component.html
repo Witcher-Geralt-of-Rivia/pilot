@@ -1,0 +1,59 @@
+<abp-page [title]="'::NewAutomationRule' | abpLocalization">
+  <div class="card">
+    <div class="card-body">
+      <form [formGroup]="form" (ngSubmit)="save()" class="row g-3">
+        <div class="col-12">
+          <label class="form-label">{{ '::Name' | abpLocalization }}</label>
+            <input class="form-control"/>
+        </div>
+
+        <div class="col-12">
+          <label class="form-label">{{ '::Description' | abpLocalization }}</label>
+            <textarea class="form-control"></textarea>
+        </div>
+
+        <div class="col-12 col-md-6">
+          <label class="form-label">{{ '::Trigger' | abpLocalization }}</label>
+            <select class="form-select"></select>
+        </div>
+
+        <div class="col-12 col-md-6">
+          <label class="form-label">{{ '::DocumentType' | abpLocalization }}</label>
+            <select class="form-select"></select>
+        </div>
+
+        <div class="col-12">
+          <label class="form-label">Condition (e.g., "GrandTotal > 5000")</label>
+            <input class="form-control"/>
+        </div>
+
+        <div class="col-12 col-md-6">
+          <label class="form-label">{{ '::Action' | abpLocalization }}</label>
+            <select class="form-select"></select>
+        </div>
+
+        <div class="col-12 col-md-6">
+          <label class="form-label">{{ '::Priority' | abpLocalization }}</label>
+            <input class="form-control"/>
+        </div>
+
+        <div class="col-12">
+          <label class="form-label">Action Config (JSON)</label>
+            <textarea class="form-control"></textarea>
+        </div>
+
+        <div class="col-12">
+          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" formControlName="isActive" id="isActive" /><label class="form-check-label" for="isActive">{{ '::Active' | abpLocalization }}</label></div>
+        </div>
+
+        <div class="col-12 d-flex gap-2 justify-content-end pt-3">
+          <button class="btn btn-outline-secondary" type="button" routerLink="/automation"><i class="fa fa-times me-1"></i>{{ '::Cancel' | abpLocalization }}
+          </button>
+          <button class="btn btn-primary" type="submit">
+            <i class="fa fa-save"></i> {{ '::Save' | abpLocalization }}
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+</abp-page>

@@ -1,0 +1,740 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Core.DomainServices;
+using MyERP.Inventory.Entities;
+using MyERP.Permissions;
+using MyERP.Sales.DomainServices;
+using MyERP.Sales.Entities;
+using MyERP.Shared;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+
+namespace MyERP.Sales;
+
+[Authorize(MyERPPermissions.Quotations.Default)]
+public class QuotationAppService : ApplicationService, IQuotationAppService
+{
+    private readonly IRepository<Quotation, Guid> _repository;
+    private readonly IRepository<Customer, Guid> _customerRepository;
+    private readonly IRepository<MyERP.CRM.Entities.CompetitorDetail, Guid> _competitorDetailRepository;
+    private readonly IRepository<QuotationLostReasonDetail, Guid> _lostReasonDetailRepository;
+    private readonly IRepository<QuotationLostReason, Guid> _lostReasonRepository;
+    private readonly IDocumentNumberGenerator _numberGenerator;
+    private readonly PricingRuleApplicationService _pricingRuleService;
+
+    public QuotationAppService(
+        IRepository<Quotation, Guid> repository,
+        IRepository<Customer, Guid> customerRepository,
+        IRepository<MyERP.CRM.Entities.CompetitorDetail, Guid> competitorDetailRepository,
+        IRepository<QuotationLostReasonDetail, Guid> lostReasonDetailRepository,
+        IRepository<QuotationLostReason, Guid> lostReasonRepository,
+        IDocumentNumberGenerator numberGenerator,
+        PricingRuleApplicationService pricingRuleService)
+    {
+        _repository = repository;
+        _customerRepository = customerRepository;
+        _competitorDetailRepository = competitorDetailRepository;
+        _lostReasonDetailRepository = lostReasonDetailRepository;
+        _lostReasonRepository = lostReasonRepository;
+        _numberGenerator = numberGenerator;
+        _pricingRuleService = pricingRuleService;
+    }
+
+    /// <summary>
+    /// Applies matching pricing rules to a quotation's items in-place, mirroring
+    /// SalesOrderAppService/SalesInvoiceAppService — Quotation was the only Selling
+    /// document missing this, so its rates never picked up auto-discounts a Sales Order
+    /// created from the same items would have applied.
+    /// </summary>
+    private async Task ApplyPricingRulesAsync(Quotation quotation)
+    {
+        var pricingContexts = quotation.Items.Select(i => new PricingRuleContext
+        {
+            ItemId = i.ItemId,
+            ItemName = i.Description,
+            Qty = i.Quantity,
+            Rate = i.UnitPrice,
+        }).ToList();
+
+        if (!pricingContexts.Any()) return;
+
+        await _pricingRuleService.ApplyToItemsAsync(
+            pricingContexts, quotation.IssueDate, "Selling",
+            quotation.CustomerId, quotation.CompanyId);
+
+        for (int idx = 0; idx < quotation.Items.Count; idx++)
+        {
+            var ctx = pricingContexts[idx];
+            if (ctx.DiscountedRate > 0 && ctx.DiscountedRate != ctx.Rate)
+            {
+                quotation.Items[idx].UnitPrice = ctx.DiscountedRate;
+            }
+        }
+    }
+
+    private async Task<string?> ResolveCustomerNameAsync(Guid customerId)
+    {
+        var customer = await _customerRepository.FindAsync(customerId);
+        return customer?.Name;
+    }
+
+    public async Task<QuotationDto> GetAsync(Guid id)
+    {
+        var quotation = await _repository.GetAsync(id);
+        var dto = ObjectMapper.Map<Quotation, QuotationDto>(quotation);
+        dto.CustomerName = await ResolveCustomerNameAsync(quotation.CustomerId);
+        dto.OrderLostReason = quotation.OrderLostReason;
+        dto.Competitors = (await _competitorDetailRepository.GetListAsync(
+                c => c.ParentType == "Quotation" && c.ParentId == id))
+            .Select(c => new MyERP.CRM.CompetitorDetailDto
+            {
+                Id = c.Id,
+                ParentType = c.ParentType,
+                ParentId = c.ParentId,
+                CompetitorId = c.CompetitorId,
+            }).ToList();
+
+        var lostDetails = await _lostReasonDetailRepository.GetListAsync(d => d.QuotationId == id);
+        var reasonIds = lostDetails.Select(d => d.QuotationLostReasonId).Distinct().ToList();
+        var reasonDict = (await _lostReasonRepository.GetListAsync(r => reasonIds.Contains(r.Id)))
+            .ToDictionary(r => r.Id, r => r.Reason);
+
+        dto.LostReasons = lostDetails.Select(d => new QuotationLostReasonDetailDto
+        {
+            Id = d.Id,
+            QuotationId = d.QuotationId,
+            QuotationLostReasonId = d.QuotationLostReasonId,
+            Reason = reasonDict.GetValueOrDefault(d.QuotationLostReasonId)
+        }).ToList();
+
+        return dto;
+    }
+
+    // --- Competitors ---
+
+    [Authorize(MyERPPermissions.Quotations.Edit)]
+    public async Task<MyERP.CRM.CompetitorDetailDto> CreateCompetitorAsync(MyERP.CRM.AddCompetitorDetailDto input)
+    {
+        var exists = await _competitorDetailRepository.AnyAsync(
+            c => c.ParentType == input.ParentType && c.ParentId == input.ParentId && c.CompetitorId == input.CompetitorId);
+        if (exists)
+            throw new BusinessException(MyERPDomainErrorCodes.DuplicateRecord)
+                .WithData("entity", "Competitor Detail");
+
+        var detail = new MyERP.CRM.Entities.CompetitorDetail(GuidGenerator.Create(), input.ParentType, input.ParentId, input.CompetitorId, CurrentTenant.Id);
+        await _competitorDetailRepository.InsertAsync(detail);
+
+        return new MyERP.CRM.CompetitorDetailDto
+        {
+            Id = detail.Id,
+            ParentType = detail.ParentType,
+            ParentId = detail.ParentId,
+            CompetitorId = detail.CompetitorId,
+        };
+    }
+
+    [Authorize(MyERPPermissions.Quotations.Edit)]
+    public async Task DeleteCompetitorAsync(Guid competitorDetailId)
+    {
+        await _competitorDetailRepository.DeleteAsync(competitorDetailId);
+    }
+
+    // --- Lost Reasons ---
+
+    [Authorize(MyERPPermissions.Quotations.Edit)]
+    public async Task<QuotationLostReasonDetailDto> CreateLostReasonAsync(AddQuotationLostReasonDetailDto input)
+    {
+        var exists = await _lostReasonDetailRepository.AnyAsync(
+            d => d.QuotationId == input.QuotationId && d.QuotationLostReasonId == input.QuotationLostReasonId);
+        if (exists)
+            throw new BusinessException(MyERPDomainErrorCodes.DuplicateRecord)
+                .WithData("entity", "Quotation Lost Reason Detail");
+
+        var detail = new QuotationLostReasonDetail(GuidGenerator.Create(), input.QuotationId, input.QuotationLostReasonId, CurrentTenant.Id);
+        await _lostReasonDetailRepository.InsertAsync(detail);
+
+        var reason = await _lostReasonRepository.FindAsync(detail.QuotationLostReasonId);
+
+        return new QuotationLostReasonDetailDto
+        {
+            Id = detail.Id,
+            QuotationId = detail.QuotationId,
+            QuotationLostReasonId = detail.QuotationLostReasonId,
+            Reason = reason?.Reason
+        };
+    }
+
+    [Authorize(MyERPPermissions.Quotations.Edit)]
+    public async Task DeleteLostReasonAsync(Guid quotationLostReasonDetailId)
+    {
+        await _lostReasonDetailRepository.DeleteAsync(quotationLostReasonDetailId);
+    }
+
+    public async Task<PagedResultDto<QuotationDto>> GetListAsync(CompanyFilteredPagedRequestDto input)
+    {
+        var query = await _repository.GetQueryableAsync();
+
+        if (input.CompanyId.HasValue)
+            query = query.Where(x => x.CompanyId == input.CompanyId.Value);
+
+        if (!string.IsNullOrWhiteSpace(input.Filter))
+        {
+            var filter = input.Filter; query = query.Where(x => x.QuotationNumber.Contains(filter));
+        }
+
+        if (!string.IsNullOrWhiteSpace(input.Status) && Enum.TryParse<Core.DocumentStatus>(input.Status, true, out var status))
+            query = query.Where(x => x.Status == status);
+
+        if (input.FromDate.HasValue)
+            query = query.Where(x => x.IssueDate >= input.FromDate.Value);
+
+        if (input.ToDate.HasValue)
+            query = query.Where(x => x.IssueDate <= input.ToDate.Value);
+
+        var totalCount = query.Count();
+        var sorted = SortingHelper.ApplySorting(query, input.Sorting,
+            q => q.OrderByDescending(x => x.IssueDate),
+            ("quotationNumber", x => (object)(x.QuotationNumber ?? string.Empty)),
+            ("issueDate", x => x.IssueDate),
+            ("grandTotal", x => x.GrandTotal),
+            ("status", x => x.Status));
+        var quotations = sorted
+            .Skip(input.SkipCount)
+            .Take(input.MaxResultCount)
+            .ToList();
+
+        var customerIds = quotations.Select(q => q.CustomerId).Distinct().ToArray();
+        var customers = (await _customerRepository.GetQueryableAsync())
+            .Where(c => customerIds.Contains(c.Id))
+            .Select(c => new { c.Id, c.Name })
+            .ToDictionary(c => c.Id, c => c.Name);
+
+        var dtos = new List<QuotationDto>();
+        foreach (var q in quotations)
+        {
+            var dto = ObjectMapper.Map<Quotation, QuotationDto>(q);
+            dto.CustomerName = customers.GetValueOrDefault(q.CustomerId);
+            dtos.Add(dto);
+        }
+
+        return new PagedResultDto<QuotationDto>(totalCount, dtos);
+    }
+
+    [Authorize(MyERPPermissions.Quotations.Create)]
+    public async Task<QuotationDto> CreateAsync(CreateQuotationDto input)
+    {
+        // Per ERPNext PR #59915 / commit 3d94050ade: default ValidUntil from CRM Settings if not set
+        if (!input.ValidUntil.HasValue)
+        {
+            var crmSettingsRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<CRM.Entities.CrmSettings, Guid>>();
+            var crmSettings = (await crmSettingsRepo.GetQueryableAsync()).FirstOrDefault();
+            var validityDays = crmSettings?.DefaultQuotationValidityDays ?? 0;
+            if (validityDays <= 0)
+            {
+                var settingProvider = LazyServiceProvider.LazyGetRequiredService<Volo.Abp.Settings.ISettingProvider>();
+                var settingStr = await settingProvider.GetOrNullAsync(Settings.MyERPSettings.CRM.DefaultValidTill);
+                if (int.TryParse(settingStr, out var days) && days > 0)
+                {
+                    validityDays = days;
+                }
+            }
+
+            if (validityDays > 0)
+            {
+                input.ValidUntil = input.IssueDate.AddDays(validityDays);
+            }
+        }
+
+        // Per gotcha #2145: ValidUntil cannot precede IssueDate
+        if (input.ValidUntil.HasValue && input.ValidUntil.Value.Date < input.IssueDate.Date)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Valid Until date cannot be earlier than Issue Date.");
+        }
+
+        // ERPNext validate_party_frozen_disabled (quotations to a Customer party)
+        var partyCustomer = await LazyServiceProvider.LazyGetRequiredService<IRepository<Customer, Guid>>().FindAsync(input.CustomerId);
+        if (partyCustomer != null)
+            await LazyServiceProvider.LazyGetRequiredService<PartyValidationService>()
+                .ValidatePartyForTransactionAsync("Customer", isDisabled: !partyCustomer.IsActive, isFrozen: partyCustomer.IsFrozen, partyCustomer.Name, input.CompanyId);
+
+        var quotationNumber = await _numberGenerator.GenerateAsync("Quotation", input.CompanyId);
+
+        var quotation = new Quotation(
+            GuidGenerator.Create(),
+            input.CompanyId,
+            input.CustomerId,
+            quotationNumber,
+            input.IssueDate);
+
+        if (input.OpportunityId.HasValue)
+        {
+            var oppRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<CRM.Entities.Opportunity, Guid>>();
+            var opp = await oppRepo.FindAsync(input.OpportunityId.Value);
+            if (opp != null && opp.CompanyId != input.CompanyId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("opportunityCompany", opp.CompanyId)
+                    .WithData("quotationCompany", input.CompanyId);
+            }
+            if (opp != null && opp.CustomerId.HasValue && opp.CustomerId.Value != input.CustomerId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CannotChangeCustomerForQuotationFromOpportunity)
+                    .WithData("opportunity", opp.OpportunityNumber);
+            }
+
+            // Per ERPNext PR #60227 / commit 2e7807e09c: refuse quotations for disabled leads
+            if (opp != null && opp.LeadId.HasValue)
+            {
+                var leadRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<CRM.Entities.Lead, Guid>>();
+                var lead = await leadRepo.FindAsync(opp.LeadId.Value);
+                if (lead != null && lead.Disabled)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.LeadIsDisabled)
+                        .WithData("0", lead.LeadNumber)
+                        .WithData("1", "Quotation");
+                }
+            }
+
+            quotation.OpportunityId = input.OpportunityId.Value;
+
+            // Per ERPNext: raising a Quotation against an Opportunity moves its stage to
+            // Quotation. Opportunity.MarkQuotation() only allows the Open/Replied -> Quotation
+            // transition — guard on that instead of letting the exception surface, since this is
+            // a courtesy status sync, not a precondition for creating the quotation itself (an
+            // opportunity can legitimately get more than one quotation after the first already
+            // advanced its stage).
+            if (opp != null && opp.Status is CRM.OpportunityStatus.Open or CRM.OpportunityStatus.Replied)
+            {
+                opp.MarkQuotation();
+                await oppRepo.UpdateAsync(opp);
+            }
+        }
+
+        quotation.ValidUntil = input.ValidUntil;
+        quotation.CurrencyCode = input.CurrencyCode;
+        var termsResolution = LazyServiceProvider.LazyGetRequiredService<MyERP.Core.DomainServices.TermsResolutionService>();
+        var (sellingTermsId, sellingTerms) = await termsResolution.ResolveSellingTermsAsync(
+            quotation.Status, quotation.CompanyId, input.TermsAndConditionsId, input.Terms);
+        quotation.TermsAndConditionsId = sellingTermsId;
+        quotation.Terms = sellingTerms;
+        quotation.Notes = input.Notes;
+
+        // Per ERPNext: Price List defaults from the customer's own default when not given explicitly, if active (commit fd492100b0).
+        quotation.PriceListId = input.PriceListId;
+        if (!quotation.PriceListId.HasValue)
+        {
+            var customer = await _customerRepository.FindAsync(input.CustomerId);
+            if (customer?.DefaultPriceListId.HasValue == true)
+            {
+                var plRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PriceList, Guid>>();
+                var pl = await plRepo.FindAsync(customer.DefaultPriceListId.Value);
+                if (pl != null && pl.IsActive)
+                {
+                    quotation.PriceListId = pl.Id;
+                }
+            }
+        }
+
+        var transactionValidation = LazyServiceProvider.LazyGetRequiredService<TransactionValidationService>();
+        await transactionValidation.ValidatePriceListAsync(quotation.PriceListId);
+
+        // Validate all items are active (per DO-NOT: disabled items must not appear in transactions)
+        var itemValidation = LazyServiceProvider.LazyGetRequiredService<MyERP.Inventory.DomainServices.ItemTransactionValidationService>();
+        var itemIds = input.Items.Select(i => i.ItemId).ToArray();
+        await itemValidation.ValidateItemsForTransactionAsync(itemIds);
+
+        // Company-restriction check: every other Selling document (SalesOrder, SalesInvoice,
+        // DeliveryNote) wires this in; Quotation didn't, and since ConvertQuotationToSalesOrderAsync
+        // builds the SalesOrder directly rather than going through SalesOrderAppService.CreateAsync,
+        // an unchecked Quotation would carry a cross-company Customer/Item all the way through to a
+        // submitted Sales Order with no check ever firing.
+        var companyRestriction = LazyServiceProvider.LazyGetRequiredService<CompanyRestrictionValidationService>();
+        await companyRestriction.ValidateTransactionCompanyAsync(
+            "Quotation", input.CompanyId, itemIds: itemIds, customerIds: new[] { input.CustomerId });
+
+        foreach (var item in input.Items)
+        {
+            quotation.AddItem(item.ItemId, item.Description, item.Quantity, item.UnitPrice, item.TaxAmount, item.Uom, item.IsAlternative);
+        }
+
+        await ApplyPricingRulesAsync(quotation);
+
+        await _repository.InsertAsync(quotation, autoSave: true);
+        var createDto = ObjectMapper.Map<Quotation, QuotationDto>(quotation);
+        createDto.CustomerName = await ResolveCustomerNameAsync(quotation.CustomerId);
+        return createDto;
+    }
+
+    [Authorize(MyERPPermissions.Quotations.Edit)]
+    public async Task<QuotationDto> UpdateAsync(Guid id, CreateQuotationDto input)
+    {
+        var quotation = await _repository.GetAsync(id);
+        if (quotation.Status != Core.DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        if (input.CompanyId != Guid.Empty && input.CompanyId != quotation.CompanyId)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                .WithData("entityCompany", quotation.CompanyId)
+                .WithData("inputCompany", input.CompanyId);
+        }
+
+        var effectiveCustomerId = input.CustomerId != Guid.Empty ? input.CustomerId : quotation.CustomerId;
+        if (effectiveCustomerId != quotation.CustomerId)
+        {
+            var customerRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Customer, Guid>>();
+            var customer = await customerRepo.FindAsync(effectiveCustomerId);
+            if (customer != null && customer.CompanyId != quotation.CompanyId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("customerCompany", customer.CompanyId)
+                    .WithData("quotationCompany", quotation.CompanyId);
+            }
+        }
+
+        // Per ERPNext commit dc4819e897: restrict customer change if creating from opportunity
+        if (quotation.OpportunityId.HasValue && effectiveCustomerId != quotation.CustomerId)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.CannotChangeCustomerForQuotationFromOpportunity)
+                .WithData("reason", "Customer cannot be changed when Quotation is created from an Opportunity.");
+        }
+
+        // Per gotcha #2145: ValidUntil cannot precede IssueDate
+        if (input.ValidUntil.HasValue && input.ValidUntil.Value.Date < quotation.IssueDate.Date)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Valid Until date cannot be earlier than Issue Date.");
+        }
+
+        // Validate all items are active (per DO-NOT: disabled items must not appear in transactions)
+        var itemValidation = LazyServiceProvider.LazyGetRequiredService<MyERP.Inventory.DomainServices.ItemTransactionValidationService>();
+        var itemIds = input.Items.Select(i => i.ItemId).ToArray();
+        await itemValidation.ValidateItemsForTransactionAsync(itemIds);
+
+        // Company-restriction check
+        var companyRestriction = LazyServiceProvider.LazyGetRequiredService<CompanyRestrictionValidationService>();
+        await companyRestriction.ValidateTransactionCompanyAsync(
+            "Quotation", quotation.CompanyId, itemIds: itemIds, customerIds: new[] { effectiveCustomerId });
+
+        quotation.CustomerId = effectiveCustomerId;
+
+        quotation.ValidUntil = input.ValidUntil;
+        quotation.CurrencyCode = input.CurrencyCode;
+        quotation.PriceListId = input.PriceListId;
+        var updateTermsResolution = LazyServiceProvider.LazyGetRequiredService<MyERP.Core.DomainServices.TermsResolutionService>();
+        var (updSellingTermsId, updSellingTerms) = await updateTermsResolution.ResolveSellingTermsAsync(
+            quotation.Status, quotation.CompanyId, input.TermsAndConditionsId, input.Terms);
+        quotation.TermsAndConditionsId = updSellingTermsId;
+        quotation.Terms = updSellingTerms;
+        quotation.Notes = input.Notes;
+
+        var transactionValidation = LazyServiceProvider.LazyGetRequiredService<TransactionValidationService>();
+        await transactionValidation.ValidatePriceListAsync(quotation.PriceListId);
+
+        // Replace items
+        quotation.ClearItems();
+        foreach (var item in input.Items)
+        {
+            quotation.AddItem(item.ItemId, item.Description, item.Quantity, item.UnitPrice, item.TaxAmount, item.Uom, item.IsAlternative);
+        }
+
+        await ApplyPricingRulesAsync(quotation);
+
+        await _repository.UpdateAsync(quotation, autoSave: true);
+        var dto = ObjectMapper.Map<Quotation, QuotationDto>(quotation);
+        dto.CustomerName = await ResolveCustomerNameAsync(quotation.CustomerId);
+        return dto;
+    }
+
+    [Authorize(MyERPPermissions.Quotations.Submit)]
+    public async Task<QuotationDto> SubmitAsync(Guid id)
+    {
+        var quotation = await _repository.GetAsync(id);
+        var transactionValidation = LazyServiceProvider.LazyGetRequiredService<TransactionValidationService>();
+        await transactionValidation.ValidatePriceListAsync(quotation.PriceListId);
+
+        // Per ERPNext PR #59378 (commit 4f1f676b24): Quotation revisions without cancelling
+        var rootId = quotation.RevisionOfId ?? quotation.Id;
+        var queryable = await _repository.GetQueryableAsync();
+        var family = queryable
+            .Where(q => (q.Id == rootId || q.RevisionOfId == rootId) && q.Id != quotation.Id)
+            .ToList();
+
+        if (family.Any(q => q.OrderStatus == "Ordered" || q.ConvertedToSalesOrderId.HasValue || q.Items.Any(i => i.OrderedQty > 0)))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Cannot submit Quotation revision because an existing version is already ordered.");
+        }
+
+        var submittedVersions = family.Where(q => q.Status == Core.DocumentStatus.Submitted).ToList();
+        if (submittedVersions.Any(q => q.IssueDate.Date > quotation.IssueDate.Date))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Quotation revision cannot be dated before the latest version.");
+        }
+
+        quotation.Submit();
+        quotation.Activate();
+
+        // Deactivate all older submitted versions in the family
+        foreach (var other in submittedVersions)
+        {
+            other.Deactivate();
+            await _repository.UpdateAsync(other);
+        }
+
+        await _repository.UpdateAsync(quotation, autoSave: true);
+
+        // Per ERPNext quotation.py on_submit(): update enquiry status
+        if (quotation.OpportunityId.HasValue)
+        {
+            var oppRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<CRM.Entities.Opportunity, Guid>>();
+            var opp = await oppRepo.FindAsync(quotation.OpportunityId.Value);
+            if (opp != null && opp.Status is CRM.OpportunityStatus.Open or CRM.OpportunityStatus.Replied)
+            {
+                opp.MarkQuotation();
+                await oppRepo.UpdateAsync(opp, autoSave: true);
+            }
+        }
+
+        var activityRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<MyERP.Core.Entities.DocumentActivityLog, Guid>>();
+        await activityRepo.InsertAsync(new MyERP.Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "Quotation", quotation.Id, "Submitted",
+            quotation.CompanyId, quotation.QuotationNumber, "Draft", "Submitted",
+            CurrentUser.Id, tenantId: quotation.TenantId));
+
+        var submitDto = ObjectMapper.Map<Quotation, QuotationDto>(quotation);
+        submitDto.CustomerName = await ResolveCustomerNameAsync(quotation.CustomerId);
+        return submitDto;
+    }
+
+    [Authorize(MyERPPermissions.Quotations.Cancel)]
+    public async Task<QuotationDto> CancelAsync(Guid id)
+    {
+        var quotation = await _repository.GetAsync(id);
+        quotation.Cancel();
+        await _repository.UpdateAsync(quotation, autoSave: true);
+
+        // Per ERPNext quotation.py on_cancel(): revert opportunity to Open if no other active quotations exist
+        if (quotation.OpportunityId.HasValue)
+        {
+            var queryable = await _repository.GetQueryableAsync();
+            var hasOtherActiveQuotations = queryable.Any(q =>
+                q.Id != quotation.Id
+                && q.OpportunityId == quotation.OpportunityId
+                && q.Status == Core.DocumentStatus.Submitted);
+
+            if (!hasOtherActiveQuotations)
+            {
+                var oppRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<CRM.Entities.Opportunity, Guid>>();
+                var opp = await oppRepo.FindAsync(quotation.OpportunityId.Value);
+                if (opp != null && opp.Status == CRM.OpportunityStatus.Quotation)
+                {
+                    opp.Reopen();
+                    await oppRepo.UpdateAsync(opp, autoSave: true);
+                }
+            }
+        }
+
+        var activityRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<MyERP.Core.Entities.DocumentActivityLog, Guid>>();
+        await activityRepo.InsertAsync(new MyERP.Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "Quotation", quotation.Id, "Cancelled",
+            quotation.CompanyId, quotation.QuotationNumber, "Submitted", "Cancelled",
+            CurrentUser.Id, tenantId: quotation.TenantId));
+
+        var cancelDto = ObjectMapper.Map<Quotation, QuotationDto>(quotation);
+        cancelDto.CustomerName = await ResolveCustomerNameAsync(quotation.CustomerId);
+        return cancelDto;
+    }
+
+    [Authorize(MyERPPermissions.Quotations.Edit)]
+    public async Task<QuotationDto> MarkLostAsync(Guid id, MarkQuotationLostDto? input = null)
+    {
+        var quotation = await _repository.GetAsync(id);
+
+        // Per ERPNext PR #61828 (commit 03771aebd8): require at least one lost reason before declaring lost
+        if (input == null || input.LostReasonIds == null || !input.LostReasonIds.Any())
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Please select at least one Lost Reason.");
+        }
+
+        // Per ERPNext PR #61828 (commit 03771aebd8): check if this quotation itself is ordered
+        if (quotation.OrderStatus == "Ordered" || quotation.ConvertedToSalesOrderId.HasValue || quotation.Items.Any(i => i.OrderedQty > 0))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Cannot set as Lost as Sales Order is made.");
+        }
+
+        // Per ERPNext PR #59378: check if any version in the family is ordered
+        var rootId = quotation.RevisionOfId ?? quotation.Id;
+        var queryable = await _repository.GetQueryableAsync();
+        var family = queryable
+            .Where(q => (q.Id == rootId || q.RevisionOfId == rootId) && q.Id != quotation.Id)
+            .ToList();
+
+        if (family.Any(q => q.OrderStatus == "Ordered" || q.ConvertedToSalesOrderId.HasValue || q.Items.Any(i => i.OrderedQty > 0)))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Cannot set as Lost as a version of this Quotation is ordered.");
+        }
+
+        quotation.MarkLost(input?.DetailedReason);
+        await _repository.UpdateAsync(quotation, autoSave: true);
+
+        if (input?.LostReasonIds != null && input.LostReasonIds.Any())
+        {
+            foreach (var reasonId in input.LostReasonIds.Distinct())
+            {
+                var exists = await _lostReasonDetailRepository.AnyAsync(d => d.QuotationId == quotation.Id && d.QuotationLostReasonId == reasonId);
+                if (!exists)
+                {
+                    await _lostReasonDetailRepository.InsertAsync(new QuotationLostReasonDetail(GuidGenerator.Create(), quotation.Id, reasonId, CurrentTenant.Id));
+                }
+            }
+        }
+
+        if (input?.CompetitorIds != null && input.CompetitorIds.Any())
+        {
+            foreach (var compId in input.CompetitorIds.Distinct())
+            {
+                var exists = await _competitorDetailRepository.AnyAsync(c => c.ParentType == "Quotation" && c.ParentId == quotation.Id && c.CompetitorId == compId);
+                if (!exists)
+                {
+                    await _competitorDetailRepository.InsertAsync(new CRM.Entities.CompetitorDetail(GuidGenerator.Create(), "Quotation", quotation.Id, compId, CurrentTenant.Id));
+                }
+            }
+        }
+
+        // Also mark other submitted versions in the family as Lost
+        foreach (var other in family.Where(q => q.Status == Core.DocumentStatus.Submitted))
+        {
+            other.MarkLost(input?.DetailedReason);
+            await _repository.UpdateAsync(other);
+        }
+
+        // Per ERPNext quotation.py declare_enquiry_lost(): mark opportunity Lost if no other active quotations exist
+        if (quotation.OpportunityId.HasValue)
+        {
+            var hasOtherActiveQuotations = queryable.Any(q =>
+                q.Id != quotation.Id
+                && q.OpportunityId == quotation.OpportunityId
+                && q.Status == Core.DocumentStatus.Submitted);
+
+            if (!hasOtherActiveQuotations)
+            {
+                var oppRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<CRM.Entities.Opportunity, Guid>>();
+                var opp = await oppRepo.FindAsync(quotation.OpportunityId.Value);
+                if (opp != null && opp.Status != CRM.OpportunityStatus.Converted)
+                {
+                    opp.DeclareLost("Quotation marked as Lost");
+                    await oppRepo.UpdateAsync(opp, autoSave: true);
+                }
+            }
+        }
+
+        return await GetAsync(quotation.Id);
+    }
+
+    /// <summary>
+    /// Creates a new revision / version of a submitted quotation without cancelling it.
+    /// Per ERPNext PR #59378 / commit 4f1f676b24.
+    /// </summary>
+    [Authorize(MyERPPermissions.Quotations.Create)]
+    public async Task<QuotationDto> CreateRevisionAsync(Guid id)
+    {
+        var original = await _repository.GetAsync(id, includeDetails: true);
+        if (original.Status != Core.DocumentStatus.Submitted)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Only submitted quotations can be revised.");
+        }
+
+        var rootId = original.RevisionOfId ?? original.Id;
+        var queryable = await _repository.GetQueryableAsync();
+        var family = queryable
+            .Where(q => q.Id == rootId || q.RevisionOfId == rootId)
+            .ToList();
+
+        if (family.Any(q => q.OrderStatus == "Ordered" || q.ConvertedToSalesOrderId.HasValue || q.Items.Any(i => i.OrderedQty > 0)))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Cannot revise Quotation because an existing version is already ordered.");
+        }
+
+        var root = family.FirstOrDefault(q => !q.RevisionOfId.HasValue) ?? original;
+        var maxIndex = family.Max(q => q.RevisionIndex);
+        var newRevisionIndex = maxIndex + 1;
+        var newNumber = $"{root.QuotationNumber}-R{newRevisionIndex}";
+
+        var revision = new Quotation(
+            GuidGenerator.Create(),
+            original.CompanyId,
+            original.CustomerId,
+            newNumber,
+            DateTime.UtcNow.Date,
+            CurrentTenant.Id);
+
+        revision.RevisionOfId = root.Id;
+        revision.RevisionIndex = newRevisionIndex;
+        revision.IsActive = false; // becomes active upon Submit
+        revision.OpportunityId = original.OpportunityId;
+        revision.PriceListId = original.PriceListId;
+        revision.CurrencyCode = original.CurrencyCode;
+        revision.ValidUntil = DateTime.UtcNow.Date.AddDays(30);
+        revision.Terms = original.Terms;
+        revision.TermsAndConditionsId = original.TermsAndConditionsId;
+        revision.Notes = original.Notes;
+
+        foreach (var item in original.Items)
+        {
+            revision.AddItem(item.ItemId, item.Description, item.Quantity, item.UnitPrice, item.TaxAmount, item.Uom, item.IsAlternative);
+        }
+
+        await _repository.InsertAsync(revision, autoSave: true);
+        var revisionDto = ObjectMapper.Map<Quotation, QuotationDto>(revision);
+        revisionDto.CustomerName = await ResolveCustomerNameAsync(revision.CustomerId);
+        return revisionDto;
+    }
+    /// Amend a cancelled or rejected quotation — creates a new draft copy for revision.
+    /// </summary>
+    [Authorize(MyERPPermissions.Quotations.Create)]
+    public async Task<QuotationDto> AmendAsync(Guid id)
+    {
+        var original = await _repository.GetAsync(id);
+        var amendService = LazyServiceProvider.LazyGetRequiredService<Core.DomainServices.DocumentAmendmentService>();
+
+        amendService.ValidateCanAmend(original.Status);
+        var newNumber = amendService.GenerateAmendedNumber(original.QuotationNumber, original.AmendmentIndex + 1);
+
+        var amended = new Quotation(
+            GuidGenerator.Create(), original.CompanyId, original.CustomerId,
+            newNumber, DateTime.UtcNow.Date);
+
+        amended.AmendedFromId = original.Id;
+        amended.AmendmentIndex = original.AmendmentIndex + 1;
+        amended.CurrencyCode = original.CurrencyCode;
+        amended.PriceListId = original.PriceListId;
+        amended.ValidUntil = DateTime.UtcNow.Date.AddDays(30); // Fresh validity
+        amended.Terms = original.Terms;
+        amended.TermsAndConditionsId = original.TermsAndConditionsId;
+        amended.Notes = original.Notes;
+
+        foreach (var item in original.Items)
+        {
+            amended.AddItem(item.ItemId, item.Description, item.Quantity, item.UnitPrice, item.TaxAmount, item.Uom, item.IsAlternative);
+        }
+
+        await _repository.InsertAsync(amended, autoSave: true);
+        var amendDto = ObjectMapper.Map<Quotation, QuotationDto>(amended);
+        amendDto.CustomerName = await ResolveCustomerNameAsync(amended.CustomerId);
+        return amendDto;
+    }
+}
+

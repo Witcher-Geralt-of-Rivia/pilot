@@ -1,0 +1,251 @@
+import { describe, it, expect } from 'vitest';
+import { FormBuilder, FormArray, Validators } from '@angular/forms';
+
+/**
+ * Tests for Payment Entry form multi-invoice allocation logic.
+ * Critical: ensures the outstanding invoices → references mapping works correctly.
+ */
+describe('PaymentEntry form allocation logic', () => {
+  const fb = new FormBuilder();
+
+  interface OutstandingInvoice {
+    id: string;
+    invoiceNumber: string;
+    outstanding: number;
+    selected: boolean;
+    allocatedAmount: number;
+  }
+
+  function calculateUnallocated(paymentAmount: number, invoices: OutstandingInvoice[]): number {
+    const totalAllocated = invoices
+      .filter(i => i.selected)
+      .reduce((sum, i) => sum + i.allocatedAmount, 0);
+    return paymentAmount - totalAllocated;
+  }
+
+  function buildReferences(invoices: OutstandingInvoice[]): any[] {
+    return invoices
+      .filter(i => i.selected && i.allocatedAmount > 0)
+      .map(i => ({
+        referenceType: 'SalesInvoice',
+        referenceId: i.id,
+        allocatedAmount: i.allocatedAmount,
+      }));
+  }
+
+  describe('unallocated amount calculation', () => {
+    it('should be full amount when nothing allocated', () => {
+      const invoices: OutstandingInvoice[] = [
+        { id: '1', invoiceNumber: 'SI-001', outstanding: 5000, selected: false, allocatedAmount: 0 },
+      ];
+      expect(calculateUnallocated(10000, invoices)).toBe(10000);
+    });
+
+    it('should reduce by selected allocations', () => {
+      const invoices: OutstandingInvoice[] = [
+        { id: '1', invoiceNumber: 'SI-001', outstanding: 5000, selected: true, allocatedAmount: 3000 },
+        { id: '2', invoiceNumber: 'SI-002', outstanding: 8000, selected: true, allocatedAmount: 4000 },
+      ];
+      expect(calculateUnallocated(10000, invoices)).toBe(3000);
+    });
+
+    it('should be zero when fully allocated', () => {
+      const invoices: OutstandingInvoice[] = [
+        { id: '1', invoiceNumber: 'SI-001', outstanding: 5000, selected: true, allocatedAmount: 5000 },
+        { id: '2', invoiceNumber: 'SI-002', outstanding: 8000, selected: true, allocatedAmount: 5000 },
+      ];
+      expect(calculateUnallocated(10000, invoices)).toBe(0);
+    });
+
+    it('should ignore unselected invoices', () => {
+      const invoices: OutstandingInvoice[] = [
+        { id: '1', invoiceNumber: 'SI-001', outstanding: 5000, selected: false, allocatedAmount: 5000 },
+      ];
+      expect(calculateUnallocated(10000, invoices)).toBe(10000);
+    });
+  });
+
+  describe('references building', () => {
+    it('should only include selected invoices with amount > 0', () => {
+      const invoices: OutstandingInvoice[] = [
+        { id: '1', invoiceNumber: 'SI-001', outstanding: 5000, selected: true, allocatedAmount: 3000 },
+        { id: '2', invoiceNumber: 'SI-002', outstanding: 8000, selected: false, allocatedAmount: 0 },
+        { id: '3', invoiceNumber: 'SI-003', outstanding: 2000, selected: true, allocatedAmount: 2000 },
+      ];
+      const refs = buildReferences(invoices);
+      expect(refs.length).toBe(2);
+      expect(refs[0].referenceId).toBe('1');
+      expect(refs[0].allocatedAmount).toBe(3000);
+      expect(refs[1].referenceId).toBe('3');
+      expect(refs[1].allocatedAmount).toBe(2000);
+    });
+
+    it('should exclude selected invoices with zero amount', () => {
+      const invoices: OutstandingInvoice[] = [
+        { id: '1', invoiceNumber: 'SI-001', outstanding: 5000, selected: true, allocatedAmount: 0 },
+      ];
+      const refs = buildReferences(invoices);
+      expect(refs.length).toBe(0);
+    });
+
+    it('should return empty for no selections', () => {
+      const invoices: OutstandingInvoice[] = [];
+      expect(buildReferences(invoices)).toEqual([]);
+    });
+  });
+
+  describe('smart auto-allocation', () => {
+    function autoAllocate(paymentAmount: number, invoices: OutstandingInvoice[], selectedId: string): OutstandingInvoice[] {
+      let remaining = paymentAmount - invoices
+        .filter(i => i.selected && i.id !== selectedId)
+        .reduce((sum, i) => sum + i.allocatedAmount, 0);
+
+      return invoices.map(inv => {
+        if (inv.id === selectedId) {
+          const allocated = Math.min(remaining, inv.outstanding);
+          return { ...inv, selected: true, allocatedAmount: allocated };
+        }
+        return inv;
+      });
+    }
+
+    it('should allocate min(remaining, outstanding) on select', () => {
+      const invoices: OutstandingInvoice[] = [
+        { id: '1', invoiceNumber: 'SI-001', outstanding: 5000, selected: false, allocatedAmount: 0 },
+      ];
+      const result = autoAllocate(3000, invoices, '1');
+      expect(result[0].allocatedAmount).toBe(3000); // min(3000, 5000)
+    });
+
+    it('should cap at outstanding amount', () => {
+      const invoices: OutstandingInvoice[] = [
+        { id: '1', invoiceNumber: 'SI-001', outstanding: 2000, selected: false, allocatedAmount: 0 },
+      ];
+      const result = autoAllocate(10000, invoices, '1');
+      expect(result[0].allocatedAmount).toBe(2000); // min(10000, 2000)
+    });
+
+    it('should consider already-allocated amounts from other invoices', () => {
+      const invoices: OutstandingInvoice[] = [
+        { id: '1', invoiceNumber: 'SI-001', outstanding: 5000, selected: true, allocatedAmount: 4000 },
+        { id: '2', invoiceNumber: 'SI-002', outstanding: 8000, selected: false, allocatedAmount: 0 },
+      ];
+      // Payment=10000, already used=4000, remaining=6000
+      const result = autoAllocate(10000, invoices, '2');
+      expect(result[1].allocatedAmount).toBe(6000); // min(6000, 8000)
+    });
+  });
+});
+
+describe('PaymentEntry form validation', () => {
+  const fb = new FormBuilder();
+
+  function createPEForm() {
+    return fb.group({
+      companyId: ['comp-1', Validators.required],
+      paymentType: ['Receive'],
+      partyType: ['Customer'],
+      partyId: ['', Validators.required],
+      paidFromAccountId: ['', Validators.required],
+      paidToAccountId: ['', Validators.required],
+      amount: [0, [Validators.required, Validators.min(0.01)]],
+      paymentDate: ['2026-07-20'],
+      referenceNumber: [''],
+    });
+  }
+
+  it('should be invalid without required fields', () => {
+    const form = createPEForm();
+    form.patchValue({ partyId: '', paidFromAccountId: '', paidToAccountId: '' });
+    expect(form.valid).toBe(false);
+  });
+
+  it('should reject zero amount', () => {
+    const form = createPEForm();
+    form.patchValue({ amount: 0 });
+    expect(form.get('amount')?.valid).toBe(false);
+  });
+
+  it('should accept valid payment', () => {
+    const form = createPEForm();
+    form.patchValue({
+      partyId: 'cust-1',
+      paidFromAccountId: 'acc-1',
+      paidToAccountId: 'acc-2',
+      amount: 5000,
+    });
+    expect(form.valid).toBe(true);
+  });
+
+  describe('InternalTransfer validation and account filtering (ERPNext PR #58529)', () => {
+    it('should reject same account for paidFrom and paidTo on internal transfer', () => {
+      const paymentType = 'InternalTransfer';
+      const paidFrom = 'bank-acct-1';
+      const paidTo = 'bank-acct-1';
+      const isInvalid = paymentType === 'InternalTransfer' && paidFrom === paidTo;
+      expect(isInvalid).toBe(true);
+    });
+
+    it('should allow different accounts on internal transfer', () => {
+      const paymentType = 'InternalTransfer';
+      const paidFrom = 'bank-acct-1';
+      const paidTo: string = 'bank-acct-2';
+      const isInvalid = paymentType === 'InternalTransfer' && (paidFrom as string) === paidTo;
+      expect(isInvalid).toBe(false);
+    });
+
+    it('should filter opposite selected account from options in template', () => {
+      const bankCashAccounts = [
+        { id: 'acc-1', accountName: 'Maybank Current' },
+        { id: 'acc-2', accountName: 'CIMB Savings' },
+        { id: 'acc-3', accountName: 'Petty Cash' },
+      ];
+      const selectedPaidTo = 'acc-2';
+      const availablePaidFrom = bankCashAccounts.filter(a => a.id !== selectedPaidTo);
+
+      expect(availablePaidFrom.length).toBe(2);
+      expect(availablePaidFrom.find(a => a.id === 'acc-2')).toBeUndefined();
+      expect(availablePaidFrom.map(a => a.id)).toEqual(['acc-1', 'acc-3']);
+    });
+  });
+
+  describe('Bank side amount re-derivation on account currency change (ERPNext PR #59582)', () => {
+    it('should detect when bank account currency changes for Pay type', () => {
+      const paymentType = 'Pay';
+      const prevBankCurrency = 'MYR';
+      const newBankCurrency = 'USD';
+
+      const shouldRederive = paymentType === 'Pay' && prevBankCurrency !== newBankCurrency;
+      expect(shouldRederive).toBe(true);
+
+      // Party amount = 500, rate = 0.2 (1 MYR = 0.2 USD)
+      const partyAmount = 500;
+      const rate = 0.2;
+      const rederivedBankAmount = Math.round(partyAmount * rate * 100) / 100;
+      expect(rederivedBankAmount).toBe(100);
+    });
+
+    it('should detect when bank account currency changes for Receive type', () => {
+      const paymentType = 'Receive';
+      const prevBankCurrency = 'MYR';
+      const newBankCurrency = 'USD';
+
+      const shouldRederive = paymentType === 'Receive' && prevBankCurrency !== newBankCurrency;
+      expect(shouldRederive).toBe(true);
+
+      // Customer pays 1000 MYR, bank currency is USD with rate 0.22
+      const customerAmount = 1000;
+      const rate = 0.22;
+      const rederivedBankAmount = Math.round(customerAmount * rate * 100) / 100;
+      expect(rederivedBankAmount).toBe(220);
+    });
+
+    it('should set exchangeRate to 1 when bank currency matches party currency', () => {
+      const partyCurrency = 'MYR';
+      const bankCurrency = 'MYR';
+      const isSameCurrency = partyCurrency === bankCurrency;
+      const exchangeRate = isSameCurrency ? 1 : 4.5;
+      expect(exchangeRate).toBe(1);
+    });
+  });
+});

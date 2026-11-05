@@ -1,0 +1,51 @@
+using System;
+using Volo.Abp.Application.Dtos;
+
+namespace MyERP.Inventory;
+
+public class RepostItemValuationDto : EntityDto<Guid>
+{
+    public Guid CompanyId { get; set; }
+    public int BasedOn { get; set; }
+    public Guid? ItemId { get; set; }
+    public Guid? WarehouseId { get; set; }
+    public DateTime PostingDate { get; set; }
+    public int Status { get; set; }
+    public bool RepostGlEntries { get; set; }
+    public bool RepostOnlyAccountingLedgers { get; set; }
+    public bool RecalculateValuationRate { get; set; }
+    public int TotalAffectedEntries { get; set; }
+    public int CurrentIndex { get; set; }
+    public string? ErrorLog { get; set; }
+    public string? VoucherType { get; set; }
+    public Guid? VoucherId { get; set; }
+    public bool IsDeduplicated { get; set; }
+    public DateTime CreationTime { get; set; }
+}
+
+public class CreateRepostItemValuationDto
+{
+    public Guid CompanyId { get; set; }
+    public int BasedOn { get; set; }
+    public Guid? ItemId { get; set; }
+    public Guid? WarehouseId { get; set; }
+    public DateTime PostingDate { get; set; }
+    public bool RepostGlEntries { get; set; } = true;
+    public bool RepostOnlyAccountingLedgers { get; set; }
+    public bool RecalculateValuationRate { get; set; }
+    public string? VoucherType { get; set; }
+    public Guid? VoucherId { get; set; }
+}
+
+public class RepostItemValuationSummaryDto
+{
+    public Guid CompanyId { get; set; }
+    public int QueuedCount { get; set; }
+    public int InProgressCount { get; set; }
+    public int CompletedCount { get; set; }
+    public int FailedCount { get; set; }
+    public int SkippedCount { get; set; }
+    public int CancelledCount { get; set; }
+    public int TotalEntriesProcessed { get; set; }
+    public DateTime? LastProcessedDate { get; set; }
+}

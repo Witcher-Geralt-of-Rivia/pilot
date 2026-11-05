@@ -1,0 +1,114 @@
+using System;
+using MyERP.Purchasing;
+using Volo.Abp;
+using Volo.Abp.Domain.Entities.Auditing;
+using Volo.Abp.MultiTenancy;
+
+namespace MyERP.Purchasing.Entities;
+
+/// <summary>
+/// Supplier master data.
+/// Maps to ERPNext buying/doctype/supplier.
+/// </summary>
+public class Supplier : FullAuditedAggregateRoot<Guid>, IMultiTenant
+{
+    public Guid? TenantId { get; set; }
+    public Guid CompanyId { get; set; }
+
+    public string Name { get; private set; } = null!;
+    public string? SupplierCode { get; set; }
+
+    /// <summary>Tax Identification Number — required for LHDN e-Invoice.</summary>
+    public string? Tin { get; set; }
+
+    /// <summary>Business registration number (BRN/SSM).</summary>
+    public string? RegistrationNumber { get; set; }
+
+    /// <summary>SST registration number.</summary>
+    public string? SstRegistrationNumber { get; set; }
+
+    /// <summary>ID type for LHDN (e.g., BRN, NRIC, PASSPORT, ARMY).</summary>
+    public string? IdType { get; set; }
+
+    /// <summary>ID value corresponding to IdType.</summary>
+    public string? IdValue { get; set; }
+
+    public string? ContactPerson { get; set; }
+    public string? Phone { get; set; }
+    public string? Email { get; set; }
+    public string? Website { get; set; }
+
+    // Address
+    public string? Address { get; set; }
+    public string? City { get; set; }
+    public string? State { get; set; }
+    public string? PostalCode { get; set; }
+    public string? Country { get; set; }
+
+    /// <summary>Default payable account for this supplier.</summary>
+    public Guid? DefaultPayableAccountId { get; set; }
+
+    /// <summary>Default currency for purchase orders/invoices from this supplier.</summary>
+    public string? DefaultCurrency { get; set; }
+
+    public bool IsActive { get; set; } = true;
+
+    /// <summary>
+    /// Hold type for the supplier. Blocks specific transaction types:
+    /// None = no hold; All = blocks PO/PI/PE; Invoices = blocks PI only; Payments = blocks PE only.
+    /// </summary>
+    public SupplierHoldType HoldType { get; set; } = SupplierHoldType.None;
+
+    /// <summary>Whether transactions with this supplier are on hold.</summary>
+    public bool IsOnHold => HoldType != SupplierHoldType.None;
+
+    /// <summary>Supplier scorecard standing — blocks POs when true (per DO-NOT: prevent_pos flag).</summary>
+    public bool PreventPurchaseOrders { get; set; }
+
+    /// <summary>Supplier scorecard standing — blocks RFQs when true (per DO-NOT: prevent_rfqs flag).</summary>
+    public bool PreventRfqs { get; set; }
+
+    /// <summary>Frozen suppliers cannot be transacted with except by the company's frozen-entries role (ERPNext is_frozen).</summary>
+    public bool IsFrozen { get; set; }
+
+    /// <summary>Exempts this supplier from the Buying Settings "Purchase Order Required" rule for invoices (ERPNext allow_purchase_invoice_creation_without_purchase_order).</summary>
+    public bool AllowPurchaseInvoiceWithoutPurchaseOrder { get; set; }
+
+    /// <summary>Exempts this supplier from the Buying Settings "Purchase Receipt Required" rule for invoices (ERPNext allow_purchase_invoice_creation_without_purchase_receipt).</summary>
+    public bool AllowPurchaseInvoiceWithoutPurchaseReceipt { get; set; }
+
+    /// <summary>For inter-company: the Company this supplier represents (bidirectional link).</summary>
+    public Guid? RepresentsCompanyId { get; set; }
+
+    /// <summary>Default Buying Price List — fetched onto new Purchase Orders/Invoices for this supplier.</summary>
+    public Guid? DefaultPriceListId { get; set; }
+
+    /// <summary>Supplier group for categorization and defaults.</summary>
+    public Guid? SupplierGroupId { get; set; }
+
+    /// <summary>Tax withholding category for TDS/WHT calculations on purchase invoices.</summary>
+    public string? TaxWithholdingCategory { get; set; }
+
+    /// <summary>Default payment terms template (auto-applied to purchase invoices from this supplier).</summary>
+    public Guid? DefaultPaymentTermsTemplateId { get; set; }
+
+    /// <summary>
+    /// When true, this supplier is restricted to specific companies (per PR #57258/#57352).
+    /// Transactions in companies not in the AllowedCompanies list will be blocked.
+    /// </summary>
+    public bool RestrictToCompanies { get; set; }
+
+    protected Supplier() { }
+
+    public Supplier(Guid id, Guid companyId, string name, Guid? tenantId = null) : base(id)
+    {
+        CompanyId = companyId;
+        SetName(name);
+        TenantId = tenantId;
+    }
+
+    public void SetName(string name)
+    {
+        Name = Check.NotNullOrWhiteSpace(name?.Trim(), nameof(name), SupplierConsts.MaxNameLength);
+    }
+}

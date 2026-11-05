@@ -1,0 +1,99 @@
+using System;
+using Volo.Abp.Domain.Entities;
+
+namespace MyERP.Manufacturing.Entities;
+
+/// <summary>
+/// Work Order Item — raw material required for production.
+/// Per ERPNext work_order.instructions.md: required items auto-populated from BOM.
+/// Per gotcha #505: WO secondary_items is COMPUTED (not stored child table).
+/// </summary>
+public class WorkOrderItem : Entity<Guid>
+{
+    public Guid WorkOrderId { get; set; }
+    public Guid ItemId { get; set; }
+    public string ItemName { get; set; } = null!;
+    public decimal RequiredQuantity { get; set; }
+    public decimal TransferredQuantity { get; set; }
+    public decimal ConsumedQuantity { get; set; }
+    /// <summary>
+    /// Quantity of raw material reserved from stock for this Work Order line.
+    /// Maps to ERPNext manufacturing/doctype/work_order_item/work_order_item.json (stock_reserved_qty).
+    /// </summary>
+    public decimal StockReservedQty { get; set; }
+    public Guid? SourceWarehouseId { get; set; }
+
+    /// <summary>
+    /// Available stock quantity at the source warehouse at the time of check/display.
+    /// Maps to ERPNext manufacturing/doctype/work_order_item/work_order_item.json (available_qty_at_source_warehouse) / PR #60200.
+    /// </summary>
+    public decimal AvailableQtyAtSourceWarehouse { get; set; }
+
+    /// <summary>
+    /// Available stock quantity at the WIP warehouse at the time of check/display.
+    /// Maps to ERPNext manufacturing/doctype/work_order_item/work_order_item.json (available_qty_at_wip_warehouse) / PR #60200.
+    /// </summary>
+    public decimal AvailableQtyAtWipWarehouse { get; set; }
+
+    /// <summary>
+    /// Per ERPNext: operation_row_id links RM to specific BOM operation for
+    /// semi-finished-goods tracking. When track_semi_finished_goods is enabled,
+    /// each operation has its own set of raw materials.
+    /// </summary>
+    public Guid? BomOperationId { get; set; }
+
+    /// <summary>
+    /// Stock UOM for the item (denormalized for SLE creation).
+    /// </summary>
+    public string StockUom { get; set; } = "Unit";
+
+    /// <summary>
+    /// Conversion factor from transaction UOM to stock UOM.
+    /// Per ERPNext: stock_qty = qty × conversion_factor.
+    /// </summary>
+    public decimal ConversionFactor { get; set; } = 1m;
+
+    /// <summary>Stock quantity = RequiredQuantity × ConversionFactor.</summary>
+    public decimal StockQty => RequiredQuantity * ConversionFactor;
+
+    /// <summary>Pending transfer quantity (required - already transferred).</summary>
+    public decimal PendingTransferQty => Math.Max(0, RequiredQuantity - TransferredQuantity);
+
+    /// <summary>Pending consumption (transferred - already consumed). Only relevant for MaterialTransferred backflush.</summary>
+    public decimal AvailableForConsumption => Math.Max(0, TransferredQuantity - ConsumedQuantity);
+
+    /// <summary>Whether this item is an alternative item substitution.</summary>
+    public bool IsAlternativeItem { get; set; }
+
+    /// <summary>Original item code if this is an alternative substitution.</summary>
+    public Guid? OriginalItemId { get; set; }
+
+    /// <summary>
+    /// Indicates whether this item was added as an extra/additional item during Material Transfer.
+    /// Per ERPNext PR #47511 / commit 963d1e502e.
+    /// </summary>
+    public bool IsAdditionalItem { get; set; }
+
+    /// <summary>
+    /// References the Stock Entry Item that added this additional raw material.
+    /// </summary>
+    public Guid? VoucherDetailReference { get; set; }
+
+    protected WorkOrderItem() { }
+
+    public WorkOrderItem(Guid id, Guid workOrderId, Guid itemId, string itemName, decimal requiredQuantity)
+        : base(id)
+    {
+        WorkOrderId = workOrderId;
+        ItemId = itemId;
+        ItemName = itemName;
+        RequiredQuantity = requiredQuantity;
+    }
+
+    public void SetStockReservedQty(decimal qty)
+    {
+        if (qty < 0)
+            throw new ArgumentException("Stock reserved quantity cannot be negative.", nameof(qty));
+        StockReservedQty = qty;
+    }
+}

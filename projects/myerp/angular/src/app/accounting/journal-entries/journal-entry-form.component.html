@@ -1,0 +1,132 @@
+<abp-page [title]="'New Journal Entry'">
+  <form [formGroup]="form" (ngSubmit)="save()" (appSaveShortcut)="save()">
+    <!-- Header -->
+    <div class="card mb-4">
+      <div class="card-header">
+        <h5 class="card-title mb-0"><i class="fa fa-book me-2"></i>{{ '::JournalEntry' | abpLocalization }}</h5>
+      </div>
+      <div class="card-body">
+        <div class="row">
+          <div class="col-12 col-md-3 mb-3">
+            <label class="form-label">{{ '::EntryType' | abpLocalization }}</label>
+            <select class="form-select" formControlName="voucherType">
+              @for (vt of voucherTypes; track vt.value) {
+                <option [ngValue]="vt.value">{{ '::VoucherType:' + vt.key | abpLocalization }}</option>
+              }
+            </select>
+          </div>
+          <div class="col-12 col-md-3 mb-3">
+            <label class="form-label">{{ 'Company' | abpLocalization }}</label>
+            <select class="form-select" formControlName="companyId">
+              <option value="">{{ 'SelectCompany' | abpLocalization }}</option>
+              @for (c of companies(); track c.id) {
+                <option [value]="c.id">{{ c.name }}</option>
+              }
+            </select>
+          </div>
+          <div class="col-12 col-md-2 mb-3">
+            <label class="form-label">{{ 'Date' | abpLocalization }}</label>
+            <input type="date" class="form-control" formControlName="entryDate" [class.is-invalid]="form.get('entryDate')?.invalid && form.get('entryDate')?.touched" />
+          </div>
+          <div class="col-12 col-md-2 mb-3">
+            <label class="form-label">{{ 'Reference' | abpLocalization }}</label>
+            <input type="text" class="form-control" formControlName="reference" [class.is-invalid]="form.get('reference')?.invalid && form.get('reference')?.touched" [placeholder]="'::Placeholder:ReferenceExample' | abpLocalization" />
+          </div>
+          <div class="col-12 col-md-2 mb-3">
+            <label class="form-label">{{ 'Narration' | abpLocalization }}</label>
+            <input type="text" class="form-control" formControlName="narration" [class.is-invalid]="form.get('narration')?.invalid && form.get('narration')?.touched" />
+          </div>
+          @if (templates().length > 0) {
+            <div class="col-12 col-md-3 mb-3">
+              <label class="form-label">{{ 'LoadFromTemplate' | abpLocalization }}</label>
+              <select class="form-select" (change)="loadTemplate($any($event.target).value)">
+                <option value="">{{ 'SelectTemplate' | abpLocalization }}</option>
+                @for (t of templates(); track t.id) { <option [value]="t.id">{{ t.templateName }}</option> }
+              </select>
+            </div>
+          }
+        </div>
+      </div>
+    </div>
+
+    <!-- Journal Lines (Debit/Credit grid) -->
+    <div class="card mb-4">
+      <div class="card-header">
+        <h5 class="card-title mb-0"><i class="fa fa-columns me-2"></i>{{ '::JournalEntryLines' | abpLocalization }}</h5>
+      </div>
+      <div class="card-body">
+        <div class="table-responsive">
+          <table class="table table-sm w-100">
+            <thead>
+              <tr>
+                <th>{{ 'Account' | abpLocalization }}</th>
+                <th style="width: 140px">{{ '::Debit' | abpLocalization }}</th>
+                <th style="width: 140px">{{ '::Credit' | abpLocalization }}</th>
+                <th style="width: 50px"></th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (row of lines.controls; track $index; let i = $index) {
+                <tr [formGroup]="$any(row)">
+                  <td>
+                    <app-link-picker
+                      formControlName="accountId"
+                      [searchFn]="accountSearchFn"
+                      [getByIdFn]="accountGetByIdFn"
+                      [displayFn]="accountDisplayFn"
+                      [placeholder]="'SelectAccount' | abpLocalization"
+                      (linkSelected)="onAccountLinkSelected(i, $event)">
+                    </app-link-picker>
+                  </td>
+                  <td><input type="number" class="form-control form-control-sm" formControlName="debit" /></td>
+                  <td><input type="number" class="form-control form-control-sm" formControlName="credit" /></td>
+                  <td>
+                    <button type="button" class="btn btn-sm btn-outline-danger" (click)="removeLine(i)">
+                      <i class="fa fa-trash"></i>
+                    </button>
+                  </td>
+                </tr>
+              }
+            </tbody>
+            <tfoot>
+              <tr class="fw-semibold">
+                <td>{{ '::Total' | abpLocalization }}</td>
+                <td class="font-monospace">{{ totalDebit | number:'1.2-2' }}</td>
+                <td class="font-monospace">{{ totalCredit | number:'1.2-2' }}</td>
+                <td></td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+
+        <div class="d-flex align-items-center justify-content-between mt-3">
+          <button type="button" class="btn btn-outline-secondary btn-sm" (click)="addLine()">
+                        <i class="fa fa-plus me-1"></i>{{ '::AddLine' | abpLocalization }}</button>
+
+          @if (!isBalanced && lines.length > 0) {
+            <span class="text-danger fw-medium small d-flex align-items-center gap-1">
+              <i class="fa fa-exclamation-circle"></i>
+              Unbalanced: Difference {{ difference | number:'1.2-2' }}
+            </span>
+          }
+          @if (isBalanced && lines.length > 0) {
+            <span class="text-success fw-medium small d-flex align-items-center gap-1">
+              <i class="fa fa-check-circle"></i>
+              Balanced
+            </span>
+          }
+        </div>
+      </div>
+    </div>
+
+    <!-- Actions -->
+    <div class="d-flex justify-content-end gap-2">
+      <button type="button" class="btn btn-outline-secondary" (click)="cancel()">
+        <i class="fa fa-times me-1"></i>{{ '::Cancel' | abpLocalization }}</button>
+      <button type="submit" class="btn btn-primary"
+        [disabled]="form.invalid || !isBalanced || lines.length === 0">
+        <i class="fa fa-save me-1"></i> Save as Draft
+      </button>
+    </div>
+  </form>
+</abp-page>

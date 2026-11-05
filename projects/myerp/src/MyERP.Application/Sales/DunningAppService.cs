@@ -1,0 +1,732 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Core;
+using MyERP.Core.DomainServices;
+using MyERP.Core.Entities;
+using MyERP.Sales.Entities;
+using MyERP.Accounting;
+using MyERP.Accounting.Entities;
+using MyERP.Accounting.DomainServices;
+using MyERP.Permissions;
+using MyERP.Shared;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.Extensions.Logging;
+using Volo.Abp;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+
+namespace MyERP.Sales;
+
+[Authorize(MyERPPermissions.Dunnings.Default)]
+public class DunningAppService : ApplicationService, IDunningAppService
+{
+    private readonly IRepository<Dunning, Guid> _repository;
+    private readonly MyERP.Sales.DomainServices.DunningManager _dunningManager;
+
+    public DunningAppService(
+        IRepository<Dunning, Guid> repository,
+        MyERP.Sales.DomainServices.DunningManager dunningManager)
+    {
+        _repository = repository;
+        _dunningManager = dunningManager;
+    }
+
+    public async Task<PagedResultDto<DunningDto>> GetListAsync(CompanyFilteredPagedRequestDto input)
+    {
+        var query = (await _repository.WithDetailsAsync()).AsQueryable();
+
+        if (input.CompanyId.HasValue)
+            query = query.Where(x => x.CompanyId == input.CompanyId.Value);
+
+        if (!string.IsNullOrWhiteSpace(input.Filter))
+        {
+            var filter = input.Filter;
+            query = query.Where(x => x.CustomerName != null && x.CustomerName.Contains(filter));
+        }
+
+        if (!string.IsNullOrWhiteSpace(input.Status) && Enum.TryParse<DocumentStatus>(input.Status, true, out var status))
+            query = query.Where(x => x.Status == status);
+
+        var totalCount = query.Count();
+        var items = query.OrderByDescending(d => d.PostingDate)
+            .Skip(input.SkipCount).Take(input.MaxResultCount).ToList();
+        return new PagedResultDto<DunningDto>(totalCount, items.Select(ObjectMapper.Map<Dunning, DunningDto>).ToList());
+    }
+
+    public async Task<DunningDto> GetAsync(Guid id)
+    {
+        var d = (await _repository.WithDetailsAsync()).First(x => x.Id == id);
+        var dto = ObjectMapper.Map<Dunning, DunningDto>(d);
+
+        // Resolve invoice numbers for overdue payment display
+        if (d.OverduePayments.Any())
+        {
+            var invoiceIds = d.OverduePayments.Select(p => p.SalesInvoiceId).ToList();
+            var invoiceRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesInvoice, Guid>>();
+            var invoiceQuery = await invoiceRepo.GetQueryableAsync();
+            var invoiceNumbers = invoiceQuery
+                .Where(si => invoiceIds.Contains(si.Id))
+                .Select(si => new { si.Id, si.InvoiceNumber })
+                .ToDictionary(si => si.Id, si => si.InvoiceNumber);
+
+            dto.OverduePayments = d.OverduePayments.Select(p => new DunningOverduePaymentDto
+            {
+                SalesInvoiceId = p.SalesInvoiceId,
+                PaymentScheduleId = p.PaymentScheduleId,
+                InvoiceNumber = invoiceNumbers.GetValueOrDefault(p.SalesInvoiceId),
+                OutstandingAmount = p.OutstandingAmount,
+                DueDate = p.DueDate,
+                OverdueDays = p.OverdueDays,
+            }).OrderByDescending(p => p.OverdueDays).ToList();
+        }
+
+        return dto;
+    }
+
+    [Authorize(MyERPPermissions.SalesInvoices.Create)]
+    public async Task<DunningDto> CreateAsync(CreateDunningDto input)
+    {
+        // Company-restriction check on the customer this dunning is issued to — every other
+        // transaction AppService referencing a company-restricted master wires this in.
+        var companyRestriction = LazyServiceProvider.LazyGetRequiredService<CompanyRestrictionValidationService>();
+        await companyRestriction.ValidateTransactionCompanyAsync(
+            "Dunning", input.CompanyId, customerIds: new[] { input.CustomerId });
+
+        // Each overdue payment row is otherwise fully client-supplied (invoice id, outstanding
+        // amount, days overdue) with nothing re-fetched server-side — Submit() posts a GL entry
+        // (DR Receivable / CR Income) off Dunning.GrandTotal, so an unchecked row could smuggle in
+        // another customer's invoice, or a fabricated outstanding amount that never existed.
+        // Per ERPNext validate_same_currency: at minimum, confirm the referenced invoice is real
+        // and belongs to this customer/company before trusting anything else about the row.
+        if (input.OverduePayments.Length > 0)
+        {
+            var siRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesInvoice, Guid>>();
+            var invoiceIds = input.OverduePayments.Select(p => p.SalesInvoiceId).Distinct().ToArray();
+            var invoices = (await siRepo.GetQueryableAsync())
+                .Where(si => invoiceIds.Contains(si.Id))
+                .ToDictionary(si => si.Id);
+
+            var seenSchedules = new HashSet<Guid>();
+            var invoiceOutstanding = new Dictionary<Guid, decimal>();
+
+            foreach (var p in input.OverduePayments)
+            {
+                if (!invoices.TryGetValue(p.SalesInvoiceId, out var invoice))
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                        .WithData("detail", $"Sales Invoice {p.SalesInvoiceId} does not exist.");
+                }
+                if (invoice.CustomerId != input.CustomerId)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                        .WithData("detail", $"Sales Invoice {invoice.InvoiceNumber} does not belong to the selected customer.");
+                }
+                if (invoice.CompanyId != input.CompanyId)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                        .WithData("detail", $"Sales Invoice {invoice.InvoiceNumber} belongs to a different company.");
+                }
+                if (invoice.Status != DocumentStatus.Submitted)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                        .WithData("detail", $"Sales Invoice {invoice.InvoiceNumber} must be submitted.");
+                }
+                // Per ERPNext commit 18e651d89e: payment must be overdue on Dunning Posting Date
+                if (p.DueDate.Date >= input.PostingDate.Date)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                        .WithData("detail", $"Payment for invoice {invoice.InvoiceNumber} must be overdue on the Dunning Posting Date.");
+                }
+                if (p.PaymentScheduleId.HasValue)
+                {
+                    if (!seenSchedules.Add(p.PaymentScheduleId.Value))
+                    {
+                        throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                            .WithData("detail", "Payment Schedule is already included in this Dunning.");
+                    }
+
+                    var schedRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Accounting.Entities.PaymentScheduleEntry, Guid>>();
+                    var sched = await schedRepo.FindAsync(p.PaymentScheduleId.Value);
+                    if (sched == null || sched.ParentId != p.SalesInvoiceId || sched.ParentType != "SalesInvoice")
+                    {
+                        throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                            .WithData("detail", $"Payment Schedule entry {p.PaymentScheduleId.Value} does not belong to invoice {p.SalesInvoiceId}.");
+                    }
+
+                    if (p.DueDate.Date != sched.DueDate.Date)
+                    {
+                        throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                            .WithData("detail", "Due Date must match the Payment Schedule.");
+                    }
+
+                    if (p.OutstandingAmount > sched.Outstanding)
+                    {
+                        throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                            .WithData("detail", $"Row for invoice {invoice.InvoiceNumber}: Outstanding must be positive and cannot exceed the unpaid invoice or installment amount.");
+                    }
+                }
+
+                invoiceOutstanding[p.SalesInvoiceId] = invoiceOutstanding.GetValueOrDefault(p.SalesInvoiceId) + p.OutstandingAmount;
+                // Per ERPNext commit 18e651d89e: outstanding must be positive and cannot exceed unpaid invoice amount
+                if (p.OutstandingAmount <= 0 || invoiceOutstanding[p.SalesInvoiceId] > invoice.OutstandingAmount)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                        .WithData("detail", $"Row for invoice {invoice.InvoiceNumber}: Outstanding must be positive and cannot exceed unpaid invoice amount.");
+                }
+            }
+        }
+
+        // Determine correct dunning level from existing submitted dunnings
+        var level = await _dunningManager.DetermineDunningLevelAsync(
+            input.CustomerId, input.CompanyId, CurrentTenant.Id);
+
+        // Default fee/interest rate/accounts from the Dunning Type when not explicitly overridden (per ERPNext fetch_from)
+        var dunningFee = input.DunningFee;
+        var interestRatePerAnnum = input.InterestRatePerAnnum;
+        Guid? incomeAccountId = input.IncomeAccountId;
+        Guid? costCenterId = input.CostCenterId;
+        if (input.DunningTypeId.HasValue)
+        {
+            var typeRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.DunningType, Guid>>();
+            var dunningType = await typeRepo.FindAsync(input.DunningTypeId.Value);
+            if (dunningType != null)
+            {
+                if (dunningFee == 0) dunningFee = dunningType.DunningFee;
+                if (interestRatePerAnnum == 0) interestRatePerAnnum = dunningType.RateOfInterest;
+                incomeAccountId ??= dunningType.IncomeAccountId;
+                costCenterId ??= dunningType.CostCenterId;
+            }
+        }
+
+        // Calculate interest if rate provided but amount not explicitly set
+        var interestAmount = input.InterestAmount;
+        if (interestAmount == 0 && interestRatePerAnnum > 0 && input.OverduePayments.Length > 0)
+        {
+            var overdueData = input.OverduePayments
+                .Select(p => (p.OutstandingAmount, p.OverdueDays))
+                .ToList();
+            interestAmount = MyERP.Sales.DomainServices.DunningManager.CalculateInterest(
+                interestRatePerAnnum, overdueData);
+        }
+
+        var companyRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Company, Guid>>();
+        var company = await companyRepo.FindAsync(input.CompanyId);
+        var currency = !string.IsNullOrWhiteSpace(input.Currency) ? input.Currency : (company?.CurrencyCode ?? "MYR");
+        var conversionRate = input.ConversionRate ?? 1m;
+
+        var d = new Dunning(GuidGenerator.Create(), input.CompanyId, input.CustomerId,
+            input.PostingDate, level, CurrentTenant.Id)
+        {
+            CustomerName = input.CustomerName,
+            DunningTypeId = input.DunningTypeId,
+            DunningFee = dunningFee,
+            InterestAmount = interestAmount,
+            RateOfInterest = interestRatePerAnnum,
+            Currency = currency,
+            ConversionRate = conversionRate,
+            IncomeAccountId = incomeAccountId,
+            CostCenterId = costCenterId,
+        };
+        foreach (var p in input.OverduePayments)
+            d.AddOverduePayment(p.SalesInvoiceId, p.OutstandingAmount, p.DueDate, p.OverdueDays);
+        await _repository.InsertAsync(d);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new DocumentActivityLog(GuidGenerator.Create(),
+            "Dunning", d.Id, "Created", d.CompanyId,
+            d.DunningLevel.ToString(), "Draft", "Draft",
+            CurrentUser.Id,
+            $"Dunning level {d.DunningLevel} created for customer {d.CustomerName}", d.TenantId));
+
+        return ObjectMapper.Map<Dunning, DunningDto>(d);
+    }
+
+    /// <summary>
+    /// Creates a Dunning document directly from a submitted overdue Sales Invoice.
+    /// Per ERPNext PR #56883 / #56006: uses transaction-currency outstanding for foreign-currency invoices.
+    /// </summary>
+    [Authorize(MyERPPermissions.SalesInvoices.Create)]
+    public async Task<DunningDto> CreateFromSalesInvoiceAsync(Guid salesInvoiceId, List<Guid>? paymentScheduleIds = null)
+    {
+        var siRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesInvoice, Guid>>();
+        var si = await siRepo.GetAsync(salesInvoiceId, includeDetails: true);
+
+        if (si.Status != DocumentStatus.Submitted)
+            throw new BusinessException(MyERPDomainErrorCodes.DocumentMustBeSubmittedForConversion);
+
+        var today = DateTime.UtcNow.Date;
+
+        // Per ERPNext PR #61267 (commit 2e7faa8857): check for payment schedule installments first
+        var schedRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Accounting.Entities.PaymentScheduleEntry, Guid>>();
+        var schedQuery = await schedRepo.GetQueryableAsync();
+        var schedules = schedQuery
+            .Where(s => s.ParentType == "SalesInvoice" && s.ParentId == si.Id)
+            .ToList();
+
+        var customerRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Customer, Guid>>();
+        var customer = await customerRepo.FindAsync(si.CustomerId);
+
+        var level = await _dunningManager.DetermineDunningLevelAsync(
+            si.CustomerId, si.CompanyId, CurrentTenant.Id);
+
+        var d = new Dunning(GuidGenerator.Create(), si.CompanyId, si.CustomerId,
+            today, level, CurrentTenant.Id)
+        {
+            CustomerName = customer?.Name,
+            Currency = !string.IsNullOrWhiteSpace(si.CurrencyCode) ? si.CurrencyCode : "MYR",
+            ConversionRate = si.ExchangeRate > 0 ? si.ExchangeRate : 1m,
+        };
+
+        if (schedules.Count > 0)
+        {
+            // Per ERPNext commits 18e651d89e & 8a09633536: apply payments without term allocations to oldest installments first.
+            var scheduleOutstanding = DomainServices.DunningManager.GetPaymentScheduleOutstanding(
+                si, schedules, si.CurrencyCode, inAccountCurrency: false);
+
+            var overdueSchedules = schedules
+                .Where(s => scheduleOutstanding[s.Id] > 0.01m && s.DueDate.Date < today)
+                .ToList();
+
+            if (paymentScheduleIds != null && paymentScheduleIds.Count > 0)
+            {
+                overdueSchedules = overdueSchedules
+                    .Where(s => paymentScheduleIds.Contains(s.Id))
+                    .ToList();
+            }
+
+            if (overdueSchedules.Count == 0)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", "There are no overdue payments to include in this Dunning.");
+            }
+
+            foreach (var sched in overdueSchedules)
+            {
+                var overdueDays = Math.Max(0, (int)(today - sched.DueDate.Date).TotalDays);
+                d.AddOverduePayment(si.Id, scheduleOutstanding[sched.Id], sched.DueDate, overdueDays, sched.Id);
+            }
+        }
+        else
+        {
+            // Transaction-currency outstanding for non-schedule invoices
+            var outstanding = si.GrandTotal - si.AmountPaid - si.WriteOffAmount - si.TotalAdvance;
+            if (outstanding <= 0.01m)
+                throw new BusinessException(MyERPDomainErrorCodes.InvoiceAlreadySettled);
+
+            var dueDate = si.DueDate ?? si.IssueDate;
+            if (dueDate.Date >= today)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", "Sales Invoice is not overdue.");
+            }
+            var overdueDays = Math.Max(0, (int)(today - dueDate).TotalDays);
+
+            d.AddOverduePayment(si.Id, outstanding, dueDate, overdueDays);
+        }
+
+        await _repository.InsertAsync(d);
+        return ObjectMapper.Map<Dunning, DunningDto>(d);
+    }
+
+    [Authorize(MyERPPermissions.SalesInvoices.Submit)]
+    public async Task<DunningDto> SubmitAsync(Guid id)
+    {
+        var d = (await _repository.WithDetailsAsync()).First(x => x.Id == id);
+
+        // Validate level sequencing before submit
+        await _dunningManager.ValidateLevelSequencingAsync(d.CustomerId, d.CompanyId, d.DunningLevel, d.TenantId);
+
+        // Resolve income account from Dunning Type or Company default if fee/interest is charged
+        if (d.DunningAmount > 0 && !d.IncomeAccountId.HasValue)
+        {
+            if (d.DunningTypeId.HasValue)
+            {
+                var typeRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.DunningType, Guid>>();
+                var dunningType = await typeRepo.FindAsync(d.DunningTypeId.Value);
+                if (dunningType?.IncomeAccountId != null)
+                    d.IncomeAccountId = dunningType.IncomeAccountId;
+            }
+            if (!d.IncomeAccountId.HasValue)
+            {
+                var companyRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Company, Guid>>();
+                var company = await companyRepo.FindAsync(d.CompanyId);
+                d.IncomeAccountId = company?.DefaultIncomeAccountId;
+            }
+        }
+
+        d.Submit(validateIncomeAccount: true);
+
+        // Post GL entries for dunning fee + interest (DR Receivable, CR Income)
+        var feeAndInterest = d.DunningFee + d.InterestAmount;
+        if (feeAndInterest > 0)
+        {
+            var companyRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Company, Guid>>();
+            var fyRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<FiscalYear, Guid>>();
+            var jeRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<JournalEntry, Guid>>();
+            var company = await companyRepo.GetAsync(d.CompanyId);
+            var fy = (await fyRepo.GetQueryableAsync())
+                .Where(f => f.CompanyId == d.CompanyId && f.StartDate <= d.PostingDate && f.EndDate >= d.PostingDate)
+                .FirstOrDefault();
+
+            if (fy == null)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.FiscalYearClosed)
+                    .WithData("detail", $"Fiscal Year not found or closed for date {d.PostingDate:d}.");
+            }
+
+            var incomeAccountId = d.IncomeAccountId;
+
+            // Per ERPNext PR #61620 (commit 308143fc67): Income account is required to collect dunning fees or interest
+            if (!incomeAccountId.HasValue)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", "Income Account is required to collect dunning fees or interest.");
+            }
+
+            if (!company.DefaultReceivableAccountId.HasValue)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", "Default Receivable Account is required on Company to collect dunning charges.");
+            }
+
+            var je = new JournalEntry(GuidGenerator.Create(), d.CompanyId, fy.Id, d.PostingDate, d.TenantId);
+            je.ReferenceType = "Dunning";
+            je.ReferenceId = d.Id;
+            // DR Receivable (customer owes fee + interest)
+            je.AddLineWithParty(company.DefaultReceivableAccountId.Value, feeAndInterest, true, d.CustomerId, "Customer", AccountSubType.AccountsReceivable);
+            // CR Income (dunning fee + interest earned)
+            je.AddLine(incomeAccountId.Value, feeAndInterest, false);
+            je.Post();
+            await jeRepo.InsertAsync(je);
+        }
+
+        // Activity log
+        try
+        {
+            var actRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<DocumentActivityLog, Guid>>();
+            await actRepo.InsertAsync(new DocumentActivityLog(GuidGenerator.Create(),
+                "Dunning", d.Id, "Submitted", d.CompanyId,
+                previousStatus: "Draft", newStatus: "Submitted",
+                performedByUserId: CurrentUser.Id, tenantId: d.TenantId));
+        }
+        catch { }
+
+        await _repository.UpdateAsync(d);
+        return ObjectMapper.Map<Dunning, DunningDto>(d);
+    }
+
+    [Authorize(MyERPPermissions.SalesInvoices.Submit)]
+    public async Task<DunningDto> ResolveAsync(Guid id)
+    {
+        var d = await _repository.GetAsync(id);
+        d.Resolve();
+        await _repository.UpdateAsync(d);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new DocumentActivityLog(GuidGenerator.Create(),
+            "Dunning", d.Id, "Resolved", d.CompanyId,
+            d.DunningLevel.ToString(), "Submitted", "Resolved",
+            CurrentUser.Id,
+            $"Dunning level {d.DunningLevel} resolved for customer {d.CustomerName}", d.TenantId));
+
+        return ObjectMapper.Map<Dunning, DunningDto>(d);
+    }
+
+    [Authorize(MyERPPermissions.SalesInvoices.Cancel)]
+    public async Task<DunningDto> CancelAsync(Guid id)
+    {
+        var d = await _repository.GetAsync(id);
+
+        // Per ERPNext PR #61620 (commits 58e9c6f8a8, 1662d7ba59):
+        // Prevent cancelling Dunning if payments are linked to it. The linked payment must be cancelled first.
+        var peTaxRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PaymentEntryTax, Guid>>();
+        var peRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PaymentEntry, Guid>>();
+        var peTaxQuery = await peTaxRepo.GetQueryableAsync();
+        var peQuery = await peRepo.GetQueryableAsync();
+        var linkedActivePeNumber = (from tax in peTaxQuery
+                                    join p in peQuery on tax.PaymentEntryId equals p.Id
+                                    where tax.DunningId == d.Id && p.Status == DocumentStatus.Submitted
+                                    select p.PaymentNumber).FirstOrDefault();
+        if (linkedActivePeNumber != null)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"Cannot cancel Dunning {d.Id} because active Payment Entry {linkedActivePeNumber} is linked to it. Cancel the payment entry first.");
+        }
+
+        d.Cancel();
+
+        // Cancel linked Journal Entries created by Dunning submit
+        try
+        {
+            var jeRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<JournalEntry, Guid>>();
+            var linkedJes = (await jeRepo.GetQueryableAsync())
+                .Where(j => j.ReferenceType == "Dunning" && j.ReferenceId == d.Id && j.Status == DocumentStatus.Posted)
+                .ToList();
+            foreach (var je in linkedJes)
+            {
+                je.Cancel();
+                await jeRepo.UpdateAsync(je);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Failed to cancel linked Journal Entry for Dunning {DunningId}", d.Id);
+        }
+
+        await _repository.UpdateAsync(d);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new DocumentActivityLog(GuidGenerator.Create(),
+            "Dunning", d.Id, "Cancelled", d.CompanyId,
+            d.DunningLevel.ToString(), "Submitted", "Cancelled",
+            CurrentUser.Id,
+            $"Dunning level {d.DunningLevel} cancelled for customer {d.CustomerName}", d.TenantId));
+
+        return ObjectMapper.Map<Dunning, DunningDto>(d);
+    }
+
+    /// <summary>
+    /// Send dunning notice email to customer with overdue invoice details.
+    /// Per ERPNext dunning.py: get_dunning_letter_text renders per-language template.
+    /// </summary>
+    /// <summary>
+    /// Auto-generate dunning documents for all customers with overdue invoices.
+    /// Per ERPNext: scans submitted SIs where due_date < today and outstanding > 0,
+    /// groups by customer, determines correct dunning level, calculates interest,
+    /// creates one Dunning per customer with all their overdue invoices.
+    /// Skips customers that already have a Draft dunning awaiting submission.
+    /// </summary>
+    [Authorize(MyERPPermissions.SalesInvoices.Create)]
+    public async Task<AutoGenerateDunningsResultDto> AutoGenerateAsync(AutoGenerateDunningsDto input)
+    {
+        Check.NotDefaultOrNull<Guid>(input.CompanyId, nameof(input.CompanyId));
+
+        var today = input.AsOfDate ?? DateTime.UtcNow.Date;
+        var result = new AutoGenerateDunningsResultDto();
+
+        // Get all submitted, non-return invoices with outstanding > 0 and due date past
+        var siRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesInvoice, Guid>>();
+        var siQuery = await siRepo.GetQueryableAsync();
+        var overdueInvoices = siQuery
+            .Where(si => si.CompanyId == input.CompanyId
+                      && si.Status == DocumentStatus.Submitted
+                      && !si.IsReturn
+                      && si.DueDate.HasValue
+                      && si.DueDate.Value < today
+                      && (si.GrandTotal - si.AmountPaid - si.WriteOffAmount - si.TotalAdvance) > 0.01m)
+            .Select(si => new
+            {
+                si.Id,
+                si.CustomerId,
+                DueDate = si.DueDate!.Value,
+                Outstanding = si.GrandTotal - si.AmountPaid - si.WriteOffAmount - si.TotalAdvance
+            })
+            .ToList();
+
+        if (!overdueInvoices.Any())
+        {
+            return result;
+        }
+
+        // Group by customer
+        var grouped = overdueInvoices.GroupBy(i => i.CustomerId).ToList();
+
+        // Find customers that already have a draft dunning (skip those)
+        var existingDraftQuery = await _repository.GetQueryableAsync();
+        var customersWithDraftDunning = existingDraftQuery
+            .Where(d => d.CompanyId == input.CompanyId && d.Status == DocumentStatus.Draft)
+            .Select(d => d.CustomerId)
+            .Distinct()
+            .ToHashSet();
+
+        foreach (var customerGroup in grouped)
+        {
+            var customerId = customerGroup.Key;
+
+            // Skip if customer already has a pending draft dunning
+            if (customersWithDraftDunning.Contains(customerId))
+            {
+                result.SkippedCount++;
+                continue;
+            }
+
+            try
+            {
+                var level = await _dunningManager.DetermineDunningLevelAsync(
+                    customerId, input.CompanyId, CurrentTenant.Id);
+
+                // Calculate interest if rate provided
+                var overdueData = customerGroup
+                    .Select(i => (i.Outstanding, (int)(today - i.DueDate).TotalDays))
+                    .ToList();
+                var interestAmount = input.InterestRatePerAnnum > 0
+                    ? Sales.DomainServices.DunningManager.CalculateInterest(input.InterestRatePerAnnum, overdueData.Select(d => (d.Outstanding, d.Item2)).ToList())
+                    : 0m;
+
+                var dunning = new Dunning(GuidGenerator.Create(), input.CompanyId, customerId,
+                    today, level, CurrentTenant.Id)
+                {
+                    DunningFee = input.DunningFeePerCustomer,
+                    InterestAmount = Math.Round(interestAmount, 2),
+                };
+
+                foreach (var inv in customerGroup)
+                {
+                    var overdueDays = (int)(today - inv.DueDate).TotalDays;
+                    dunning.AddOverduePayment(inv.Id, inv.Outstanding, inv.DueDate, overdueDays);
+                }
+
+                await _repository.InsertAsync(dunning);
+                result.CreatedCount++;
+                result.TotalOverdueAmount += dunning.TotalOutstanding;
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning(ex, "Failed to auto-generate dunning for customer {CustomerId}", customerId);
+                result.FailedCount++;
+            }
+        }
+
+        result.CustomersScanned = grouped.Count;
+        return result;
+    }
+
+    [Authorize(MyERPPermissions.SalesInvoices.Submit)]
+    public async Task SendDunningEmailAsync(Guid id, SendDunningEmailDto input)
+    {
+        var d = (await _repository.WithDetailsAsync()).First(x => x.Id == id);
+        if (d.Status != DocumentStatus.Submitted)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("reason", "Dunning must be submitted before sending email");
+
+        var customerRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Customer, Guid>>();
+        var companyRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Company, Guid>>();
+        var customer = await customerRepo.GetAsync(d.CustomerId);
+        var company = await companyRepo.GetAsync(d.CompanyId);
+
+        var recipientEmail = input.RecipientEmail ?? customer.Email;
+        if (string.IsNullOrWhiteSpace(recipientEmail))
+            throw new BusinessException(MyERPDomainErrorCodes.RecipientEmailRequired)
+                .WithData("reason", "No email address for customer. Provide a recipient email.");
+
+        var invoiceDetails = d.OverduePayments
+            .OrderByDescending(p => p.OverdueDays)
+            .Select(p => $"  • Outstanding {p.OutstandingAmount:N2} (overdue {p.OverdueDays} days)")
+            .ToList();
+
+        var subject = $"Payment Reminder - Level {d.DunningLevel} - {company.Name}";
+        var body = $"""
+            Dear {customer.Name},
+
+            This is a reminder that the following invoices are overdue:
+
+            {string.Join("\n", invoiceDetails)}
+
+            Total Outstanding: {d.TotalOutstanding:N2}
+            Dunning Fee: {d.DunningFee:N2}
+            Interest: {d.InterestAmount:N2}
+            Grand Total Due: {d.GrandTotal:N2}
+
+            Please arrange payment at your earliest convenience.
+
+            Regards,
+            {company.Name}
+            """;
+
+        var emailService = LazyServiceProvider.LazyGetRequiredService<DocumentEmailService>();
+        var ccEmails = string.IsNullOrWhiteSpace(input.Cc)
+            ? null
+            : input.Cc.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        await emailService.SendCustomEmailAsync(recipientEmail, subject, body, ccEmails: ccEmails);
+
+        d.MarkEmailSent(recipientEmail);
+        await _repository.UpdateAsync(d);
+    }
+
+    public async Task<List<DunningOverduePaymentDto>> GetUnpaidOverduePaymentsAsync(Guid id, bool inAccountCurrency = false)
+    {
+        var d = (await _repository.WithDetailsAsync()).First(x => x.Id == id);
+        if (!d.OverduePayments.Any())
+            return new List<DunningOverduePaymentDto>();
+
+        var companyRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Company, Guid>>();
+        var company = await companyRepo.FindAsync(d.CompanyId);
+        var companyCurrency = !string.IsNullOrWhiteSpace(company?.CurrencyCode) ? company.CurrencyCode : "MYR";
+
+        var invoiceIds = d.OverduePayments.Select(p => p.SalesInvoiceId).Distinct().ToList();
+        var invoiceRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesInvoice, Guid>>();
+        var invoiceQuery = await invoiceRepo.GetQueryableAsync();
+        var invoices = invoiceQuery
+            .Where(si => invoiceIds.Contains(si.Id))
+            .ToDictionary(si => si.Id);
+
+        var schedRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PaymentScheduleEntry, Guid>>();
+        var schedQuery = await schedRepo.GetQueryableAsync();
+        var schedulesByInvoice = schedQuery
+            .Where(s => s.ParentType == "SalesInvoice" && invoiceIds.Contains(s.ParentId))
+            .ToList()
+            .GroupBy(s => s.ParentId)
+            .ToDictionary(g => g.Key, g => (IReadOnlyList<PaymentScheduleEntry>)g.ToList());
+
+        var accountIds = invoices.Values
+            .Where(si => si.DebitToAccountId != Guid.Empty)
+            .Select(si => si.DebitToAccountId)
+            .Distinct()
+            .ToList();
+        var accountRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Account, Guid>>();
+        var accountQuery = await accountRepo.GetQueryableAsync();
+        var accountCurrencies = accountIds.Count > 0
+            ? accountQuery.Where(a => accountIds.Contains(a.Id))
+                .Select(a => new { a.Id, a.Currency })
+                .ToDictionary(a => a.Id, a => a.Currency)
+            : new Dictionary<Guid, string?>();
+
+        var customerRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Customer, Guid>>();
+        var customer = await customerRepo.FindAsync(d.CustomerId);
+        string? defaultPartyCurrency = null;
+        var defaultPartyAccountId = customer?.DefaultReceivableAccountId ?? company?.DefaultReceivableAccountId;
+        if (defaultPartyAccountId.HasValue && defaultPartyAccountId.Value != Guid.Empty)
+        {
+            var defaultAcc = await accountRepo.FindAsync(defaultPartyAccountId.Value);
+            defaultPartyCurrency = defaultAcc?.Currency;
+        }
+
+        var result = new List<DunningOverduePaymentDto>();
+        foreach (var row in d.OverduePayments)
+        {
+            if (!invoices.TryGetValue(row.SalesInvoiceId, out var si))
+                continue;
+            if (si.Status == DocumentStatus.Draft || si.Status == DocumentStatus.Cancelled)
+                continue;
+
+            var partyAccountCurrency = (si.DebitToAccountId != Guid.Empty
+                    && accountCurrencies.TryGetValue(si.DebitToAccountId, out var accCurr)
+                    && !string.IsNullOrWhiteSpace(accCurr))
+                ? accCurr
+                : (!string.IsNullOrWhiteSpace(defaultPartyCurrency) ? defaultPartyCurrency : companyCurrency);
+
+            var invSchedules = schedulesByInvoice.GetValueOrDefault(si.Id, Array.Empty<PaymentScheduleEntry>());
+            var currentOutstanding = DomainServices.DunningManager.GetCurrentOverdueOutstanding(
+                row, si, invSchedules, partyAccountCurrency, inAccountCurrency);
+
+            if (currentOutstanding > 0m)
+            {
+                result.Add(new DunningOverduePaymentDto
+                {
+                    SalesInvoiceId = row.SalesInvoiceId,
+                    PaymentScheduleId = row.PaymentScheduleId,
+                    InvoiceNumber = si.InvoiceNumber,
+                    OutstandingAmount = currentOutstanding,
+                    DueDate = row.DueDate,
+                    OverdueDays = row.OverdueDays
+                });
+            }
+        }
+
+        return result;
+    }
+}
+

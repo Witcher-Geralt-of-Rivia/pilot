@@ -1,0 +1,179 @@
+using System;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Accounting;
+using MyERP.Accounting.Entities;
+using MyERP.Core.Entities;
+using MyERP.Inventory.Entities;
+using Volo.Abp;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Domain.Services;
+
+namespace MyERP.Inventory.DomainServices;
+
+/// <summary>
+/// Resolves the GL account for a given warehouse for perpetual inventory GL posting.
+/// 
+/// Per ERPNext stock/utils.py → get_warehouse_account():
+///   Resolution chain:
+///   1. WarehouseAccount entity for the specific (warehouse, company)
+///   2. Parent warehouse's WarehouseAccount (traverse tree up)
+///   3. Company.DefaultInventoryAccountId (fallback)
+///   4. Error if all null
+///
+/// Also resolves SRBNB and SDBNB accounts with same fallback pattern.
+/// 
+/// Per gotcha #15: Warehouse→Account 5-level resolution chain.
+/// Per gotcha #2864: BaseStockGLComposer uses this for DR Stock account on PR, CR Stock on DN.
+/// </summary>
+public class WarehouseAccountService : DomainService
+{
+    private readonly IRepository<WarehouseAccount, Guid> _warehouseAccountRepository;
+    private readonly IRepository<Warehouse, Guid> _warehouseRepository;
+    private readonly IRepository<Company, Guid> _companyRepository;
+    private readonly IRepository<Account, Guid> _accountRepository;
+
+    public WarehouseAccountService(
+        IRepository<WarehouseAccount, Guid> warehouseAccountRepository,
+        IRepository<Warehouse, Guid> warehouseRepository,
+        IRepository<Company, Guid> companyRepository,
+        IRepository<Account, Guid> accountRepository)
+    {
+        _warehouseAccountRepository = warehouseAccountRepository;
+        _warehouseRepository = warehouseRepository;
+        _companyRepository = companyRepository;
+        _accountRepository = accountRepository;
+    }
+
+    /// <summary>
+    /// Resolves the stock GL account for a warehouse.
+    /// Per ERPNext: used for DR on stock-in (PR/Manufacture/Receipt) and CR on stock-out (DN/Issue).
+    /// If Company.EnableItemWiseInventoryAccount is true and an item is provided, checks item/item-group account first.
+    /// </summary>
+    public virtual async Task<Guid> ResolveStockAccountAsync(Guid warehouseId, Guid companyId, Guid? itemId = null)
+    {
+        var company = await _companyRepository.GetAsync(companyId);
+
+        // Level 0: Item-wise inventory account (if enabled per PR #50193 / commit 74192547ce)
+        if (company.EnableItemWiseInventoryAccount && itemId.HasValue)
+        {
+            var itemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Item, Guid>>();
+            var item = await itemRepo.FindAsync(itemId.Value);
+            if (item?.DefaultInventoryAccountId.HasValue == true)
+                return item.DefaultInventoryAccountId.Value;
+
+            if (item?.ItemGroupId.HasValue == true)
+            {
+                var itemGroupRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<ItemGroup, Guid>>();
+                var itemGroup = await itemGroupRepo.FindAsync(item.ItemGroupId.Value);
+                if (itemGroup?.DefaultInventoryAccountId.HasValue == true)
+                    return itemGroup.DefaultInventoryAccountId.Value;
+            }
+        }
+
+        // Level 1: Direct warehouse account mapping
+        var warehouseAccount = await _warehouseAccountRepository.FindAsync(
+            wa => wa.WarehouseId == warehouseId && wa.CompanyId == companyId);
+
+        if (warehouseAccount != null)
+            return warehouseAccount.AccountId;
+
+        // Level 2: Check warehouse's own DefaultAccountId
+        var warehouse = await _warehouseRepository.GetAsync(warehouseId);
+        if (warehouse.DefaultAccountId.HasValue)
+            return warehouse.DefaultAccountId.Value;
+
+        // Level 3: Walk up parent warehouse hierarchy (max 10 levels)
+        var currentWarehouseId = warehouse.ParentWarehouseId;
+        for (int depth = 0; depth < 10 && currentWarehouseId.HasValue; depth++)
+        {
+            var parentAccount = await _warehouseAccountRepository.FindAsync(
+                wa => wa.WarehouseId == currentWarehouseId.Value && wa.CompanyId == companyId);
+            if (parentAccount != null)
+                return parentAccount.AccountId;
+
+            var parentWarehouse = await _warehouseRepository.FindAsync(currentWarehouseId.Value);
+            if (parentWarehouse?.DefaultAccountId.HasValue == true)
+                return parentWarehouse.DefaultAccountId.Value;
+
+            currentWarehouseId = parentWarehouse?.ParentWarehouseId;
+        }
+
+        // Level 4: Company default
+        if (company.DefaultInventoryAccountId.HasValue)
+            return company.DefaultInventoryAccountId.Value;
+
+        // Level 5: Per PR #57626 — only auto-resolve if exactly ONE stock account exists.
+        // Multiple stock accounts = ambiguous → require explicit configuration.
+        var accountQuery = await _accountRepository.GetQueryableAsync();
+        var stockAccounts = accountQuery
+            .Where(a => a.CompanyId == companyId
+                     && a.AccountSubType == AccountSubType.Stock
+                     && !a.IsGroup)
+            .Select(a => a.Id)
+            .Take(2) // Only need to know if 0, 1, or >1
+            .ToList();
+
+        if (stockAccounts.Count == 1)
+            return stockAccounts[0];
+
+        // Level 6: Error — no unambiguous account found
+        throw new BusinessException(MyERPDomainErrorCodes.DefaultAccountNotConfigured)
+            .WithData("message", $"No stock account configured for warehouse '{warehouse.Name}' or company defaults. " +
+                $"Please set Account in the Warehouse or Default Inventory Account in Company settings.");
+    }
+
+    /// <summary>
+    /// Resolves the SRBNB (Stock Received But Not Billed) account for purchase receipts.
+    /// Per ERPNext: DR Stock, CR SRBNB on Purchase Receipt submit.
+    /// </summary>
+    public virtual async Task<Guid> ResolveSrbnbAccountAsync(Guid warehouseId, Guid companyId)
+    {
+        var warehouseAccount = await _warehouseAccountRepository.FindAsync(
+            wa => wa.WarehouseId == warehouseId && wa.CompanyId == companyId);
+
+        if (warehouseAccount?.StockReceivedButNotBilledAccountId.HasValue == true)
+            return warehouseAccount.StockReceivedButNotBilledAccountId.Value;
+
+        var company = await _companyRepository.GetAsync(companyId);
+        return company.StockReceivedButNotBilledAccountId
+            ?? throw new BusinessException(MyERPDomainErrorCodes.DefaultAccountNotConfigured)
+                .WithData("message", "No SRBNB account configured.");
+    }
+
+    /// <summary>
+    /// Resolves the SDBNB (Stock Delivered But Not Billed) account for delivery notes.
+    /// Per ERPNext gotcha #2864: DN 4-branch SDBNB logic.
+    /// </summary>
+    public virtual async Task<Guid> ResolveSdbnbAccountAsync(Guid warehouseId, Guid companyId)
+    {
+        var warehouseAccount = await _warehouseAccountRepository.FindAsync(
+            wa => wa.WarehouseId == warehouseId && wa.CompanyId == companyId);
+
+        if (warehouseAccount?.StockDeliveredButNotBilledAccountId.HasValue == true)
+            return warehouseAccount.StockDeliveredButNotBilledAccountId.Value;
+
+        var company = await _companyRepository.GetAsync(companyId);
+        return company.StockDeliveredButNotBilledAccountId
+            ?? throw new BusinessException(MyERPDomainErrorCodes.DefaultAccountNotConfigured)
+                .WithData("message", "No SDBNB account configured.");
+    }
+
+    /// <summary>
+    /// Resolves the stock adjustment account for stock reconciliation entries.
+    /// </summary>
+    public virtual async Task<Guid> ResolveStockAdjustmentAccountAsync(Guid warehouseId, Guid companyId)
+    {
+        var warehouseAccount = await _warehouseAccountRepository.FindAsync(
+            wa => wa.WarehouseId == warehouseId && wa.CompanyId == companyId);
+
+        if (warehouseAccount?.StockAdjustmentAccountId.HasValue == true)
+            return warehouseAccount.StockAdjustmentAccountId.Value;
+
+        var company = await _companyRepository.GetAsync(companyId);
+        // Stock adjustment fallback: Company.StockAdjustmentAccountId not on entity yet → use expense
+        return company.DefaultExpenseAccountId
+            ?? throw new BusinessException(MyERPDomainErrorCodes.DefaultAccountNotConfigured)
+                .WithData("message", "No stock adjustment account configured.");
+    }
+}

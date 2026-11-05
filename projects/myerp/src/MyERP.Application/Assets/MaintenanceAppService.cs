@@ -1,0 +1,249 @@
+using System;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Maintenance.Entities;
+using MyERP.Maintenance;
+using MyERP.Permissions;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+
+namespace MyERP.Assets;
+
+[Authorize(MyERPPermissions.Assets.Default)]
+public class MaintenanceAppService : ApplicationService, IMaintenanceAppService
+{
+    private readonly IRepository<MaintenanceSchedule, Guid> _scheduleRepo;
+    private readonly IRepository<MaintenanceVisit, Guid> _visitRepo;
+
+    public MaintenanceAppService(
+        IRepository<MaintenanceSchedule, Guid> scheduleRepo,
+        IRepository<MaintenanceVisit, Guid> visitRepo)
+    {
+        _scheduleRepo = scheduleRepo;
+        _visitRepo = visitRepo;
+    }
+
+    public async Task<PagedResultDto<MaintenanceScheduleDto>> GetScheduleListAsync(PagedAndSortedResultRequestDto input)
+    {
+        var query = (await _scheduleRepo.WithDetailsAsync()).AsQueryable();
+        var totalCount = query.Count();
+        var items = query.OrderByDescending(s => s.StartDate)
+            .Skip(input.SkipCount).Take(input.MaxResultCount).ToList();
+        return new PagedResultDto<MaintenanceScheduleDto>(totalCount, items.Select(x => ObjectMapper.Map<MaintenanceSchedule, MaintenanceScheduleDto>(x)).ToList());
+    }
+
+    public async Task<MaintenanceScheduleDto> GetScheduleAsync(Guid id)
+    {
+        var ms = (await _scheduleRepo.WithDetailsAsync()).First(s => s.Id == id);
+        return ObjectMapper.Map<MaintenanceSchedule, MaintenanceScheduleDto>(ms);
+    }
+
+    [Authorize(MyERPPermissions.Assets.Create)]
+    public async Task<MaintenanceScheduleDto> CreateScheduleAsync(CreateMaintenanceScheduleDto input)
+    {
+        if (input.CustomerId.HasValue)
+        {
+            var customerRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Sales.Entities.Customer, Guid>>();
+            var customer = await customerRepo.FindAsync(input.CustomerId.Value);
+            if (customer != null && customer.CompanyId != input.CompanyId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("customerCompany", customer.CompanyId)
+                    .WithData("scheduleCompany", input.CompanyId);
+            }
+        }
+
+        if (input.AssetId.HasValue)
+        {
+            var assetRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Entities.Asset, Guid>>();
+            var asset = await assetRepo.FindAsync(input.AssetId.Value);
+            if (asset != null && asset.CompanyId != input.CompanyId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("assetCompany", asset.CompanyId)
+                    .WithData("scheduleCompany", input.CompanyId);
+            }
+        }
+
+        var companyRestriction = LazyServiceProvider.LazyGetRequiredService<MyERP.Core.DomainServices.CompanyRestrictionValidationService>();
+        await companyRestriction.ValidateTransactionCompanyAsync(
+            "MaintenanceSchedule", input.CompanyId,
+            itemIds: input.ItemId.HasValue ? new[] { input.ItemId.Value } : null,
+            customerIds: input.CustomerId.HasValue ? new[] { input.CustomerId.Value } : null);
+
+        var ms = new MaintenanceSchedule(GuidGenerator.Create(), input.CompanyId,
+            input.StartDate, input.EndDate, input.Periodicity, CurrentTenant.Id)
+        {
+            AssetId = input.AssetId,
+            ItemId = input.ItemId,
+            CustomerId = input.CustomerId,
+        };
+        var generator = LazyServiceProvider.LazyGetRequiredService<MyERP.Maintenance.DomainServices.MaintenanceScheduleGenerator>();
+        await generator.GenerateAsync(ms);
+        await _scheduleRepo.InsertAsync(ms);
+        return ObjectMapper.Map<MaintenanceSchedule, MaintenanceScheduleDto>(ms);
+    }
+
+    [Authorize(MyERPPermissions.Assets.Submit)]
+    public async Task<MaintenanceScheduleDto> SubmitScheduleAsync(Guid id)
+    {
+        var ms = (await _scheduleRepo.WithDetailsAsync()).First(s => s.Id == id);
+        ms.Submit();
+        await _scheduleRepo.UpdateAsync(ms);
+        return ObjectMapper.Map<MaintenanceSchedule, MaintenanceScheduleDto>(ms);
+    }
+
+    // --- Maintenance Visit CRUD ---
+
+    public async Task<PagedResultDto<MaintenanceVisitDto>> GetVisitListAsync(GetMaintenanceVisitListDto input)
+    {
+        var query = (await _visitRepo.WithDetailsAsync()).AsQueryable();
+
+        if (input.CompletionStatus.HasValue)
+            query = query.Where(v => v.CompletionStatus == input.CompletionStatus.Value);
+        if (input.MaintenanceScheduleId.HasValue)
+            query = query.Where(v => v.MaintenanceScheduleId == input.MaintenanceScheduleId.Value);
+        if (!string.IsNullOrWhiteSpace(input.MaintenanceType))
+            query = query.Where(v => v.MaintenanceType == input.MaintenanceType);
+        if (input.CustomerId.HasValue)
+            query = query.Where(v => v.CustomerId == input.CustomerId.Value);
+
+        var totalCount = query.Count();
+        var items = query.OrderByDescending(v => v.VisitDate)
+            .Skip(input.SkipCount).Take(input.MaxResultCount).ToList();
+
+        return new PagedResultDto<MaintenanceVisitDto>(totalCount,
+            items.Select(ObjectMapper.Map<MaintenanceVisit, MaintenanceVisitDto>).ToList());
+    }
+
+    public async Task<MaintenanceVisitDto> GetVisitAsync(Guid id)
+    {
+        var visit = (await _visitRepo.WithDetailsAsync()).First(v => v.Id == id);
+        return ObjectMapper.Map<MaintenanceVisit, MaintenanceVisitDto>(visit);
+    }
+
+    [Authorize(MyERPPermissions.Assets.Create)]
+    public async Task<MaintenanceVisitDto> CreateVisitAsync(CreateMaintenanceVisitDto input)
+    {
+        var visitItemIds = input.Purposes.Where(p => p.ItemId.HasValue).Select(p => p.ItemId!.Value).Distinct().ToArray();
+        var companyRestriction = LazyServiceProvider.LazyGetRequiredService<MyERP.Core.DomainServices.CompanyRestrictionValidationService>();
+        await companyRestriction.ValidateTransactionCompanyAsync(
+            "MaintenanceVisit", input.CompanyId,
+            itemIds: visitItemIds.Length > 0 ? visitItemIds : null,
+            customerIds: input.CustomerId.HasValue ? new[] { input.CustomerId.Value } : null);
+
+        if (input.MaintenanceScheduleId.HasValue)
+        {
+            var ms = await _scheduleRepo.FindAsync(input.MaintenanceScheduleId.Value);
+            if (ms != null && ms.CompanyId != input.CompanyId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("scheduleCompany", ms.CompanyId)
+                    .WithData("visitCompany", input.CompanyId);
+            }
+        }
+
+        var visit = new MaintenanceVisit(GuidGenerator.Create(), input.CompanyId,
+            input.VisitDate, input.MaintenanceType, CurrentTenant.Id)
+        {
+            MaintenanceScheduleId = input.MaintenanceScheduleId,
+            CustomerId = input.CustomerId,
+            ContactId = input.ContactId,
+        };
+
+        foreach (var p in input.Purposes)
+        {
+            visit.AddPurpose(new MaintenanceVisitPurpose(GuidGenerator.Create(), visit.Id, p.WorkDone)
+            {
+                ItemId = p.ItemId,
+                ItemName = p.ItemName,
+                SerialNoId = p.SerialNoId,
+                WorkDetails = p.WorkDetails,
+            });
+        }
+
+        await _visitRepo.InsertAsync(visit);
+        return ObjectMapper.Map<MaintenanceVisit, MaintenanceVisitDto>(visit);
+    }
+
+    [Authorize(MyERPPermissions.Assets.Edit)]
+    public async Task<MaintenanceVisitDto> UpdateVisitAsync(Guid id, CreateMaintenanceVisitDto input)
+    {
+        var visit = (await _visitRepo.WithDetailsAsync()).First(v => v.Id == id);
+
+        if (visit.CompletionStatus == MaintenanceVisitStatus.Completed ||
+            visit.CompletionStatus == MaintenanceVisitStatus.Cancelled)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("message", "Cannot edit a completed or cancelled visit.");
+        }
+
+        visit.VisitDate = input.VisitDate;
+        visit.MaintenanceType = input.MaintenanceType;
+        visit.MaintenanceScheduleId = input.MaintenanceScheduleId;
+        visit.CustomerId = input.CustomerId;
+        visit.ContactId = input.ContactId;
+
+        await _visitRepo.UpdateAsync(visit);
+        return ObjectMapper.Map<MaintenanceVisit, MaintenanceVisitDto>(visit);
+    }
+
+    [Authorize(MyERPPermissions.Assets.Submit)]
+    public async Task<MaintenanceVisitDto> CompleteVisitAsync(Guid id)
+    {
+        var visit = await _visitRepo.GetAsync(id);
+        visit.Complete();
+        await _visitRepo.UpdateAsync(visit);
+
+        // Mark the schedule's oldest outstanding visit date as done so its progress %,
+        // "next due" lookup, and the nightly reminder job (which only nags on !IsCompleted)
+        // actually reflect completed work instead of tracking it forever.
+        if (visit.MaintenanceScheduleId.HasValue)
+        {
+            var schedule = await _scheduleRepo.FindAsync(visit.MaintenanceScheduleId.Value);
+            var nextDetail = schedule?.Details.Where(d => !d.IsCompleted).OrderBy(d => d.ScheduledDate).FirstOrDefault();
+            if (nextDetail != null)
+            {
+                nextDetail.IsCompleted = true;
+                nextDetail.ActualDate = visit.VisitDate;
+                await _scheduleRepo.UpdateAsync(schedule!);
+            }
+        }
+
+        return ObjectMapper.Map<MaintenanceVisit, MaintenanceVisitDto>(visit);
+    }
+
+    [Authorize(MyERPPermissions.Assets.Submit)]
+    public async Task<MaintenanceVisitDto> PartiallyCompleteVisitAsync(Guid id)
+    {
+        var visit = await _visitRepo.GetAsync(id);
+        visit.PartiallyComplete();
+        await _visitRepo.UpdateAsync(visit);
+        return ObjectMapper.Map<MaintenanceVisit, MaintenanceVisitDto>(visit);
+    }
+
+    [Authorize(MyERPPermissions.Assets.Submit)]
+    public async Task<MaintenanceVisitDto> CancelVisitAsync(Guid id)
+    {
+        var visit = await _visitRepo.GetAsync(id);
+        visit.Cancel();
+        await _visitRepo.UpdateAsync(visit);
+        return ObjectMapper.Map<MaintenanceVisit, MaintenanceVisitDto>(visit);
+    }
+
+    [Authorize(MyERPPermissions.Assets.Delete)]
+    public async Task DeleteVisitAsync(Guid id)
+    {
+        var visit = await _visitRepo.GetAsync(id);
+        if (visit.CompletionStatus == MaintenanceVisitStatus.Completed)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("message", "Cannot delete a completed visit.");
+        }
+        await _visitRepo.DeleteAsync(id);
+    }
+}
+

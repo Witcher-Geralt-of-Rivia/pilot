@@ -1,0 +1,86 @@
+<abp-page [title]="'::Employees' | abpLocalization">
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <span class="text-muted small">{{ store.totalCount() }} {{ '::Results' | abpLocalization }}</span>
+    <button class="btn btn-primary btn-sm" routerLink="new">
+      <i class="fa fa-user-plus me-1"></i> {{ '::NewEmployee' | abpLocalization }}
+    </button>
+  </div>
+
+  <div class="card">
+    <div class="card-body">
+      <!-- Search -->
+      <div class="row mb-3">
+        <div class="col-auto ms-auto">
+          <div class="input-group input-group-sm" style="width: 250px;">
+            <span class="input-group-text"><i class="fa fa-search"></i></span>
+            <input type="text" class="form-control"
+              [placeholder]="'::Search' | abpLocalization"
+              [(ngModel)]="searchTerm"
+              (keyup.enter)="onSearch(searchTerm)" />
+          </div>
+        </div>
+      </div>
+
+      @if (store.isLoading()) {
+        <div class="text-center py-5">
+          <div class="spinner-border text-primary" role="status">
+            <span class="visually-hidden">Loading...</span>
+          </div>
+        </div>
+      } @else if (store.entities().length === 0) {
+        <div class="text-center py-5">
+          <i class="fa fa-id-badge fa-3x text-muted mb-3 d-block"></i>
+          <h6 class="text-muted">{{ '::NoRecordsFound' | abpLocalization }}</h6>
+          <p class="text-muted small mb-3">{{ '::NoEmployeesYet' | abpLocalization }}</p>
+          <button class="btn btn-primary btn-sm" routerLink="new">
+            <i class="fa fa-user-plus me-1"></i>{{ '::NewEmployee' | abpLocalization }}
+          </button>
+        </div>
+      } @else {
+        <div class="table-responsive">
+                    <table class="table table-hover w-100">
+            <thead>
+              <tr>
+                <th>{{ '::EmployeeId' | abpLocalization }}</th>
+                <th style="min-width: 150px;">{{ '::Name' | abpLocalization }}</th>
+                <th>{{ '::Department' | abpLocalization }}</th>
+                <th>{{ '::Designation' | abpLocalization }}</th>
+                <th>{{ '::Status' | abpLocalization }}</th>
+                <th class="text-end" style="width: 100px;"></th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (row of store.entities(); track row.id ?? $index) {
+                <tr>
+                  <td>{{ row.employeeId || '—' }}</td>
+                  <td class="fw-medium text-truncate" style="max-width: 200px;" [title]="(row.firstName ?? '') + ' ' + (row.lastName ?? '')"><a [routerLink]="['/hr/employees', row.id, 'edit']" class="text-decoration-none">{{ (row.firstName ?? '') + ' ' + (row.lastName ?? '') }}</a></td>
+                  <td>{{ row.department ?? '—' }}</td>
+                  <td>{{ row.designation ?? '—' }}</td>
+                  <td><app-status-badge [status]="row.status ?? ''" /></td>
+                  <td class="text-end">
+                    <div class="btn-group btn-group-sm">
+                      <button class="btn btn-outline-primary" [routerLink]="[row.id, 'edit']"
+                        title="Edit" aria-label="Edit">
+                        <i class="fa fa-pencil"></i>
+                      </button>
+                      <button class="btn btn-outline-danger" (click)="delete(row.id)"
+                        title="Delete" aria-label="Delete">
+                        <i class="fa fa-trash"></i>
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        </div>
+      }
+    </div>
+  </div>
+
+  <app-pagination
+    [totalCount]="store.totalCount()"
+    [pageSize]="20"
+    [currentPage]="0"
+    (pageChange)="onPageChange($event)" />
+</abp-page>

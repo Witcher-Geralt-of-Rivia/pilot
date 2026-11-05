@@ -1,0 +1,201 @@
+using System;
+using MyERP.Inventory.Entities;
+using Shouldly;
+using Volo.Abp;
+using Xunit;
+
+namespace MyERP.Inventory;
+
+public class QualityInspectionTests
+{
+    private static QualityInspection CreateQI()
+        => new(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), InspectionType.Incoming, DateTime.UtcNow);
+
+    [Fact]
+    public void Create_SetsDefaults()
+    {
+        var qi = CreateQI();
+        qi.Status.ShouldBe(InspectionStatus.Draft);
+        qi.DocStatus.ShouldBe(Core.DocumentStatus.Draft);
+        qi.Readings.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public void AddReading_ValueBased_Accepted()
+    {
+        var qi = CreateQI();
+        qi.AddReading("Color", "Red", null, null, "Red");
+        qi.Evaluate();
+        qi.Status.ShouldBe(InspectionStatus.Accepted);
+        qi.Readings[0].Status.ShouldBe(InspectionStatus.Accepted);
+    }
+
+    [Fact]
+    public void AddReading_ValueBased_Rejected()
+    {
+        var qi = CreateQI();
+        qi.AddReading("Color", "Red", null, null, "Blue");
+        qi.Evaluate();
+        qi.Status.ShouldBe(InspectionStatus.Rejected);
+    }
+
+    [Fact]
+    public void AddReading_NumericInRange_Accepted()
+    {
+        var qi = CreateQI();
+        qi.AddReading("Weight", null, 10m, 20m, "15.5", isNumeric: true);
+        qi.Evaluate();
+        qi.Readings[0].Status.ShouldBe(InspectionStatus.Accepted);
+    }
+
+    [Fact]
+    public void AddReading_NumericOutOfRange_Rejected()
+    {
+        var qi = CreateQI();
+        qi.AddReading("Weight", null, 10m, 20m, "25", isNumeric: true);
+        qi.Evaluate();
+        qi.Readings[0].Status.ShouldBe(InspectionStatus.Rejected);
+    }
+
+    [Fact]
+    public void ManualInspection_OverridesRejection()
+    {
+        var qi = CreateQI();
+        qi.ManualInspection = true;
+        qi.AddReading("Appearance", "Good", null, null, "Bad");
+        qi.Evaluate();
+        qi.Status.ShouldBe(InspectionStatus.Accepted); // manual override
+    }
+
+    [Fact]
+    public void Submit_WithReadings_Succeeds()
+    {
+        var qi = CreateQI();
+        qi.AddReading("Test", "OK", null, null, "OK");
+        qi.Submit();
+        qi.DocStatus.ShouldBe(Core.DocumentStatus.Submitted);
+    }
+
+    [Fact]
+    public void Submit_WithoutReadings_Throws()
+    {
+        var qi = CreateQI();
+        Should.Throw<BusinessException>(() => qi.Submit());
+    }
+
+    [Fact]
+    public void Cancel_Submitted_Succeeds()
+    {
+        var qi = CreateQI();
+        qi.AddReading("Test", "OK", null, null, "OK");
+        qi.Submit();
+        qi.Cancel();
+        qi.DocStatus.ShouldBe(Core.DocumentStatus.Cancelled);
+    }
+
+    [Fact]
+    public void MultipleReadings_OneRejected_OverallRejected()
+    {
+        var qi = CreateQI();
+        qi.AddReading("Color", "Red", null, null, "Red");
+        qi.AddReading("Weight", null, 10m, 20m, "25", isNumeric: true);
+        qi.Evaluate();
+        qi.Status.ShouldBe(InspectionStatus.Rejected);
+    }
+
+    [Fact]
+    public void AddReading_FormulaBased_Accepted()
+    {
+        var qi = CreateQI();
+        qi.AddReading("Tensile Strength", null, null, null, "15",
+            formulaBased: true, formula: "reading_1 >= 10 and reading_1 <= 20");
+        qi.Evaluate();
+        qi.Readings[0].Status.ShouldBe(InspectionStatus.Accepted);
+        qi.Status.ShouldBe(InspectionStatus.Accepted);
+    }
+
+    [Fact]
+    public void AddReading_FormulaBased_Rejected()
+    {
+        var qi = CreateQI();
+        qi.AddReading("Tensile Strength", null, null, null, "25",
+            formulaBased: true, formula: "reading_1 >= 10 and reading_1 <= 20");
+        qi.Evaluate();
+        qi.Readings[0].Status.ShouldBe(InspectionStatus.Rejected);
+        qi.Status.ShouldBe(InspectionStatus.Rejected);
+    }
+
+    [Fact]
+    public void AddReading_FormulaBased_MissingFormula_Throws()
+    {
+        var qi = CreateQI();
+        qi.AddReading("Tensile Strength", null, null, null, "15",
+            formulaBased: true, formula: null);
+        Should.Throw<BusinessException>(() => qi.Evaluate());
+    }
+
+    [Fact]
+    public void AddReading_FormulaBased_InvalidFormula_Throws()
+    {
+        var qi = CreateQI();
+        qi.AddReading("Tensile Strength", null, null, null, "15",
+            formulaBased: true, formula: "reading_1 >=");
+        Should.Throw<BusinessException>(() => qi.Evaluate());
+    }
+
+    [Fact]
+    public void Submit_ZeroOrNegativeSampleSize_Throws()
+    {
+        var qi = CreateQI();
+        qi.AddReading("Color", "Red", null, null, "Red");
+        qi.SampleSize = 0;
+        Should.Throw<BusinessException>(() => qi.Submit());
+
+        qi.SampleSize = -2.5m;
+        Should.Throw<BusinessException>(() => qi.Submit());
+    }
+
+    [Fact]
+    public void Submit_PositiveSampleSize_Succeeds()
+    {
+        var qi = CreateQI();
+        qi.AddReading("Color", "Red", null, null, "Red");
+        qi.SampleSize = 5;
+        qi.Submit();
+        qi.DocStatus.ShouldBe(Core.DocumentStatus.Submitted);
+    }
+
+    // --- ERPNext PR #59808: Keep manual reading status on inspections ---
+
+    [Fact]
+    public void Evaluate_ManualReadingStatus_PreservesManuallyRejectedReading()
+    {
+        var qi = CreateQI();
+        // Reading matches expected "OK", but manual inspection has explicitly rejected it
+        qi.AddReading("Finish", "OK", null, null, "OK",
+            manualInspection: true, status: InspectionStatus.Rejected);
+
+        qi.Evaluate();
+
+        // Reading status must stay Rejected despite value matching expected "OK"
+        qi.Readings[0].Status.ShouldBe(InspectionStatus.Rejected);
+        qi.Status.ShouldBe(InspectionStatus.Rejected);
+    }
+
+    [Fact]
+    public void Evaluate_ManualInspection_PreservesExplicitInspectionStatus()
+    {
+        var qi = CreateQI();
+        qi.ManualInspection = true;
+        qi.SetStatus(InspectionStatus.Rejected);
+
+        // Reading evaluates to Accepted
+        qi.AddReading("Color", "Red", null, null, "Red");
+
+        qi.Evaluate();
+
+        // Reading is accepted, but inspector's overall manual status remains Rejected
+        qi.Readings[0].Status.ShouldBe(InspectionStatus.Accepted);
+        qi.Status.ShouldBe(InspectionStatus.Rejected);
+    }
+}

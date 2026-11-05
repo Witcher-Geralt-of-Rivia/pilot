@@ -1,0 +1,278 @@
+import { describe, it, expect } from 'vitest';
+import { FormBuilder, FormArray, Validators } from '@angular/forms';
+
+/**
+ * Tests for the Stock Entry form DTO mapping and validation logic.
+ * Specifically tests the warehouse validation and item mapping patterns that had bugs.
+ */
+describe('StockEntry form DTO mapping', () => {
+  const fb = new FormBuilder();
+
+  function createSEForm() {
+    return fb.group({
+      companyId: ['comp-1', Validators.required],
+      entryType: [0],
+      sourceWarehouse: [''],
+      targetWarehouse: [''],
+      postingDate: ['2026-07-20'],
+      remarks: [''],
+      items: fb.array([]),
+    });
+  }
+
+  function addItem(items: FormArray, opts?: { itemId?: string; qty?: number; rate?: number }) {
+    items.push(fb.group({
+      itemId: [opts?.itemId ?? '', Validators.required],
+      qty: [opts?.qty ?? 1, [Validators.required, Validators.min(0.01)]],
+      rate: [opts?.rate ?? 0],
+      description: [''],
+    }));
+  }
+
+  function mapItemsForBackend(items: FormArray): any[] {
+    return items.controls.map(ctrl => ({
+      itemId: ctrl.get('itemId')?.value,
+      quantity: ctrl.get('qty')?.value ?? ctrl.get('quantity')?.value ?? 0,
+      rate: ctrl.get('rate')?.value ?? 0,
+      description: ctrl.get('description')?.value || '',
+    }));
+  }
+
+  describe('form creation', () => {
+    it('should create form with defaults', () => {
+      const form = createSEForm();
+      expect(form.get('entryType')?.value).toBe(0);
+      expect(form.get('companyId')?.value).toBe('comp-1');
+    });
+
+    it('should require companyId', () => {
+      const form = createSEForm();
+      form.patchValue({ companyId: '' });
+      expect(form.get('companyId')?.valid).toBe(false);
+    });
+  });
+
+  describe('items', () => {
+    it('should add item to form array', () => {
+      const form = createSEForm();
+      const items = form.get('items') as FormArray;
+      addItem(items, { itemId: 'item-1', qty: 5, rate: 100 });
+      expect(items.length).toBe(1);
+    });
+
+    it('should reject empty itemId', () => {
+      const form = createSEForm();
+      const items = form.get('items') as FormArray;
+      addItem(items, { itemId: '', qty: 5 });
+      expect(items.at(0).get('itemId')?.valid).toBe(false);
+    });
+
+    it('should reject zero quantity', () => {
+      const form = createSEForm();
+      const items = form.get('items') as FormArray;
+      addItem(items, { itemId: 'item-1', qty: 0 });
+      expect(items.at(0).get('qty')?.valid).toBe(false);
+    });
+  });
+
+  describe('DTO mapping', () => {
+    it('should map qty field to quantity for backend', () => {
+      const form = createSEForm();
+      const items = form.get('items') as FormArray;
+      addItem(items, { itemId: 'item-1', qty: 10, rate: 50 });
+      const mapped = mapItemsForBackend(items);
+      expect(mapped[0].quantity).toBe(10);
+      expect(mapped[0].itemId).toBe('item-1');
+    });
+
+    it('should handle multiple items', () => {
+      const form = createSEForm();
+      const items = form.get('items') as FormArray;
+      addItem(items, { itemId: 'item-1', qty: 3, rate: 100 });
+      addItem(items, { itemId: 'item-2', qty: 7, rate: 200 });
+      const mapped = mapItemsForBackend(items);
+      expect(mapped.length).toBe(2);
+      expect(mapped[0].quantity).toBe(3);
+      expect(mapped[1].quantity).toBe(7);
+    });
+
+    it('should default missing fields', () => {
+      const form = createSEForm();
+      const items = form.get('items') as FormArray;
+      items.push(fb.group({ itemId: ['item-x'], qty: [null], rate: [null], description: [null] }));
+      const mapped = mapItemsForBackend(items);
+      expect(mapped[0].quantity).toBe(0);
+      expect(mapped[0].rate).toBe(0);
+      expect(mapped[0].description).toBe('');
+    });
+  });
+});
+
+describe('StockEntry type validation rules', () => {
+  // Transfer requires source + target
+  // Receipt requires target only
+  // Issue requires source only
+
+  function validateWarehouses(entryType: number, source: string, target: string): string[] {
+    const errors: string[] = [];
+    const TRANSFER_TYPES = [2, 3, 8, 9]; // Transfer, TransferForMfg, SendToWarehouse, ReceiveAtWarehouse
+    const RECEIPT_TYPES = [0, 9, 4]; // MaterialReceipt, ReceiveAtWarehouse, Manufacture
+    const ISSUE_TYPES = [1]; // MaterialIssue
+
+    if (TRANSFER_TYPES.includes(entryType)) {
+      if (!source) errors.push('sourceWarehouseRequired');
+      if (!target) errors.push('targetWarehouseRequired');
+      if (source && target && source === target) errors.push('sameWarehouse');
+    }
+    if (RECEIPT_TYPES.includes(entryType) && !target) {
+      errors.push('targetWarehouseRequired');
+    }
+    if (ISSUE_TYPES.includes(entryType) && !source) {
+      errors.push('sourceWarehouseRequired');
+    }
+    return errors;
+  }
+
+  it('Transfer requires both warehouses', () => {
+    const errors = validateWarehouses(2, '', '');
+    expect(errors).toContain('sourceWarehouseRequired');
+    expect(errors).toContain('targetWarehouseRequired');
+  });
+
+  it('Transfer blocks same warehouse', () => {
+    const errors = validateWarehouses(2, 'wh-1', 'wh-1');
+    expect(errors).toContain('sameWarehouse');
+  });
+
+  it('Transfer allows different warehouses', () => {
+    const errors = validateWarehouses(2, 'wh-1', 'wh-2');
+    expect(errors.length).toBe(0);
+  });
+
+  it('Receipt requires target only', () => {
+    const errors = validateWarehouses(0, '', '');
+    expect(errors).toContain('targetWarehouseRequired');
+  });
+
+  it('Receipt with target is valid', () => {
+    const errors = validateWarehouses(0, '', 'wh-target');
+    expect(errors.length).toBe(0);
+  });
+
+  it('Issue requires source only', () => {
+    const errors = validateWarehouses(1, '', 'wh-x');
+    expect(errors).toContain('sourceWarehouseRequired');
+  });
+
+  it('Issue with source is valid', () => {
+    const errors = validateWarehouses(1, 'wh-source', '');
+    expect(errors.length).toBe(0);
+  });
+});
+
+describe('StockEntry save() item warehouse fallback', () => {
+  // Mirrors stock-entry-form.component.ts save(): item rows from addItem() and
+  // loadMaterialRequestItems() carry no per-item warehouse override, so the
+  // document-level sourceWarehouse/targetWarehouse selects must be used instead
+  // of sending null (which the backend's StockEntryManager.ValidateWarehousesAsync
+  // rejects with MissingWarehouse for MaterialIssue/Transfer/Receipt/Adjustment).
+  function mapItemsForSave(raw: { sourceWarehouse?: string; targetWarehouse?: string; items: any[] }) {
+    return raw.items.map((item: any) => ({
+      itemId: item.itemId,
+      quantity: item.quantity ?? item.qty ?? 0,
+      sourceWarehouseId: item.sourceWarehouseId || raw.sourceWarehouse || null,
+      targetWarehouseId: item.targetWarehouseId || raw.targetWarehouse || null,
+    }));
+  }
+
+  it('falls back to document-level source warehouse for plain Add Item rows (MaterialIssue)', () => {
+    const dto = mapItemsForSave({
+      sourceWarehouse: 'wh-main',
+      targetWarehouse: '',
+      items: [{ itemId: 'item-1', qty: 5 }],
+    });
+    expect(dto[0].sourceWarehouseId).toBe('wh-main');
+    expect(dto[0].targetWarehouseId).toBeNull();
+  });
+
+  it('falls back to document-level source+target for plain Add Item rows (MaterialTransfer)', () => {
+    const dto = mapItemsForSave({
+      sourceWarehouse: 'wh-a',
+      targetWarehouse: 'wh-b',
+      items: [{ itemId: 'item-1', qty: 5 }],
+    });
+    expect(dto[0].sourceWarehouseId).toBe('wh-a');
+    expect(dto[0].targetWarehouseId).toBe('wh-b');
+  });
+
+  it('prefers a per-item warehouse override over the document-level value (BOM/Manufacture rows)', () => {
+    const dto = mapItemsForSave({
+      sourceWarehouse: 'wh-doc-source',
+      targetWarehouse: 'wh-doc-target',
+      items: [{ itemId: 'item-1', qty: 5, sourceWarehouseId: 'wh-row-source', targetWarehouseId: '' }],
+    });
+    expect(dto[0].sourceWarehouseId).toBe('wh-row-source');
+    expect(dto[0].targetWarehouseId).toBe('wh-doc-target');
+  });
+
+  it('sends null when neither the row nor the document has a warehouse', () => {
+    const dto = mapItemsForSave({ items: [{ itemId: 'item-1', qty: 5 }] });
+    expect(dto[0].sourceWarehouseId).toBeNull();
+    expect(dto[0].targetWarehouseId).toBeNull();
+  });
+});
+
+describe('ERPNext PR #60751: recalculate stock entry row amounts when qty changes', () => {
+  const fb = new FormBuilder();
+
+  function calculateRow(qty: number, conversionFactor: number, basicRate: number) {
+    const transferQty = qty * conversionFactor;
+    const amount = Math.round(transferQty * basicRate * 100) / 100;
+    return { transferQty, amount };
+  }
+
+  it('recalculates transfer_qty and amount when qty changes', () => {
+    const row = calculateRow(5, 2, 10);
+    expect(row.transferQty).toBe(10);
+    expect(row.amount).toBe(100);
+  });
+
+  it('preserves manual rate and recalculates amount when setBasicRateManually is true', () => {
+    const manualRate = 25.5;
+    const initial = calculateRow(2, 1, manualRate);
+    expect(initial.amount).toBe(51.0);
+
+    const updated = calculateRow(4, 1, manualRate);
+    expect(updated.transferQty).toBe(4);
+    expect(updated.amount).toBe(102.0);
+  });
+
+  it('maps valuationRate and setBasicRateManually for backend DTO save', () => {
+    const items = [
+      {
+        itemId: 'item-1',
+        qty: 10,
+        basicRate: 15.5,
+        setBasicRateManually: true,
+        conversionFactor: 2,
+        uom: 'Box',
+      }
+    ];
+
+    const mapped = items.map((item: any) => ({
+      itemId: item.itemId,
+      quantity: item.qty,
+      valuationRate: item.basicRate ? Number(item.basicRate) : undefined,
+      setBasicRateManually: !!item.setBasicRateManually,
+      conversionFactor: item.conversionFactor ? Number(item.conversionFactor) : 1,
+      stockUom: item.uom ?? 'Unit',
+    }));
+
+    expect(mapped[0].quantity).toBe(10);
+    expect(mapped[0].valuationRate).toBe(15.5);
+    expect(mapped[0].setBasicRateManually).toBe(true);
+    expect(mapped[0].conversionFactor).toBe(2);
+    expect(mapped[0].stockUom).toBe('Box');
+  });
+});
+

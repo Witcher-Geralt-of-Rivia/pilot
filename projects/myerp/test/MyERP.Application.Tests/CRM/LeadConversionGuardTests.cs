@@ -1,0 +1,483 @@
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using MyERP.Core.Entities;
+using MyERP.CRM.Entities;
+using MyERP.Inventory;
+using MyERP.Inventory.Entities;
+using MyERP.Sales;
+using MyERP.Sales.Entities;
+using Shouldly;
+using Volo.Abp;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Modularity;
+using Xunit;
+
+namespace MyERP.CRM;
+
+public abstract class LeadConversionGuardTests<TStartupModule> : MyERPApplicationTestBase<TStartupModule>
+    where TStartupModule : IAbpModule
+{
+    [Fact]
+    public async Task ConvertToCustomerAsync_FromNewLead_CreatesCustomerAndMarksConverted()
+    {
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var companyRepo = GetRequiredService<IRepository<Company, Guid>>();
+            var leadRepo = GetRequiredService<IRepository<Lead, Guid>>();
+            var customerRepo = GetRequiredService<IRepository<Customer, Guid>>();
+            var leadAppService = GetRequiredService<ILeadAppService>();
+
+            var company = await companyRepo.InsertAsync(new Company(Guid.NewGuid(), "Lead Conv Co 1"), autoSave: true);
+            var lead = new Lead(Guid.NewGuid(), company.Id, "LEAD-CONV-01", "Charlie")
+            {
+                LastName = "Brown",
+                CompanyName = "Peanuts Corp",
+                Email = "charlie@peanuts.com"
+            };
+            await leadRepo.InsertAsync(lead, autoSave: true);
+
+            var customerId = await leadAppService.ConvertToCustomerAsync(new ConvertLeadToCustomerDto
+            {
+                LeadId = lead.Id,
+            });
+
+            var customer = await customerRepo.GetAsync(customerId);
+            customer.Name.ShouldBe("Peanuts Corp");
+            customer.CompanyId.ShouldBe(company.Id);
+
+            var updatedLead = await leadRepo.GetAsync(lead.Id);
+            updatedLead.Status.ShouldBe(LeadStatus.Converted);
+            updatedLead.ConvertedCustomerId.ShouldBe(customerId);
+        });
+    }
+
+    [Fact]
+    public async Task ConvertToCustomerAsync_AlreadyConvertedLead_Throws()
+    {
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var companyRepo = GetRequiredService<IRepository<Company, Guid>>();
+            var leadRepo = GetRequiredService<IRepository<Lead, Guid>>();
+            var leadAppService = GetRequiredService<ILeadAppService>();
+
+            var company = await companyRepo.InsertAsync(new Company(Guid.NewGuid(), "Lead Conv Co 2"), autoSave: true);
+            var lead = new Lead(Guid.NewGuid(), company.Id, "LEAD-CONV-02", "David");
+            lead.ConvertToCustomer(Guid.NewGuid());
+            await leadRepo.InsertAsync(lead, autoSave: true);
+
+            var ex = await Should.ThrowAsync<BusinessException>(() =>
+                leadAppService.ConvertToCustomerAsync(new ConvertLeadToCustomerDto
+                {
+                    LeadId = lead.Id
+                }));
+
+            ex.Code.ShouldBe(MyERPDomainErrorCodes.InvalidStatusTransition);
+        });
+    }
+
+    [Fact]
+    public async Task ConvertToCustomerAsync_LostLead_Throws()
+    {
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var companyRepo = GetRequiredService<IRepository<Company, Guid>>();
+            var leadRepo = GetRequiredService<IRepository<Lead, Guid>>();
+            var leadAppService = GetRequiredService<ILeadAppService>();
+
+            var company = await companyRepo.InsertAsync(new Company(Guid.NewGuid(), "Lead Conv Co 3"), autoSave: true);
+            var lead = new Lead(Guid.NewGuid(), company.Id, "LEAD-CONV-03", "Eve");
+            lead.MarkOpen();
+            lead.MarkLost();
+            await leadRepo.InsertAsync(lead, autoSave: true);
+
+            var ex = await Should.ThrowAsync<BusinessException>(() =>
+                leadAppService.ConvertToCustomerAsync(new ConvertLeadToCustomerDto
+                {
+                    LeadId = lead.Id
+                }));
+
+            ex.Code.ShouldBe(MyERPDomainErrorCodes.InvalidStatusTransition);
+        });
+    }
+
+    [Fact]
+    public async Task ConvertToCustomerAsync_GroupCustomerGroup_Throws()
+    {
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var companyRepo = GetRequiredService<IRepository<Company, Guid>>();
+            var leadRepo = GetRequiredService<IRepository<Lead, Guid>>();
+            var groupRepo = GetRequiredService<IRepository<CustomerGroup, Guid>>();
+            var leadAppService = GetRequiredService<ILeadAppService>();
+
+            var company = await companyRepo.InsertAsync(new Company(Guid.NewGuid(), "Lead Conv Co 4"), autoSave: true);
+            var lead = new Lead(Guid.NewGuid(), company.Id, "LEAD-CONV-04", "Frank");
+            await leadRepo.InsertAsync(lead, autoSave: true);
+
+            var groupNode = new CustomerGroup(Guid.NewGuid(), "All Groups Node", null, isGroup: true);
+            await groupRepo.InsertAsync(groupNode, autoSave: true);
+
+            var ex = await Should.ThrowAsync<BusinessException>(() =>
+                leadAppService.ConvertToCustomerAsync(new ConvertLeadToCustomerDto
+                {
+                    LeadId = lead.Id,
+                    CustomerGroupId = groupNode.Id
+                }));
+
+            ex.Code.ShouldBe(MyERPDomainErrorCodes.ValidationFailed);
+        });
+    }
+
+    [Fact]
+    public async Task ConvertToOpportunityAsync_NewLead_Throws()
+    {
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var companyRepo = GetRequiredService<IRepository<Company, Guid>>();
+            var leadRepo = GetRequiredService<IRepository<Lead, Guid>>();
+            var leadAppService = GetRequiredService<ILeadAppService>();
+
+            var company = await companyRepo.InsertAsync(new Company(Guid.NewGuid(), "Lead Conv Co 5"), autoSave: true);
+            var lead = new Lead(Guid.NewGuid(), company.Id, "LEAD-CONV-05", "Grace");
+            // Status is New (not Open, Interested, Qualified, Replied)
+            await leadRepo.InsertAsync(lead, autoSave: true);
+
+            var ex = await Should.ThrowAsync<BusinessException>(() =>
+                leadAppService.ConvertToOpportunityAsync(new ConvertLeadToOpportunityDto
+                {
+                    LeadId = lead.Id,
+                    Title = "Grace Opportunity"
+                }));
+
+            ex.Code.ShouldBe(MyERPDomainErrorCodes.InvalidStatusTransition);
+        });
+    }
+
+    [Fact]
+    public async Task ConvertToOpportunityAsync_OpenLead_CreatesOpportunityAndMarksConverted()
+    {
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var companyRepo = GetRequiredService<IRepository<Company, Guid>>();
+            var leadRepo = GetRequiredService<IRepository<Lead, Guid>>();
+            var oppRepo = GetRequiredService<IRepository<Opportunity, Guid>>();
+            var leadAppService = GetRequiredService<ILeadAppService>();
+
+            var company = await companyRepo.InsertAsync(new Company(Guid.NewGuid(), "Lead Conv Co 6"), autoSave: true);
+            var lead = new Lead(Guid.NewGuid(), company.Id, "LEAD-CONV-06", "Hank");
+            lead.MarkOpen();
+            await leadRepo.InsertAsync(lead, autoSave: true);
+
+            var oppDto = await leadAppService.ConvertToOpportunityAsync(new ConvertLeadToOpportunityDto
+            {
+                LeadId = lead.Id,
+                Title = "Hank Opportunity Deal",
+                OpportunityAmount = 2500m,
+            });
+
+            oppDto.CompanyId.ShouldBe(company.Id);
+            oppDto.LeadId.ShouldBe(lead.Id);
+            oppDto.OpportunityAmount.ShouldBe(2500m);
+
+            var opp = await oppRepo.GetAsync(oppDto.Id);
+            opp.Title.ShouldBe("Hank Opportunity Deal");
+
+            var updatedLead = await leadRepo.GetAsync(lead.Id);
+            updatedLead.Status.ShouldBe(LeadStatus.Converted);
+            updatedLead.ConvertedOpportunityId.ShouldBe(opp.Id);
+        });
+    }
+
+    [Fact]
+    public async Task UpdateLead_AlreadyConverted_Throws()
+    {
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var companyRepo = GetRequiredService<IRepository<Company, Guid>>();
+            var leadRepo = GetRequiredService<IRepository<Lead, Guid>>();
+            var leadAppService = GetRequiredService<ILeadAppService>();
+
+            var company = await companyRepo.InsertAsync(new Company(Guid.NewGuid(), "Lead Conv Co 7"), autoSave: true);
+            var lead = new Lead(Guid.NewGuid(), company.Id, "LEAD-CONV-07", "Ivy");
+            lead.ConvertToCustomer(Guid.NewGuid());
+            await leadRepo.InsertAsync(lead, autoSave: true);
+
+            var ex = await Should.ThrowAsync<BusinessException>(() =>
+                leadAppService.UpdateAsync(lead.Id, new UpdateLeadDto
+                {
+                    FirstName = "Ivy Renamed"
+                }));
+
+            ex.Code.ShouldBe(MyERPDomainErrorCodes.InvalidStatusTransition);
+        });
+    }
+
+    [Fact]
+    public async Task ConvertToCustomerAsync_CustomerAlreadyExistsForLead_ThrowsLeadAlreadyConverted()
+    {
+        // ERPNext PR #59891 / commit 718d79701b: refuse converting a lead into a second customer
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var companyRepo = GetRequiredService<IRepository<Company, Guid>>();
+            var leadRepo = GetRequiredService<IRepository<Lead, Guid>>();
+            var customerRepo = GetRequiredService<IRepository<Customer, Guid>>();
+            var leadAppService = GetRequiredService<ILeadAppService>();
+
+            var company = await companyRepo.InsertAsync(new Company(Guid.NewGuid(), "Lead Conv Co 8"), autoSave: true);
+            var lead = new Lead(Guid.NewGuid(), company.Id, "LEAD-CONV-08", "John");
+            await leadRepo.InsertAsync(lead, autoSave: true);
+
+            var existingCust = new Customer(Guid.NewGuid(), company.Id, "Existing John Cust")
+            {
+                LeadId = lead.Id
+            };
+            await customerRepo.InsertAsync(existingCust, autoSave: true);
+
+            var ex = await Should.ThrowAsync<BusinessException>(() =>
+                leadAppService.ConvertToCustomerAsync(new ConvertLeadToCustomerDto
+                {
+                    LeadId = lead.Id
+                }));
+
+            ex.Code.ShouldBe(MyERPDomainErrorCodes.LeadAlreadyConverted);
+        });
+    }
+
+    [Fact]
+    public async Task OpportunityAppService_ConvertToCustomerAsync_Success()
+    {
+        // ERPNext PR #59890 / commit 167380e7f4: convert opportunity to customer
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var companyRepo = GetRequiredService<IRepository<Company, Guid>>();
+            var leadRepo = GetRequiredService<IRepository<Lead, Guid>>();
+            var oppRepo = GetRequiredService<IRepository<Opportunity, Guid>>();
+            var oppAppService = GetRequiredService<IOpportunityAppService>();
+            var customerRepo = GetRequiredService<IRepository<Customer, Guid>>();
+
+            var company = await companyRepo.InsertAsync(new Company(Guid.NewGuid(), "Opp Conv Co 1"), autoSave: true);
+            var lead = new Lead(Guid.NewGuid(), company.Id, "LEAD-OPP-01", "Alice");
+            await leadRepo.InsertAsync(lead, autoSave: true);
+
+            var opp = new Opportunity(Guid.NewGuid(), company.Id, "OPP-001", "Big Deal")
+            {
+                LeadId = lead.Id,
+                ContactName = "Alice In Chains"
+            };
+            await oppRepo.InsertAsync(opp, autoSave: true);
+
+            var customerId = await oppAppService.ConvertToCustomerAsync(new ConvertOpportunityToCustomerDto
+            {
+                OpportunityId = opp.Id
+            });
+
+            var customer = await customerRepo.GetAsync(customerId);
+            customer.Name.ShouldBe("Alice In Chains");
+            customer.OpportunityId.ShouldBe(opp.Id);
+            customer.LeadId.ShouldBe(lead.Id);
+
+            var updatedOpp = await oppRepo.GetAsync(opp.Id);
+            updatedOpp.CustomerId.ShouldBe(customerId);
+
+            var updatedLead = await leadRepo.GetAsync(lead.Id);
+            updatedLead.ConvertedCustomerId.ShouldBe(customerId);
+        });
+    }
+
+    [Fact]
+    public async Task OpportunityAppService_ConvertToCustomerAsync_AlreadyForCustomer_Throws()
+    {
+        // ERPNext PR #59890: refuse when opportunity already is for a customer
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var companyRepo = GetRequiredService<IRepository<Company, Guid>>();
+            var oppRepo = GetRequiredService<IRepository<Opportunity, Guid>>();
+            var oppAppService = GetRequiredService<IOpportunityAppService>();
+
+            var company = await companyRepo.InsertAsync(new Company(Guid.NewGuid(), "Opp Conv Co 2"), autoSave: true);
+            var opp = new Opportunity(Guid.NewGuid(), company.Id, "OPP-002", "Customer Deal")
+            {
+                CustomerId = Guid.NewGuid()
+            };
+            await oppRepo.InsertAsync(opp, autoSave: true);
+
+            var ex = await Should.ThrowAsync<BusinessException>(() =>
+                oppAppService.ConvertToCustomerAsync(new ConvertOpportunityToCustomerDto
+                {
+                    OpportunityId = opp.Id
+                }));
+
+            ex.Code.ShouldBe(MyERPDomainErrorCodes.OpportunityAlreadyHasCustomer);
+        });
+    }
+
+    [Fact]
+    public async Task OpportunityAppService_ConvertToCustomerAsync_CustomerExistsForLead_Throws()
+    {
+        // ERPNext PR #59890: refuse when customer already exists for the opportunity's lead
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var companyRepo = GetRequiredService<IRepository<Company, Guid>>();
+            var leadRepo = GetRequiredService<IRepository<Lead, Guid>>();
+            var oppRepo = GetRequiredService<IRepository<Opportunity, Guid>>();
+            var customerRepo = GetRequiredService<IRepository<Customer, Guid>>();
+            var oppAppService = GetRequiredService<IOpportunityAppService>();
+
+            var company = await companyRepo.InsertAsync(new Company(Guid.NewGuid(), "Opp Conv Co 3"), autoSave: true);
+            var lead = new Lead(Guid.NewGuid(), company.Id, "LEAD-OPP-03", "Bob");
+            await leadRepo.InsertAsync(lead, autoSave: true);
+
+            var existingCust = new Customer(Guid.NewGuid(), company.Id, "Bob Cust")
+            {
+                LeadId = lead.Id
+            };
+            await customerRepo.InsertAsync(existingCust, autoSave: true);
+
+            var opp = new Opportunity(Guid.NewGuid(), company.Id, "OPP-003", "Bob Deal")
+            {
+                LeadId = lead.Id
+            };
+            await oppRepo.InsertAsync(opp, autoSave: true);
+
+            var ex = await Should.ThrowAsync<BusinessException>(() =>
+                oppAppService.ConvertToCustomerAsync(new ConvertOpportunityToCustomerDto
+                {
+                    OpportunityId = opp.Id
+                }));
+
+            ex.Code.ShouldBe(MyERPDomainErrorCodes.OpportunityCustomerAlreadyExists);
+        });
+    }
+
+    [Fact]
+    public async Task ConvertToCustomerAsync_DisabledLead_ThrowsLeadIsDisabled()
+    {
+        // Per ERPNext PR #60227 / commit 2e7807e09c: refuse disabled leads
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var companyRepo = GetRequiredService<IRepository<Company, Guid>>();
+            var leadRepo = GetRequiredService<IRepository<Lead, Guid>>();
+            var leadAppService = GetRequiredService<ILeadAppService>();
+
+            var company = await companyRepo.InsertAsync(new Company(Guid.NewGuid(), "Lead Disabled Co 1"), autoSave: true);
+            var lead = new Lead(Guid.NewGuid(), company.Id, "LEAD-DIS-01", "DisabledLead1")
+            {
+                Disabled = true
+            };
+            await leadRepo.InsertAsync(lead, autoSave: true);
+
+            var ex = await Should.ThrowAsync<BusinessException>(() =>
+                leadAppService.ConvertToCustomerAsync(new ConvertLeadToCustomerDto
+                {
+                    LeadId = lead.Id
+                }));
+
+            ex.Code.ShouldBe(MyERPDomainErrorCodes.LeadIsDisabled);
+        });
+    }
+
+    [Fact]
+    public async Task ConvertToOpportunityAsync_DisabledLead_ThrowsLeadIsDisabled()
+    {
+        // Per ERPNext PR #60227 / commit 2e7807e09c: refuse disabled leads
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var companyRepo = GetRequiredService<IRepository<Company, Guid>>();
+            var leadRepo = GetRequiredService<IRepository<Lead, Guid>>();
+            var leadAppService = GetRequiredService<ILeadAppService>();
+
+            var company = await companyRepo.InsertAsync(new Company(Guid.NewGuid(), "Lead Disabled Co 2"), autoSave: true);
+            var lead = new Lead(Guid.NewGuid(), company.Id, "LEAD-DIS-02", "DisabledLead2")
+            {
+                Disabled = true
+            };
+            await leadRepo.InsertAsync(lead, autoSave: true);
+
+            var ex = await Should.ThrowAsync<BusinessException>(() =>
+                leadAppService.ConvertToOpportunityAsync(new ConvertLeadToOpportunityDto
+                {
+                    LeadId = lead.Id,
+                    Title = "Opp From Disabled"
+                }));
+
+            ex.Code.ShouldBe(MyERPDomainErrorCodes.LeadIsDisabled);
+        });
+    }
+
+    [Fact]
+    public async Task CreateProspectAndContactAsync_DisabledLead_ThrowsLeadIsDisabled()
+    {
+        // Per ERPNext PR #60227 / commit 2e7807e09c: refuse disabled leads
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var companyRepo = GetRequiredService<IRepository<Company, Guid>>();
+            var leadRepo = GetRequiredService<IRepository<Lead, Guid>>();
+            var leadAppService = GetRequiredService<ILeadAppService>();
+
+            var company = await companyRepo.InsertAsync(new Company(Guid.NewGuid(), "Lead Disabled Co 3"), autoSave: true);
+            var lead = new Lead(Guid.NewGuid(), company.Id, "LEAD-DIS-03", "DisabledLead3")
+            {
+                Disabled = true
+            };
+            await leadRepo.InsertAsync(lead, autoSave: true);
+
+            var ex = await Should.ThrowAsync<BusinessException>(() =>
+                leadAppService.CreateProspectAndContactAsync(lead.Id, new CreateProspectAndContactDto
+                {
+                    CreateProspect = true
+                }));
+
+            ex.Code.ShouldBe(MyERPDomainErrorCodes.LeadIsDisabled);
+        });
+    }
+
+    [Fact]
+    public async Task QuotationAppService_CreateAsync_FromOpportunityWithDisabledLead_ThrowsLeadIsDisabled()
+    {
+        // Per ERPNext PR #60227 / commit 2e7807e09c: refuse quotations against opportunity linked to disabled lead
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var companyRepo = GetRequiredService<IRepository<Company, Guid>>();
+            var seriesRepo = GetRequiredService<IRepository<DocumentSeries, Guid>>();
+            var leadRepo = GetRequiredService<IRepository<Lead, Guid>>();
+            var oppRepo = GetRequiredService<IRepository<Opportunity, Guid>>();
+            var customerRepo = GetRequiredService<IRepository<Customer, Guid>>();
+            var itemRepo = GetRequiredService<IRepository<Item, Guid>>();
+            var quotationAppService = GetRequiredService<IQuotationAppService>();
+
+            var company = await companyRepo.InsertAsync(new Company(Guid.NewGuid(), "Lead Disabled Co 4"), autoSave: true);
+            await seriesRepo.InsertAsync(new DocumentSeries(Guid.NewGuid(), company.Id, "Quotation Series", "Quotation", "QTN-"), autoSave: true);
+            var customer = await customerRepo.InsertAsync(new Customer(Guid.NewGuid(), company.Id, "Quotation Cust"), autoSave: true);
+            var item = await itemRepo.InsertAsync(new Item(Guid.NewGuid(), company.Id, "QUOT-ITEM-01", "Quot Item", ItemType.Goods), autoSave: true);
+
+            var lead = new Lead(Guid.NewGuid(), company.Id, "LEAD-DIS-04", "DisabledLead4")
+            {
+                Disabled = true
+            };
+            await leadRepo.InsertAsync(lead, autoSave: true);
+
+            var opp = new Opportunity(Guid.NewGuid(), company.Id, "OPP-DIS-01", "Opp With Disabled Lead")
+            {
+                LeadId = lead.Id,
+                CustomerId = customer.Id
+            };
+            await oppRepo.InsertAsync(opp, autoSave: true);
+
+            var ex = await Should.ThrowAsync<BusinessException>(() =>
+                quotationAppService.CreateAsync(new CreateQuotationDto
+                {
+                    CompanyId = company.Id,
+                    CustomerId = customer.Id,
+                    IssueDate = DateTime.UtcNow,
+                    OpportunityId = opp.Id,
+                    Items = new List<CreateQuotationItemDto>
+                    {
+                        new() { ItemId = item.Id, Description = item.ItemName, Quantity = 1m, UnitPrice = 100m }
+                    }
+                }));
+
+            ex.Code.ShouldBe(MyERPDomainErrorCodes.LeadIsDisabled);
+        });
+    }
+}

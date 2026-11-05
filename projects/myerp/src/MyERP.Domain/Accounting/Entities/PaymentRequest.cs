@@ -1,0 +1,155 @@
+using System;
+using MyERP.Core;
+using Volo.Abp;
+using Volo.Abp.Domain.Entities.Auditing;
+using Volo.Abp.MultiTenancy;
+
+namespace MyERP.Accounting.Entities;
+
+/// <summary>
+/// Payment Request — request for payment from customer (portal/gateway integration).
+/// Can be created from Sales Invoice, Sales Order, or Purchase Order.
+/// On payment completion, auto-creates Payment Entry.
+/// Maps to ERPNext accounts/doctype/payment_request.
+/// </summary>
+public class PaymentRequest : FullAuditedAggregateRoot<Guid>, IMultiTenant
+{
+    public Guid? TenantId { get; set; }
+    public Guid CompanyId { get; set; }
+
+    /// <summary>Payment type: Inward (receive) or Outward (pay).</summary>
+    public string PaymentRequestType { get; set; } = "Inward";
+
+    /// <summary>Source document type: SalesInvoice, SalesOrder, PurchaseOrder.</summary>
+    public string ReferenceDoctype { get; set; } = null!;
+    public Guid ReferenceId { get; set; }
+    public string? ReferenceNumber { get; set; }
+
+    /// <summary>Party (Customer or Supplier).</summary>
+    public Guid PartyId { get; set; }
+    public string PartyType { get; set; } = "Customer";
+    public string? PartyName { get; set; }
+
+    public decimal GrandTotal { get; set; }
+    public decimal OutstandingAmount { get; set; }
+    public string Currency { get; set; } = "MYR";
+
+    /// <summary>Payment gateway (if applicable).</summary>
+    public string? PaymentGateway { get; set; }
+    public string? PaymentUrl { get; set; }
+
+    /// <summary>Bank account for bank transfers.</summary>
+    public Guid? BankAccountId { get; set; }
+
+    /// <summary>Whether this payment request is linked to a recurring subscription.</summary>
+    public bool IsASubscription { get; set; }
+
+    /// <summary>Linked subscription ID if created against subscription or subscription invoice.</summary>
+    public Guid? SubscriptionId { get; set; }
+
+    public string? EmailTo { get; set; }
+    public string? Subject { get; set; }
+    public string? Message { get; set; }
+
+    public PaymentRequestStatus Status { get; private set; } = PaymentRequestStatus.Draft;
+
+    /// <summary>Created Payment Entry (after payment received).</summary>
+    public Guid? PaymentEntryId { get; set; }
+
+    protected PaymentRequest() { }
+
+    public PaymentRequest(Guid id, Guid companyId, string referenceDoctype,
+        Guid referenceId, Guid partyId, string partyType,
+        decimal grandTotal, Guid? tenantId = null) : base(id)
+    {
+        CompanyId = companyId;
+        ReferenceDoctype = referenceDoctype;
+        ReferenceId = referenceId;
+        PartyId = partyId;
+        PartyType = partyType;
+        GrandTotal = grandTotal;
+        OutstandingAmount = grandTotal;
+        TenantId = tenantId;
+    }
+
+    public void Submit()
+    {
+        if (Status != PaymentRequestStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = PaymentRequestStatus.Initiated;
+    }
+
+    public void MarkPaid(Guid paymentEntryId)
+    {
+        if (Status != PaymentRequestStatus.Initiated)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        PaymentEntryId = paymentEntryId;
+        Status = PaymentRequestStatus.Paid;
+    }
+
+    /// <summary>
+    /// Validates bank account ownership and active status.
+    /// Per ERPNext PR #62159 (commit 3419a7c410):
+    /// Company accounts must match the request's company; party accounts must match party type and ID.
+    /// </summary>
+    public void ValidateBankAccount(BankAccount? bankAccount, Guid? bankAccountId)
+    {
+        if (!bankAccountId.HasValue)
+            return;
+
+        if (bankAccount == null || bankAccount.IsDisabled)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"Bank Account {bankAccountId.Value} is missing or disabled.");
+        }
+
+        if (bankAccount.IsCompanyAccount)
+        {
+            if (bankAccount.CompanyId != CompanyId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("detail", $"Bank Account {bankAccount.AccountName} does not belong to Company {CompanyId}.");
+            }
+        }
+        else
+        {
+            if (!string.Equals(bankAccount.PartyType, PartyType, StringComparison.OrdinalIgnoreCase) || bankAccount.PartyId != PartyId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Bank Account {bankAccount.AccountName} does not belong to {PartyType} {PartyId}.");
+            }
+        }
+    }
+
+    public void Cancel()
+    {
+        if (Status == PaymentRequestStatus.Paid)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("detail", "Cannot cancel paid payment request");
+        OutstandingAmount = 0m;
+        Status = PaymentRequestStatus.Cancelled;
+    }
+
+    /// <summary>
+    /// Reopens a Paid Payment Request when its settling Payment Entry is cancelled.
+    /// Per ERPNext commit 389206f2dc: restores OutstandingAmount and sets status back to Initiated.
+    /// </summary>
+    public void ReopenOnPaymentCancelled(decimal restoredAmount = 0m)
+    {
+        if (Status == PaymentRequestStatus.Paid)
+        {
+            PaymentEntryId = null;
+            OutstandingAmount = restoredAmount > 0 ? restoredAmount : GrandTotal;
+            Status = PaymentRequestStatus.Initiated;
+        }
+    }
+}
+
+public enum PaymentRequestStatus
+{
+    Draft = 0,
+    Initiated = 1,
+    Paid = 2,
+    Cancelled = 3,
+    Failed = 4
+}

@@ -1,0 +1,853 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Volo.Abp;
+using Volo.Abp.Domain.Entities.Auditing;
+using Volo.Abp.MultiTenancy;
+
+namespace MyERP.Assets.Entities;
+
+public class Asset : FullAuditedAggregateRoot<Guid>, IMultiTenant
+{
+    public Guid? TenantId { get; set; }
+
+    public string AssetNumber { get; set; } = null!;
+    public string AssetName { get; set; } = null!;
+    public AssetStatus Status { get; private set; }
+
+    public Guid CompanyId { get; set; }
+    public Guid? AssetCategoryId { get; set; }
+    public Guid? ItemId { get; set; }
+
+    /// <summary>Denormalized display name, kept in sync with <see cref="LocationId"/> when set.</summary>
+    public string? Location { get; set; }
+
+    /// <summary>Link to the Location master (hierarchical, tree-based). Null = free-text Location only.</summary>
+    public Guid? LocationId { get; set; }
+
+    public Guid? CustodianEmployeeId { get; set; }
+
+    /// <summary>Cost Center responsible for this asset and receiving depreciation expense postings.</summary>
+    public Guid? CostCenterId { get; set; }
+
+    // Purchase
+    public DateTime PurchaseDate { get; set; }
+    public decimal PurchaseAmount { get; set; }
+    public decimal AdditionalCost { get; set; }
+    public decimal TotalAssetCost => PurchaseAmount + AdditionalCost;
+
+    /// <summary>Cumulative revaluation/impairment adjustment amount (PR #61459 / #61462).</summary>
+    [System.ComponentModel.DataAnnotations.Schema.NotMapped]
+    public decimal ValueAdjustmentAmount { get; set; }
+
+    /// <summary>Gross asset value including revaluation/impairment adjustments (PR #61462).</summary>
+    [System.ComponentModel.DataAnnotations.Schema.NotMapped]
+    public decimal GrossAssetValue => TotalAssetCost + ValueAdjustmentAmount;
+
+    /// <summary>Whether the WDV rate of depreciation was entered manually rather than derived from salvage value (PR #61473).</summary>
+    [System.ComponentModel.DataAnnotations.Schema.NotMapped]
+    public bool IsRateOfDepreciationEntered { get; set; }
+
+    /// <summary>Asset quantity (default: 1). Multiple quantity assets can be split.</summary>
+    public int AssetQuantity { get; set; } = 1;
+
+    /// <summary>Original asset ID if this asset was created by splitting another asset.</summary>
+    public Guid? SplitFromAssetId { get; set; }
+
+    /// <summary>
+    /// Indicates this asset is a composite / CWIP (Capital Work in Progress) asset.
+    /// Per ERPNext commit 3855536ef1: unsubmitted composite assets have status 'WorkInProgress'.
+    /// </summary>
+    public bool IsCompositeAsset
+    {
+        get => _isCompositeAsset;
+        set
+        {
+            _isCompositeAsset = value;
+            if (_isCompositeAsset)
+            {
+                _isCompositeComponent = false;
+                if (Status == AssetStatus.Draft)
+                {
+                    Status = AssetStatus.WorkInProgress;
+                }
+            }
+            else if (Status == AssetStatus.WorkInProgress && !_isCompositeAsset)
+            {
+                Status = AssetStatus.Draft;
+            }
+        }
+    }
+    private bool _isCompositeAsset;
+
+    /// <summary>
+    /// Indicates this asset is a composite component asset (waiting to be capitalized into a composite asset).
+    /// Per ERPNext commit 0f5be4b245: component assets do not calculate depreciation, do not require
+    /// AvailableForUseDate, and do not post standalone fixed asset GL entries upon creation.
+    /// </summary>
+    public bool IsCompositeComponent
+    {
+        get => _isCompositeComponent;
+        set
+        {
+            _isCompositeComponent = value;
+            if (_isCompositeComponent)
+            {
+                _isCompositeAsset = false;
+                CalculateDepreciation = false;
+            }
+        }
+    }
+    private bool _isCompositeComponent;
+
+    /// <summary>Source Purchase Receipt that created this asset (for return validation).</summary>
+    public Guid? PurchaseReceiptId { get; set; }
+
+    /// <summary>Source Purchase Receipt Item row that created this asset (ERPNext PR #62091).</summary>
+    public Guid? PurchaseReceiptItemId { get; set; }
+
+    /// <summary>Source Purchase Invoice that created this asset (for return validation).</summary>
+    public Guid? PurchaseInvoiceId { get; set; }
+
+    /// <summary>Source Purchase Invoice Item row that created this asset (ERPNext PR #62091).</summary>
+    public Guid? PurchaseInvoiceItemId { get; set; }
+
+    // Depreciation
+    public bool CalculateDepreciation
+    {
+        get => !_isCompositeComponent && _calculateDepreciation;
+        set => _calculateDepreciation = !_isCompositeComponent && value;
+    }
+    private bool _calculateDepreciation;
+    public DepreciationMethod DepreciationMethod { get; set; }
+    public int UsefulLifeMonths { get; set; }
+    public decimal DepreciationRate { get; set; }
+    public int FrequencyMonths { get; set; } = 12;
+    public DateTime? AvailableForUseDate { get; set; }
+    public decimal OpeningAccumulatedDepreciation { get; set; }
+    /// <summary>
+    /// Number of depreciations already booked in legacy system (for imported/existing assets).
+    /// Per ERPNext PR #59304 / commit 56f24a6adf.
+    /// </summary>
+    public int OpeningNumberOfBookedDepreciations { get; set; }
+    /// <summary>
+    /// Date when depreciation starts for this asset (for imported/existing assets).
+    /// Per ERPNext PR #59304 / commit 56f24a6adf.
+    /// </summary>
+    public DateTime? DepreciationStartDate { get; set; }
+    /// <summary>Expected residual/salvage value at end of useful life (ERPNext commit 2a89bac11d).</summary>
+    public decimal ExpectedValueAfterUsefulLife { get; set; }
+    public decimal ValueAfterDepreciation { get; set; }
+    public bool IsFullyDepreciated { get; set; }
+    /// <summary>
+    /// Snapshot of AccountsSettings.CalculateDeprUsingTotalDays at asset creation — captured
+    /// once rather than re-read live, so a later change to the company-wide setting doesn't
+    /// retroactively alter an existing asset's already-communicated schedule. When true,
+    /// Straight Line periods are weighted by actual elapsed calendar days instead of divided
+    /// equally, so a period spanning a shorter month depreciates proportionally less.
+    /// </summary>
+    public bool UseTotalDaysForDepreciation { get; set; }
+
+    // Disposal
+    public DateTime? DisposalDate { get; set; }
+    public decimal? DisposalAmount { get; set; }
+
+    public string? Notes { get; set; }
+
+    public List<DepreciationScheduleEntry> DepreciationSchedule { get; private set; } = new();
+
+    /// <summary>
+    /// Per-finance-book depreciation settings. Each entry defines method, rate, frequency
+    /// for a specific finance book. Enables multi-book depreciation (tax vs management).
+    /// Per gotcha #64: asset status driven by DEFAULT finance book, not first.
+    /// </summary>
+    public List<AssetDepreciationDetail> DepreciationDetails { get; private set; } = new();
+
+    protected Asset() { }
+
+    public Asset(Guid id, Guid companyId, string assetNumber, string assetName,
+        DateTime purchaseDate, decimal purchaseAmount, Guid? tenantId = null)
+        : base(id)
+    {
+        CompanyId = Check.NotDefaultOrNull<Guid>(companyId, nameof(companyId));
+        AssetNumber = assetNumber;
+        AssetName = assetName;
+        PurchaseDate = purchaseDate;
+        PurchaseAmount = purchaseAmount;
+        ValueAfterDepreciation = purchaseAmount;
+        Status = AssetStatus.Draft;
+        TenantId = tenantId;
+    }
+
+    /// <summary>
+    /// Calculates purchase amount for auto-created assets from purchase documents.
+    /// Per ERPNext PR #57618: uses valuation_rate × qty (not base_net_amount)
+    /// because valuation rate includes landed costs and other adjustments.
+    /// </summary>
+    public static decimal CalculatePurchaseAmountFromValuation(decimal valuationRate, decimal qty)
+        => valuationRate * qty;
+
+    public void Submit()
+    {
+        if (Status != AssetStatus.Draft && Status != AssetStatus.WorkInProgress)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        ValidateManualSchedule();
+        Status = AssetStatus.Submitted;
+    }
+
+    /// <summary>
+    /// Validates a manual depreciation schedule.
+    /// Per ERPNext PR #59883 / commit 5e523af409 & a093e4ac36:
+    /// - Requires positive amounts per row
+    /// - Schedule date on or after AvailableForUseDate
+    /// - Total unbooked depreciation must match depreciable value (ValueAfterDepreciation - ExpectedValueAfterUsefulLife)
+    /// - Recomputes accumulated depreciation
+    /// </summary>
+    public void ValidateManualSchedule()
+    {
+        if (DepreciationMethod != DepreciationMethod.Manual || DepreciationSchedule.Count == 0)
+            return;
+
+        var availableDate = AvailableForUseDate ?? PurchaseDate;
+        for (int i = 0; i < DepreciationSchedule.Count; i++)
+        {
+            var row = DepreciationSchedule[i];
+            if (row.DepreciationAmount <= 0)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Row #{i + 1}: Depreciation Amount must be greater than zero");
+            }
+
+            if (row.ScheduleDate < availableDate)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Row #{i + 1}: Schedule Date cannot be before the Available-for-use Date {availableDate:d}");
+            }
+        }
+
+        var unbookedAmount = DepreciationSchedule.Where(d => !d.IsBooked).Sum(d => d.DepreciationAmount);
+        var depreciableAmount = ValueAfterDepreciation - ExpectedValueAfterUsefulLife;
+
+        if (Math.Round(unbookedAmount, 2) != Math.Round(depreciableAmount, 2))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"Total Depreciation Amount {unbookedAmount:N2} must be equal to the depreciable value {depreciableAmount:N2}");
+        }
+
+        var accumulated = OpeningAccumulatedDepreciation;
+        foreach (var row in DepreciationSchedule.OrderBy(d => d.ScheduleDate))
+        {
+            accumulated += row.DepreciationAmount;
+            row.AccumulatedDepreciation = accumulated;
+        }
+    }
+
+    /// <summary>
+    /// Synchronizes header ValueAfterDepreciation with the default finance book's value.
+    /// Per ERPNext PR #59883 / commit a1ff01724d: prevents summing multi-book depreciation into header.
+    /// </summary>
+    public void SyncValueAfterDepreciation()
+    {
+        if (!CalculateDepreciation || DepreciationDetails.Count == 0)
+            return;
+
+        var defaultDetail = DepreciationDetails.FirstOrDefault(d => d.FinanceBookId == null) ?? DepreciationDetails[0];
+        ValueAfterDepreciation = defaultDetail.ValueAfterDepreciation;
+        RecalculateStatus();
+    }
+
+    public void MarkPartiallyDepreciated()
+    {
+        if (Status is not (AssetStatus.Submitted or AssetStatus.PartiallyDepreciated))
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = AssetStatus.PartiallyDepreciated;
+    }
+
+    public void MarkFullyDepreciated()
+    {
+        Status = AssetStatus.FullyDepreciated;
+        IsFullyDepreciated = true;
+        ValueAfterDepreciation = 0;
+    }
+
+    public void Sell(DateTime disposalDate, decimal disposalAmount)
+    {
+        if (Status is AssetStatus.Draft or AssetStatus.Cancelled)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = AssetStatus.Sold;
+        DisposalDate = disposalDate;
+        DisposalAmount = disposalAmount;
+    }
+
+    public void Scrap(DateTime disposalDate)
+    {
+        if (Status is AssetStatus.Draft or AssetStatus.Cancelled)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = AssetStatus.Scrapped;
+        DisposalDate = disposalDate;
+        DisposalAmount = 0;
+    }
+
+    /// <summary>
+    /// Checks if the asset was disposed on or before the given reporting end date.
+    /// Per ERPNext PR #59928 / commit 7e4cabcd5c: an asset sold/scrapped/capitalized AFTER the report's end date
+    /// is still held during the period and retains its book value.
+    /// </summary>
+    public bool IsDisposedBy(DateTime? asOfDate)
+    {
+        if (Status is not (AssetStatus.Sold or AssetStatus.Scrapped or AssetStatus.Capitalized))
+            return false;
+
+        if (!asOfDate.HasValue || !DisposalDate.HasValue)
+            return true;
+
+        return DisposalDate.Value.Date <= asOfDate.Value.Date;
+    }
+
+    /// <summary>
+    /// Computes the asset's book value as of an optional reporting date, taking into account
+    /// depreciation, revaluations, and disposal date.
+    /// Per ERPNext PR #59928 / commit 7e4cabcd5c: returns 0 only when disposed on or before asOfDate.
+    /// </summary>
+    public decimal GetAssetValueAsOf(DateTime? asOfDate, decimal bookedDepreciationAmount = 0m, decimal revaluationAdjustmentAmount = 0m)
+    {
+        if (IsDisposedBy(asOfDate))
+            return 0m;
+
+        return TotalAssetCost - OpeningAccumulatedDepreciation - bookedDepreciationAmount + revaluationAdjustmentAmount;
+    }
+
+    /// <summary>
+    /// Cancels the asset. Allowed for Draft, and for Submitted/PartiallyDepreciated/
+    /// FullyDepreciated assets that have no GL-posted depreciation outstanding — cancelling
+    /// those is then a pure status change, no reversal needed here. If depreciation has been
+    /// booked, the caller must reverse it first via ReverseAllBookedDepreciation() (which
+    /// itself requires every booked entry's Journal Entry to already be reversed via
+    /// DocumentPostingOrchestrator — same "caller reverses GL, this only updates state"
+    /// contract Restore() uses). Still blocked for InMaintenance/Sold/Scrapped (per ERPNext:
+    /// complete maintenance, or restore/un-sell first). Once Cancelled,
+    /// DepreciationSchedulerJob's own status filter (Status != Cancelled) stops it from ever
+    /// posting the remaining schedule.
+    /// </summary>
+    public void Cancel()
+    {
+        var hasBookedDepreciation = DepreciationSchedule.Any(e => e.IsBooked);
+        var cancellable = Status == AssetStatus.Draft
+            || (Status is AssetStatus.Submitted or AssetStatus.PartiallyDepreciated or AssetStatus.FullyDepreciated
+                && !hasBookedDepreciation);
+
+        if (!cancellable)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        Status = AssetStatus.Cancelled;
+    }
+
+    /// <summary>
+    /// Validates whether the depreciation schedule can be cancelled directly.
+    /// Per ERPNext PR #59883 / commit a1c275a6ee: block cancelling the depreciation schedule
+    /// of a submitted asset on its own. Cancel the Asset instead.
+    /// </summary>
+    public void ValidateCanCancelDepreciationSchedule(bool isReschedulingOrAssetCancellation = false)
+    {
+        if (isReschedulingOrAssetCancellation)
+            return;
+
+        if (Status is AssetStatus.Submitted or AssetStatus.PartiallyDepreciated or AssetStatus.FullyDepreciated)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.CannotCancelScheduleOfSubmittedAsset)
+                .WithData("assetNumber", AssetNumber);
+        }
+    }
+
+    /// <summary>
+    /// Resets depreciation state ahead of a full cancel from PartiallyDepreciated/
+    /// FullyDepreciated — clears the schedule and regenerates it fresh (as if no periods had
+    /// ever been booked), and resets each finance book's tracked value. Caller MUST reverse
+    /// every currently-booked entry's Journal Entry via
+    /// DocumentPostingOrchestrator.ReverseGlForJournalEntryAsync BEFORE calling this — it only
+    /// updates the asset's own schedule/value state, matching Restore()'s GL-then-state
+    /// ordering contract.
+    /// </summary>
+    public void ReverseAllBookedDepreciation()
+    {
+        DepreciationSchedule.Clear();
+        ValueAfterDepreciation = TotalAssetCost - OpeningAccumulatedDepreciation;
+        IsFullyDepreciated = false;
+        GenerateDepreciationSchedule();
+
+        foreach (var detail in DepreciationDetails)
+        {
+            detail.ValueAfterDepreciation = detail.NetPurchaseAmount - detail.OpeningAccumulatedDepreciation;
+        }
+    }
+
+    /// <summary>
+    /// Reverses a scrap — restores the asset's pre-disposal status and clears the disposal
+    /// fields. Scrap-only, matching ERPNext's restore_asset (a sold asset has real external
+    /// proceeds/counterparty and isn't reversible this way). Caller is responsible for
+    /// reversing the disposal GL entry first (DocumentPostingOrchestrator.ReverseGlForDocumentAsync)
+    /// — this method only updates the asset's own state.
+    /// </summary>
+    public void Restore()
+    {
+        if (Status != AssetStatus.Scrapped)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        DisposalDate = null;
+        DisposalAmount = null;
+        Status = AssetStatus.Submitted;
+        RecalculateStatus();
+    }
+
+    /// <summary>
+    /// Reverses an asset sale when the linked Sales Invoice is cancelled.
+    /// Restores pre-sale status and clears disposal fields.
+    /// </summary>
+    public void Unsell()
+    {
+        if (Status != AssetStatus.Sold)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        DisposalDate = null;
+        DisposalAmount = null;
+        Status = AssetStatus.Submitted;
+        RecalculateStatus();
+    }
+
+    /// <summary>
+    /// Marks this asset as consumed/capitalized into another asset.
+    /// Per ERPNext commit 2391c859b2 / a121c30b56.
+    /// </summary>
+    public void MarkAsCapitalized(DateTime disposalDate)
+    {
+        Status = AssetStatus.Capitalized;
+        DisposalDate = disposalDate;
+    }
+
+    /// <summary>
+    /// Restores a previously capitalized asset when the capitalization is cancelled.
+    /// Per ERPNext commit 2391c859b2 / a121c30b56.
+    /// </summary>
+    public void RestoreFromCapitalization()
+    {
+        if (Status != AssetStatus.Capitalized) return;
+        DisposalDate = null;
+        Status = AssetStatus.Submitted;
+        RecalculateStatus();
+        if (CalculateDepreciation)
+        {
+            GenerateDepreciationSchedule();
+        }
+    }
+
+    /// <summary>
+    /// Sets asset status to InMaintenance when open maintenance logs are due on or before today.
+    /// Per ERPNext PR #59998 / commit 730bb168b7.
+    /// </summary>
+    public void SetInMaintenance()
+    {
+        if (Status is AssetStatus.Sold or AssetStatus.Scrapped or AssetStatus.Cancelled or AssetStatus.Draft or AssetStatus.Capitalized or AssetStatus.WorkInProgress)
+            return;
+        Status = AssetStatus.InMaintenance;
+    }
+
+    /// <summary>
+    /// Resets asset status from InMaintenance back to its standard lifecycle status.
+    /// Per ERPNext PR #59998 / commit 730bb168b7.
+    /// </summary>
+    public void ResetMaintenanceStatus()
+    {
+        if (Status != AssetStatus.InMaintenance) return;
+        RecalculateStatus();
+    }
+
+    /// <summary>
+    /// Computes depreciation rate and initial value after depreciation.
+    /// Per ERPNext commit 48311ee5c5: called on asset creation/update before checking CalculateDepreciation.
+    /// </summary>
+    public void SetDepreciationRateAndValueAfterDepreciation()
+    {
+        if (SplitFromAssetId.HasValue) return;
+
+        IsRateOfDepreciationEntered = IsEnteredDepreciationRate();
+        ValueAfterDepreciation = TotalAssetCost + ValueAdjustmentAmount - OpeningAccumulatedDepreciation;
+        if (UsefulLifeMonths > 0 && FrequencyMonths > 0)
+        {
+            var periods = UsefulLifeMonths / FrequencyMonths;
+            if (periods > 0 && DepreciationRate == 0)
+            {
+                DepreciationRate = DepreciationMethod == DepreciationMethod.WrittenDownValue && ExpectedValueAfterUsefulLife > 0
+                    ? CalculateWrittenDownValueRate(ValueAfterDepreciation, ExpectedValueAfterUsefulLife, UsefulLifeMonths)
+                    : Math.Round(100m / periods, 4);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Calculates the annual Written Down Value depreciation rate from book value, salvage value, and useful life in months.
+    /// Per ERPNext PR #61473: rate = (1 - (salvage / book_value) ^ (1 / (useful_life_months / 12))) * 100.
+    /// </summary>
+    public static decimal CalculateWrittenDownValueRate(decimal bookValue, decimal salvageValue, int usefulLifeMonths)
+    {
+        if (bookValue <= 0 || salvageValue <= 0 || salvageValue >= bookValue || usefulLifeMonths <= 0)
+            return 0m;
+
+        var years = usefulLifeMonths / 12.0;
+        if (years <= 0) return 0m;
+
+        var ratio = (double)(salvageValue / bookValue);
+        var rate = (1.0 - Math.Pow(ratio, 1.0 / years)) * 100.0;
+        return Math.Round((decimal)rate, 4);
+    }
+
+    /// <summary>
+    /// Determines whether the Written Down Value depreciation rate was entered manually rather than derived from salvage value.
+    /// Per ERPNext PR #61473: preserved across asset splits and value adjustments so rescheduling does not overwrite an entered rate.
+    /// </summary>
+    public bool IsEnteredDepreciationRate()
+    {
+        if (DepreciationMethod != DepreciationMethod.WrittenDownValue || DepreciationRate <= 0)
+            return false;
+
+        if (IsRateOfDepreciationEntered || ExpectedValueAfterUsefulLife <= 0)
+            return true;
+
+        var initialBookValue = TotalAssetCost - OpeningAccumulatedDepreciation;
+        var derivedInitialRate = CalculateWrittenDownValueRate(initialBookValue, ExpectedValueAfterUsefulLife, UsefulLifeMonths);
+        return Math.Round(DepreciationRate, 4) != derivedInitialRate;
+    }
+
+    /// <summary>
+    /// (Re)generates the depreciation schedule. Preserves already-booked (GL-posted) rows —
+    /// only unbooked rows are cleared and rebuilt. Regenerating the whole schedule from
+    /// scratch would silently recreate fresh, unbooked duplicates of periods whose Journal
+    /// Entry already exists, causing the depreciation scheduler to double-post them.
+    /// Called both on first schedule creation (no booked rows yet) and incrementally by
+    /// <see cref="ApplyRepairCapitalization"/>/<see cref="ApplyValueAdjustment"/> on assets
+    /// that may already be Submitted/PartiallyDepreciated with real posted history.
+    /// </summary>
+    public void GenerateDepreciationSchedule()
+    {
+        if (!CalculateDepreciation || UsefulLifeMonths <= 0) return;
+
+        var bookedEntries = DepreciationSchedule.Where(e => e.IsBooked).OrderBy(e => e.ScheduleDate).ToList();
+        DepreciationSchedule.RemoveAll(e => !e.IsBooked);
+
+        var startDate = AvailableForUseDate ?? PurchaseDate;
+        var depreciableAmount = GrossAssetValue - ExpectedValueAfterUsefulLife - OpeningAccumulatedDepreciation;
+        var totalPeriods = FrequencyMonths > 0 ? UsefulLifeMonths / FrequencyMonths : 0;
+        if (totalPeriods <= 0 || depreciableAmount <= 0) return;
+
+        var previouslyBookedCount = bookedEntries.Count + OpeningNumberOfBookedDepreciations;
+        var remainingPeriods = totalPeriods - previouslyBookedCount;
+        if (remainingPeriods <= 0) return;
+
+        var periodsToDepreciate = totalPeriods - OpeningNumberOfBookedDepreciations;
+        if (periodsToDepreciate <= 0) return;
+
+        var accumulated = bookedEntries.Count > 0 ? bookedEntries[^1].AccumulatedDepreciation : OpeningAccumulatedDepreciation;
+        var bookValue = GrossAssetValue - accumulated;
+
+        var useLastDay = (DepreciationStartDate.HasValue && DepreciationStartDate.Value.Day == DateTime.DaysInMonth(DepreciationStartDate.Value.Year, DepreciationStartDate.Value.Month))
+            || (startDate.Day == DateTime.DaysInMonth(startDate.Year, startDate.Month));
+
+        for (int k = 0; k < remainingPeriods; k++)
+        {
+            var scheduleDate = GetScheduleDate(startDate, previouslyBookedCount, k, useLastDay, bookedEntries);
+            decimal amount;
+
+            var remainingDepreciable = Math.Max(bookValue - ExpectedValueAfterUsefulLife, 0);
+            if (k == remainingPeriods - 1)
+            {
+                // Final period absorbs rounding difference so book value reaches ExpectedValueAfterUsefulLife
+                amount = remainingDepreciable;
+            }
+            else
+            {
+                amount = CalculateDepreciationAmount(depreciableAmount, remainingDepreciable, periodsToDepreciate, totalPeriods, k, startDate);
+                amount = Math.Min(amount, remainingDepreciable); // never exceed remaining depreciable value
+            }
+
+            if (amount <= 0) break;
+
+            accumulated += amount;
+            bookValue -= amount;
+
+            DepreciationSchedule.Add(new DepreciationScheduleEntry(
+                Guid.NewGuid(), Id, scheduleDate, amount, accumulated));
+        }
+    }
+
+    private DateTime GetScheduleDate(DateTime startDate, int previouslyBookedCount, int k, bool useLastDay, List<DepreciationScheduleEntry> bookedEntries)
+    {
+        DateTime scheduleDate;
+        if (bookedEntries.Count > 0)
+        {
+            scheduleDate = bookedEntries[^1].ScheduleDate.AddMonths((k + 1) * FrequencyMonths);
+        }
+        else if (DepreciationStartDate.HasValue)
+        {
+            scheduleDate = DepreciationStartDate.Value.AddMonths(k * FrequencyMonths);
+        }
+        else
+        {
+            scheduleDate = startDate.AddMonths((previouslyBookedCount + k + 1) * FrequencyMonths);
+        }
+
+        if (useLastDay)
+        {
+            scheduleDate = new DateTime(scheduleDate.Year, scheduleDate.Month, DateTime.DaysInMonth(scheduleDate.Year, scheduleDate.Month));
+        }
+
+        return scheduleDate;
+    }
+
+    /// <summary>
+    /// Simulates book value as of an arbitrary date (typically a disposal date) WITHOUT
+    /// mutating the real schedule — replicates GenerateDepreciationSchedule's period-by-period
+    /// logic up to asOfDate, prorating the final partial period by elapsed-vs-total days within
+    /// it. Per ERPNext get_value_after_depreciation_on_disposal_date: disposal gain/loss should
+    /// use this instead of the last-booked entry's ValueAfterDepreciation, which can be stale
+    /// by however long it's been since the depreciation scheduler last ran (up to a full period).
+    /// </summary>
+    public decimal SimulateBookValueAtDate(DateTime asOfDate)
+    {
+        // Per ERPNext get_value_after_depreciation_on_disposal_date: an asset that doesn't
+        // calculate depreciation has no schedule to simulate — use the stored value as-is.
+        if (!CalculateDepreciation || UsefulLifeMonths <= 0)
+            return ValueAfterDepreciation;
+
+        var startDate = AvailableForUseDate ?? PurchaseDate;
+        if (asOfDate <= startDate)
+            return GrossAssetValue - OpeningAccumulatedDepreciation;
+
+        var bookedEntries = DepreciationSchedule.Where(e => e.IsBooked).OrderBy(e => e.ScheduleDate).ToList();
+        var depreciableAmount = GrossAssetValue - ExpectedValueAfterUsefulLife - OpeningAccumulatedDepreciation;
+        var totalPeriods = FrequencyMonths > 0 ? UsefulLifeMonths / FrequencyMonths : 0;
+        if (totalPeriods <= 0 || depreciableAmount <= 0) return ValueAfterDepreciation;
+
+        var previouslyBookedCount = bookedEntries.Count + OpeningNumberOfBookedDepreciations;
+        var remainingPeriods = totalPeriods - previouslyBookedCount;
+        if (remainingPeriods <= 0) return ValueAfterDepreciation;
+
+        var periodsToDepreciate = totalPeriods - OpeningNumberOfBookedDepreciations;
+        if (periodsToDepreciate <= 0) return ValueAfterDepreciation;
+
+        var accumulated = bookedEntries.Count > 0 ? bookedEntries[^1].AccumulatedDepreciation : OpeningAccumulatedDepreciation;
+        var bookValue = GrossAssetValue - accumulated;
+
+        var useLastDay = (DepreciationStartDate.HasValue && DepreciationStartDate.Value.Day == DateTime.DaysInMonth(DepreciationStartDate.Value.Year, DepreciationStartDate.Value.Month))
+            || (startDate.Day == DateTime.DaysInMonth(startDate.Year, startDate.Month));
+
+        var periodStart = bookedEntries.Count > 0
+            ? bookedEntries[^1].ScheduleDate
+            : (DepreciationStartDate.HasValue ? DepreciationStartDate.Value.AddMonths(-FrequencyMonths) : startDate.AddMonths(previouslyBookedCount * FrequencyMonths));
+
+        for (int k = 0; k < remainingPeriods; k++)
+        {
+            var scheduleDate = GetScheduleDate(startDate, previouslyBookedCount, k, useLastDay, bookedEntries);
+            var remainingDepreciable = Math.Max(bookValue - ExpectedValueAfterUsefulLife, 0);
+            var fullPeriodAmount = k == remainingPeriods - 1
+                ? remainingDepreciable
+                : Math.Min(CalculateDepreciationAmount(depreciableAmount, remainingDepreciable, periodsToDepreciate, totalPeriods, k, startDate), remainingDepreciable);
+
+            if (fullPeriodAmount <= 0) break;
+
+            if (scheduleDate > asOfDate)
+            {
+                // asOfDate falls mid-period — prorate by elapsed days within this period only.
+                var periodDays = (scheduleDate - periodStart).TotalDays;
+                var elapsedDays = (asOfDate - periodStart).TotalDays;
+                if (periodDays > 0 && elapsedDays > 0)
+                {
+                    var prorated = Math.Round(fullPeriodAmount * (decimal)(elapsedDays / periodDays), 2);
+                    bookValue -= Math.Min(prorated, remainingDepreciable);
+                }
+                break;
+            }
+
+            bookValue -= fullPeriodAmount;
+            periodStart = scheduleDate;
+        }
+
+        return Math.Max(bookValue, ExpectedValueAfterUsefulLife);
+    }
+
+    private decimal CalculateDepreciationAmount(decimal depreciableAmount, decimal bookValue, int periodsToDepreciate, int totalPeriods, int periodIndex, DateTime startDate)
+    {
+        return DepreciationMethod switch
+        {
+            DepreciationMethod.StraightLine => UseTotalDaysForDepreciation
+                ? CalculateStraightLineByTotalDays(depreciableAmount, periodsToDepreciate, periodIndex, startDate)
+                : Math.Round(depreciableAmount / periodsToDepreciate, 2),
+            DepreciationMethod.DoubleDecliningBalance => Math.Round(bookValue * (2m / totalPeriods), 2),
+            DepreciationMethod.WrittenDownValue => Math.Round(bookValue * (DepreciationRate / 100m), 2),
+            _ => 0,
+        };
+    }
+
+    /// <summary>
+    /// Per ERPNext AccountsSettings.calculate_depreciation_using_total_days: instead of dividing
+    /// the depreciable amount equally across periods, weight each period by its actual elapsed
+    /// calendar days (a period spanning a shorter month depreciates proportionally less). Only
+    /// meaningful for Straight Line — WDV/DDB already derive each period from book value x rate,
+    /// not from an equal division of the total.
+    /// </summary>
+    private decimal CalculateStraightLineByTotalDays(decimal depreciableAmount, int periodsToDepreciate, int periodIndex, DateTime startDate)
+    {
+        var scheduleStartDate = startDate.AddMonths(periodsToDepreciate * FrequencyMonths);
+        var totalDays = (scheduleStartDate - startDate).TotalDays;
+        if (totalDays <= 0) return Math.Round(depreciableAmount / periodsToDepreciate, 2);
+
+        var periodStart = startDate.AddMonths(periodIndex * FrequencyMonths);
+        var periodEnd = startDate.AddMonths((periodIndex + 1) * FrequencyMonths);
+        var periodDays = (periodEnd - periodStart).TotalDays;
+
+        return Math.Round(depreciableAmount * (decimal)(periodDays / totalDays), 2);
+    }
+
+    public void ApplyRepairCapitalization(decimal additionalCost, int increaseInUsefulLifeMonths)
+    {
+        var wasEnteredRate = IsEnteredDepreciationRate();
+        IsRateOfDepreciationEntered = wasEnteredRate;
+
+        AdditionalCost += additionalCost;
+        ValueAfterDepreciation += additionalCost;
+        if (increaseInUsefulLifeMonths != 0)
+        {
+            UsefulLifeMonths += increaseInUsefulLifeMonths;
+        }
+
+        foreach (var detail in DepreciationDetails)
+        {
+            detail.ValueAfterDepreciation += additionalCost;
+            if (increaseInUsefulLifeMonths != 0)
+            {
+                detail.IncreaseInAssetLife += increaseInUsefulLifeMonths;
+                var additionalPeriods = detail.FrequencyOfDepreciation > 0
+                    ? (int)Math.Round((decimal)increaseInUsefulLifeMonths / detail.FrequencyOfDepreciation)
+                    : 0;
+                detail.TotalNumberOfDepreciations += additionalPeriods;
+            }
+        }
+
+        RecalculateWdvRateOnReschedule(wasEnteredRate);
+        GenerateDepreciationSchedule();
+        RecalculateStatus();
+    }
+
+    public void ApplyValueAdjustment(decimal newValue, Guid? financeBookId = null, decimal? differenceAmount = null)
+    {
+        var wasEnteredRate = IsEnteredDepreciationRate();
+        IsRateOfDepreciationEntered = wasEnteredRate;
+
+        if (financeBookId.HasValue && DepreciationDetails.Count > 0)
+        {
+            var detail = DepreciationDetails.FirstOrDefault(d => d.FinanceBookId == financeBookId.Value);
+            if (detail != null)
+            {
+                var diff = differenceAmount ?? (newValue - detail.ValueAfterDepreciation);
+                detail.ValueAdjustmentAmount += diff;
+                detail.ValueAfterDepreciation = newValue;
+            }
+
+            var defaultDetail = DepreciationDetails.FirstOrDefault(d => d.FinanceBookId == null) ?? DepreciationDetails[0];
+            if (detail != null && ReferenceEquals(detail, defaultDetail))
+            {
+                var diff = differenceAmount ?? (newValue - ValueAfterDepreciation);
+                ValueAdjustmentAmount += diff;
+                ValueAfterDepreciation = newValue;
+            }
+        }
+        else
+        {
+            var diff = differenceAmount ?? (newValue - ValueAfterDepreciation);
+            ValueAdjustmentAmount += diff;
+            ValueAfterDepreciation = newValue;
+
+            var defaultDetail = DepreciationDetails.FirstOrDefault(d => d.FinanceBookId == null);
+            if (defaultDetail != null)
+            {
+                defaultDetail.ValueAdjustmentAmount += diff;
+                defaultDetail.ValueAfterDepreciation = newValue;
+            }
+        }
+
+        RecalculateWdvRateOnReschedule(wasEnteredRate);
+        GenerateDepreciationSchedule();
+        RecalculateStatus();
+    }
+
+    private void RecalculateWdvRateOnReschedule(bool wasEnteredRate)
+    {
+        if (DepreciationMethod == DepreciationMethod.WrittenDownValue
+            && !wasEnteredRate
+            && ExpectedValueAfterUsefulLife > 0
+            && ValueAfterDepreciation > ExpectedValueAfterUsefulLife
+            && FrequencyMonths > 0)
+        {
+            var bookedCount = DepreciationSchedule.Count(e => e.IsBooked) + OpeningNumberOfBookedDepreciations;
+            var remainingMonths = Math.Max(FrequencyMonths, UsefulLifeMonths - bookedCount * FrequencyMonths);
+            var recomputed = CalculateWrittenDownValueRate(ValueAfterDepreciation, ExpectedValueAfterUsefulLife, remainingMonths);
+            if (recomputed > 0)
+            {
+                DepreciationRate = recomputed;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Recalculates asset status based on ValueAfterDepreciation and depreciation history.
+    /// Per ERPNext PR #48086 / commit da2663b8dc.
+    /// </summary>
+    public void RecalculateStatus()
+    {
+        if (Status is AssetStatus.Sold or AssetStatus.Scrapped or AssetStatus.Cancelled or AssetStatus.Draft or AssetStatus.Capitalized or AssetStatus.WorkInProgress)
+            return;
+
+        if (ValueAfterDepreciation <= 0)
+            Status = AssetStatus.FullyDepreciated;
+        else if (ValueAfterDepreciation < TotalAssetCost)
+            Status = AssetStatus.PartiallyDepreciated;
+        else
+            Status = AssetStatus.Submitted;
+    }
+
+    public void UpdateLocationAndCustodian(string? location, Guid? custodianEmployeeId, Guid? locationId = null)
+    {
+        if (!string.IsNullOrWhiteSpace(location) || locationId.HasValue)
+        {
+            Location = location;
+            LocationId = locationId;
+        }
+        CustodianEmployeeId = custodianEmployeeId;
+    }
+
+    /// <summary>
+    /// Scales proportional asset values and quantities when an asset is split.
+    /// Per ERPNext: split_asset() in assets/doctype/asset/mapper.py.
+    /// </summary>
+    public void ApplySplitScale(decimal scalingFactor, int newQuantity)
+    {
+        AssetQuantity = newQuantity;
+        PurchaseAmount = Math.Round(PurchaseAmount * scalingFactor, 2);
+        AdditionalCost = Math.Round(AdditionalCost * scalingFactor, 2);
+        ValueAdjustmentAmount = Math.Round(ValueAdjustmentAmount * scalingFactor, 2);
+        OpeningAccumulatedDepreciation = Math.Round(OpeningAccumulatedDepreciation * scalingFactor, 2);
+        ExpectedValueAfterUsefulLife = Math.Round(ExpectedValueAfterUsefulLife * scalingFactor, 2);
+        ValueAfterDepreciation = Math.Round(ValueAfterDepreciation * scalingFactor, 2);
+
+        foreach (var detail in DepreciationDetails)
+        {
+            detail.NetPurchaseAmount = Math.Round(detail.NetPurchaseAmount * scalingFactor, 2);
+            detail.ValueAdjustmentAmount = Math.Round(detail.ValueAdjustmentAmount * scalingFactor, 2);
+            detail.OpeningAccumulatedDepreciation = Math.Round(detail.OpeningAccumulatedDepreciation * scalingFactor, 2);
+            detail.ValueAfterDepreciation = Math.Round(detail.ValueAfterDepreciation * scalingFactor, 2);
+            detail.ExpectedValueAfterUsefulLife = Math.Round(detail.ExpectedValueAfterUsefulLife * scalingFactor, 2);
+        }
+
+        DepreciationSchedule.Clear();
+        GenerateDepreciationSchedule();
+    }
+}

@@ -1,0 +1,116 @@
+using System;
+using Volo.Abp.Domain.Entities.Auditing;
+
+namespace MyERP.Sales.Entities;
+
+/// <summary>
+/// Line item in a delivery note.
+/// Maps to ERPNext stock/doctype/delivery_note_item.
+/// </summary>
+public class DeliveryNoteItem : CreationAuditedEntity<Guid>
+{
+    public Guid DeliveryNoteId { get; set; }
+    /// <summary>Zero-based row position within the document (ERPNext idx); the database gives no ordering guarantee.</summary>
+    public int Idx { get; set; }
+    public Guid ItemId { get; set; }
+
+    public string Description { get; set; } = null!;
+    public string Uom { get; set; } = "Unit";
+    public decimal Quantity { get; set; }
+    public decimal UnitPrice { get; set; }
+    public decimal TaxAmount { get; set; }
+
+    public decimal LineTotal => Quantity * UnitPrice;
+
+    /// <summary>Item's stock UOM. From Item master.</summary>
+    public string StockUom { get; set; } = "Unit";
+
+    /// <summary>Conversion factor: transaction UOM → stock UOM.</summary>
+    public decimal ConversionFactor { get; set; } = 1m;
+
+    /// <summary>Quantity in stock UOM = Quantity × ConversionFactor. Used for SLE creation.</summary>
+    public decimal StockQty => Quantity * ConversionFactor;
+
+    /// <summary>Rate per stock UOM = UnitPrice / ConversionFactor (gotcha #198).</summary>
+    public decimal StockUomRate => ConversionFactor > 0 ? Math.Round(UnitPrice / ConversionFactor, 4) : UnitPrice;
+
+    /// <summary>Link back to the Sales Order item being fulfilled.</summary>
+    public Guid? SalesOrderItemId { get; set; }
+
+    /// <summary>Batch reference for batch-tracked items.</summary>
+    public Guid? BatchId { get; set; }
+
+    /// <summary>Serial number reference for serialized items.</summary>
+    public Guid? SerialNoId { get; set; }
+
+    /// <summary>
+    /// Per-item warehouse override. When set, stock is issued from this warehouse instead of DN header warehouse.
+    /// Per ERPNext: each DN item can specify its own warehouse (multi-warehouse delivery).
+    /// </summary>
+    public Guid? WarehouseId { get; set; }
+
+    /// <summary>Cost rate at time of delivery (from stock valuation). Used for COGS calculation.</summary>
+    public decimal ValuationRate { get; set; }
+
+    /// <summary>
+    /// Quantity already billed against this DN item (via Sales Invoice).
+    /// Per ERPNext: billed_amt tracking enables DN→SI billing status (PerBilled).
+    /// </summary>
+    public decimal BilledQty { get; set; }
+
+    /// <summary>Whether this individual row is closed (per ERPNext PR #57596).</summary>
+    public bool IsClosed { get; set; }
+
+    /// <summary>
+    /// Quantity returned against this DN item via Return Delivery Note.
+    /// Per ERPNext PR #58953 / commit be8208e7cb: enables accurate DN PerBilled calculation when returned.
+    /// </summary>
+    public decimal ReturnedQty { get; set; }
+
+    /// <summary>Effective billable quantity: Quantity - ReturnedQty.</summary>
+    public decimal BillableQty => Math.Max(0, Math.Abs(Quantity) - Math.Abs(ReturnedQty));
+
+    /// <summary>Pending billing quantity = BillableQty - BilledQty. 0 if closed.</summary>
+    public decimal PendingBillingQty => IsClosed ? 0 : Math.Max(0, BillableQty - Math.Abs(BilledQty));
+
+    /// <summary>
+    /// Quantity packed into a submitted Packing Slip so far, updated by
+    /// PackingSlipAppService.Submit/CancelAsync. Per ERPNext: once ANY Packing Slip exists
+    /// for the DN, every item must be fully packed (PackedQty == Quantity) before DN submit.
+    /// </summary>
+    public decimal PackedQty { get; set; }
+
+    /// <summary>
+    /// Quantity installed at customer site via submitted Installation Notes.
+    /// Per ERPNext status updater: Installation Note Item.qty -> DN Item.installed_qty.
+    /// </summary>
+    public decimal InstalledQty { get; set; }
+
+    /// <summary>Pending installation quantity = BillableQty - InstalledQty. 0 if closed (PR #61806).</summary>
+    public decimal PendingInstallationQty => IsClosed ? 0 : Math.Max(0, BillableQty - Math.Abs(InstalledQty));
+
+    /// <summary>
+    /// Link to Pick List Item when created from or fulfilled via Pick List.
+    /// Per ERPNext status updater: Delivery Note Item.pick_list_item -> Pick List Item.delivered_qty.
+    /// </summary>
+    public Guid? PickListItemId { get; set; }
+
+    protected DeliveryNoteItem() { }
+
+    public DeliveryNoteItem(
+        Guid id, Guid deliveryNoteId, Guid itemId,
+        string description, decimal quantity, decimal unitPrice, decimal taxAmount,
+        string uom = "Unit", Guid? salesOrderItemId = null, Guid? pickListItemId = null)
+        : base(id)
+    {
+        DeliveryNoteId = deliveryNoteId;
+        ItemId = itemId;
+        Description = description;
+        Quantity = quantity;
+        UnitPrice = unitPrice;
+        TaxAmount = taxAmount;
+        Uom = uom;
+        SalesOrderItemId = salesOrderItemId;
+        PickListItemId = pickListItemId;
+    }
+}

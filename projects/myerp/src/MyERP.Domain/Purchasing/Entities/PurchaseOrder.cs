@@ -1,0 +1,530 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using MyERP.Core;
+using Volo.Abp;
+using Volo.Abp.Domain.Entities.Auditing;
+using Volo.Abp.MultiTenancy;
+
+namespace MyERP.Purchasing.Entities;
+
+/// <summary>
+/// Purchase Order — order placed to supplier.
+/// Maps to ERPNext buying/doctype/purchase_order.
+/// Flow: PurchaseOrder → PurchaseInvoice
+/// </summary>
+public class PurchaseOrder : FullAuditedAggregateRoot<Guid>, IMultiTenant, IAmendable
+{
+    public Guid? TenantId { get; set; }
+    public Guid CompanyId { get; set; }
+
+    /// <summary>Shipping term (e.g. FOB, CIF, EXW) — who bears cost/risk at each stage.</summary>
+    public Guid? IncotermId { get; set; }
+
+    public string OrderNumber { get; set; } = null!;
+    public DateTime OrderDate { get; set; }
+    public DateTime? ExpectedDeliveryDate { get; set; }
+
+    public Guid SupplierId { get; set; }
+
+    public string CurrencyCode { get; set; } = "MYR";
+
+    /// <summary>Buying Price List — defaults from Supplier.DefaultPriceListId, overridable per order.</summary>
+    public Guid? PriceListId { get; set; }
+
+    public decimal NetTotal { get; set; }
+    public decimal TaxAmount { get; set; }
+    public decimal GrandTotal { get; set; }
+
+    /// <summary>Additional discount percentage on total (mirrors PurchaseInvoice / SalesOrder).</summary>
+    public decimal AdditionalDiscountPercentage { get; set; }
+
+    /// <summary>Fixed discount amount on total.</summary>
+    public decimal DiscountAmount { get; set; }
+
+    /// <summary>Target for additional discount: "Net Total" or "Grand Total".</summary>
+    public string? ApplyDiscountOn { get; set; }
+
+    /// <summary>Primary billing address (auto-resolved from Supplier on create).</summary>
+    public Guid? BillingAddressId { get; set; }
+
+    /// <summary>Shipping address (defaults to warehouse/company, or customer address for drop ship orders per PR #59415).</summary>
+    public Guid? ShippingAddressId { get; set; }
+
+    /// <summary>Linked Customer for drop ship orders (PR #59415).</summary>
+    public Guid? CustomerId { get; set; }
+
+    /// <summary>Whether this PO contains drop-ship items delivered directly by supplier to customer.</summary>
+    public bool IsDropShip => _items.Any(i => i.DeliveredBySupplier);
+
+    /// <summary>Total advance payment made against this order.</summary>
+    public decimal AdvancePaid { get; set; }
+
+    /// <summary>Advance payment status (per gotcha #706: defaults to "Not Initiated").</summary>
+    public string AdvancePaymentStatus { get; set; } = "Not Initiated";
+
+    /// <summary>Percentage of advance paid vs grand total (0-100).</summary>
+    public decimal PerAdvancePaid => GrandTotal > 0
+        ? Math.Round(AdvancePaid / GrandTotal * 100, 2)
+        : 0;
+
+    /// <summary>Cost center for departmental tracking.</summary>
+    public Guid? CostCenterId { get; set; }
+
+    /// <summary>Project for project-wise tracking.</summary>
+    public Guid? ProjectId { get; set; }
+
+    /// <summary>Whether this PO is for subcontracted items (links to SCO).</summary>
+    public bool IsSubcontracted { get; set; }
+
+    // --- Supplier Confirmation Tracking (per ERPNext PO supplier acknowledgment workflow) ---
+
+    /// <summary>Supplier's own reference/confirmation number for this order.</summary>
+    public string? SupplierConfirmationNumber { get; set; }
+
+    /// <summary>Date when supplier confirmed/acknowledged the order.</summary>
+    public DateTime? SupplierConfirmationDate { get; set; }
+
+    /// <summary>Supplier's promised delivery date (may differ from our expected date).</summary>
+    public DateTime? SupplierPromisedDate { get; set; }
+
+    /// <summary>Whether supplier has confirmed/acknowledged this order.</summary>
+    public bool IsSupplierConfirmed => SupplierConfirmationDate.HasValue;
+
+    /// <summary>Records supplier confirmation with optional reference number and promised date.</summary>
+    public void RecordSupplierConfirmation(string? confirmationNumber, DateTime confirmationDate, DateTime? promisedDate)
+    {
+        if (Status == DocumentStatus.Draft || Status == DocumentStatus.Cancelled)
+            throw new BusinessException("MyERP:01001").WithData("documentType", "PurchaseOrder").WithData("status", Status.ToString());
+
+        SupplierConfirmationNumber = confirmationNumber;
+        SupplierConfirmationDate = confirmationDate;
+        SupplierPromisedDate = promisedDate;
+    }
+
+    /// <summary>Source Supplier Quotation that this PO was created from (if any).</summary>
+    public Guid? SupplierQuotationId { get; set; }
+
+    /// <summary>Inter-company Sales Order that triggered this PO creation (if any).</summary>
+    public Guid? InterCompanySalesOrderId { get; set; }
+
+    /// <summary>Exchange rate: transaction currency → company currency. Default 1.0 for same-currency.</summary>
+    public decimal ExchangeRate { get; set; } = 1m;
+
+    public Guid? TermsAndConditionsId { get; set; }
+    public string? Terms { get; set; }
+    public string? Notes { get; set; }
+    /// <summary>Remarks for additional instructions/notes (PR #59420 / commit e10129ef5e).</summary>
+    public string? Remarks { get; set; }
+
+    // Amendment support
+    public Guid? AmendedFromId { get; set; }
+    public int AmendmentIndex { get; set; }
+
+    public DocumentStatus Status { get; private set; } = DocumentStatus.Draft;
+
+    /// <summary>Percentage of total qty received (0-100). Uses sum of capped received quantities divided by total quantity (gotcha #370). Excludes closed rows.</summary>
+    public decimal PerReceived
+    {
+        get
+        {
+            var openItems = _items.Where(i => !i.IsClosed).ToList();
+            var basis = openItems.Count > 0 ? openItems : _items;
+            if (basis.Count == 0) return 0m;
+            var totalQty = basis.Sum(i => i.Quantity);
+            if (totalQty <= 0) return 0m;
+            var receivedQty = basis.Sum(i => Math.Min(Math.Max(0, i.ReceivedQty), i.Quantity));
+            var percentage = Math.Round(receivedQty / totalQty * 100m, 2);
+            // Per ERPNext PR #61983: snap rounding-short >= 99.99% to 100% when all rows received
+            if (percentage >= 99.99m && !basis.Any(i => i.PendingReceiptQty > 0))
+                return 100m;
+            return percentage;
+        }
+    }
+
+    /// <summary>Percentage of total amount billed (0-100). Excludes closed rows. Falls back to quantity for zero-amount orders (ERPNext PR #58816).</summary>
+    public decimal PerBilled
+    {
+        get
+        {
+            var openItems = _items.Where(i => !i.IsClosed).ToList();
+            var basis = openItems.Count > 0 ? openItems : _items;
+            if (basis.Count == 0) return 0m;
+
+            var basisTotal = basis.Sum(i => i.LineTotal);
+            if (basisTotal > 0)
+            {
+                var percentage = Math.Round(basis.Sum(i => i.BilledQty * i.UnitPrice) / basisTotal * 100, 2);
+                if (percentage >= 100m && basis.Any(i => i.PendingBillingQty > 0))
+                    return 99.99m;
+                // Per ERPNext PR #61983: snap rounding-short >= 99.99% to 100% when all rows billed
+                if (percentage >= 99.99m && !basis.Any(i => i.PendingBillingQty > 0))
+                    return 100m;
+                return percentage;
+            }
+
+            var totalQty = basis.Sum(i => i.Quantity);
+            if (totalQty > 0)
+            {
+                var percentage = Math.Round(basis.Sum(i => Math.Min(i.Quantity, i.BilledQty)) / totalQty * 100, 2);
+                if (percentage >= 99.99m && !basis.Any(i => i.PendingBillingQty > 0))
+                    return 100m;
+                return percentage;
+            }
+            return 100m;
+        }
+    }
+
+    private readonly List<PurchaseOrderItem> _items = new();
+    /// <summary>Rows in document order (Idx), since the database gives no ordering guarantee.</summary>
+    public IReadOnlyList<PurchaseOrderItem> Items => _items.OrderBy(i => i.Idx).ThenBy(i => i.CreationTime).ToList();
+
+    protected PurchaseOrder() { }
+
+    public PurchaseOrder(Guid id, Guid companyId, Guid supplierId, string orderNumber, DateTime orderDate, Guid? tenantId = null)
+        : base(id)
+    {
+        CompanyId = Check.NotDefaultOrNull<Guid>(companyId, nameof(companyId));
+        SupplierId = Check.NotDefaultOrNull<Guid>(supplierId, nameof(supplierId));
+        OrderNumber = Check.NotNullOrWhiteSpace(orderNumber, nameof(orderNumber), PurchaseOrderConsts.MaxOrderNumberLength);
+        OrderDate = orderDate;
+        TenantId = tenantId;
+    }
+
+    public PurchaseOrderItem AddItem(Guid itemId, string description, decimal quantity, decimal unitPrice, decimal taxAmount, string uom = "Unit", Guid? warehouseId = null, Guid? expenseAccountId = null, Guid? projectId = null, bool deliveredBySupplier = false)
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Check.NotDefaultOrNull<Guid>(itemId, nameof(itemId));
+        if (quantity <= 0)
+            throw new ArgumentException("Quantity must be greater than zero.", nameof(quantity));
+        var item = new PurchaseOrderItem(Guid.NewGuid(), Id, itemId, description, quantity, unitPrice, taxAmount, uom, projectId ?? ProjectId)
+        {
+            WarehouseId = warehouseId,
+            ExpenseAccountId = expenseAccountId,
+            DeliveredBySupplier = deliveredBySupplier
+        };
+        item.Idx = _items.Count;
+        _items.Add(item);
+        RecalculateTotals();
+        return item;
+    }
+
+    /// <summary>Clear all items (Draft only). Used during edit to replace items.</summary>
+    public void ClearItems()
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        _items.Clear();
+        RecalculateTotals();
+    }
+
+    /// <summary>
+    /// Removes a single item row from a submitted order (post-submit editing).
+    /// Caller must validate the row is safe to delete (ChildItemUpdateService) before calling this.
+    /// </summary>
+    public void RemoveItem(Guid itemRowId)
+    {
+        if (Status == DocumentStatus.Cancelled)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        var item = _items.FirstOrDefault(i => i.Id == itemRowId);
+        if (item == null)
+            return;
+        _items.Remove(item);
+        RecalculateTotals();
+    }
+
+    public void Submit()
+    {
+        if (Status != DocumentStatus.Draft || !_items.Any())
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        // Auto-correct conversion factor when UOM equals StockUOM (gotcha #6171)
+        foreach (var item in _items)
+        {
+            if (!string.IsNullOrEmpty(item.Uom) && !string.IsNullOrEmpty(item.StockUom)
+                && string.Equals(item.Uom, item.StockUom, StringComparison.OrdinalIgnoreCase)
+                && item.ConversionFactor != 1.0m)
+            {
+                item.ConversionFactor = 1.0m;
+            }
+        }
+
+        Status = AdvancePaymentStatus == "Initiated"
+            ? DocumentStatus.ToPay
+            : DocumentStatus.ToDeliverAndBill; // "To Receive and Bill"
+    }
+
+    /// <summary>
+    /// Per ERPNext (mirrors SalesOrder.Cancel()'s equivalent fix): a Closed PO cannot be
+    /// cancelled directly — it must be reopened first.
+    /// </summary>
+    public void Cancel()
+    {
+        if (Status == DocumentStatus.Cancelled || Status == DocumentStatus.Closed)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        // Per Gotcha #500: PO cancel zeros drop-ship received_qty THEN recalculates percentage
+        foreach (var item in _items.Where(i => i.DeliveredBySupplier))
+        {
+            item.ReceivedQty = 0;
+        }
+
+        Status = DocumentStatus.Cancelled;
+    }
+
+    /// <summary>
+    /// Manually close the PO (stops further fulfillment without cancelling).
+    /// </summary>
+    public void Close()
+    {
+        if (Status == DocumentStatus.Draft || Status == DocumentStatus.Cancelled || Status == DocumentStatus.Closed)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = DocumentStatus.Closed;
+    }
+
+    /// <summary>
+    /// Reopen a closed PO for further fulfillment.
+    /// </summary>
+    public void Reopen()
+    {
+        if (Status != DocumentStatus.Closed)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        if (_items.Count > 0 && _items.All(i => i.IsClosed))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Every row of Purchase Order is closed. Reopen the rows you need instead.");
+        }
+        UpdateFulfillmentStatus();
+    }
+
+    /// <summary>
+    /// Recalculates fulfillment status based on received/billed quantities.
+    /// Called after Purchase Receipt or Purchase Invoice submission.
+    /// </summary>
+    public void UpdateFulfillmentStatus()
+    {
+        if (Status == DocumentStatus.Cancelled || Status == DocumentStatus.Draft)
+            return;
+
+        var fullyReceived = PerReceived >= 100m;
+        var fullyBilled = PerBilled >= 100m;
+
+        if (fullyReceived && fullyBilled)
+            Status = DocumentStatus.Completed;
+        else if (fullyReceived)
+            Status = DocumentStatus.ToBill;
+        else if (fullyBilled)
+            Status = DocumentStatus.ToDeliver; // "To Receive"
+        else if (AdvancePaymentStatus == "Initiated")
+            Status = DocumentStatus.ToPay;
+        else
+            Status = DocumentStatus.ToDeliverAndBill;
+    }
+
+    /// <summary>
+    /// Syncs advance payment status and recalculates fulfillment status (PR #59727).
+    /// </summary>
+    public void SetAdvancePaymentStatus(string status)
+    {
+        AdvancePaymentStatus = status;
+        UpdateFulfillmentStatus();
+    }
+
+    private void RecalculateTotals()
+    {
+        NetTotal = _items.Sum(i => i.LineTotal);
+        TaxAmount = _items.Sum(i => i.TaxAmount);
+        GrandTotal = NetTotal + TaxAmount;
+    }
+
+    /// <summary>Count of items past their expected delivery date with pending receipt.</summary>
+    public int GetOverdueItemCount(DateTime asOfDate) =>
+        _items.Count(i => i.IsOverdue(asOfDate, ExpectedDeliveryDate));
+
+    /// <summary>Whether any item is past expected delivery date.</summary>
+    public bool HasOverdueItems(DateTime asOfDate) =>
+        _items.Any(i => i.IsOverdue(asOfDate, ExpectedDeliveryDate));
+
+    /// <summary>Maximum days overdue across all items.</summary>
+    public int GetMaxDaysOverdue(DateTime asOfDate) =>
+        _items.Count > 0 ? _items.Max(i => i.DaysOverdue(asOfDate, ExpectedDeliveryDate)) : 0;
+
+    /// <summary>Count of items confirmed by supplier.</summary>
+    public int ConfirmedItemCount => _items.Count(i => i.IsSupplierConfirmed);
+
+    /// <summary>Whether all items have been confirmed by supplier.</summary>
+    public bool IsFullyConfirmed => _items.Count > 0 && _items.All(i => i.IsSupplierConfirmed);
+
+    /// <summary>Percentage of items confirmed by supplier (0-100).</summary>
+    public decimal PerConfirmed => _items.Count > 0
+        ? Math.Round((decimal)_items.Count(i => i.IsSupplierConfirmed) / _items.Count * 100, 0)
+        : 0;
+
+    /// <summary>Closes an individual item row (per ERPNext PR #57596).</summary>
+    public void CloseItem(Guid itemRowId)
+    {
+        var item = _items.FirstOrDefault(i => i.Id == itemRowId);
+        if (item == null || item.IsClosed) return;
+        if (item.ReceivedQty >= item.Quantity && item.BilledQty >= item.Quantity)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"Item {item.Description} is already completed in full, so there is nothing to close.");
+        }
+        item.IsClosed = true;
+        if (_items.All(i => i.IsClosed))
+        {
+            Status = DocumentStatus.Closed;
+        }
+        else
+        {
+            UpdateFulfillmentStatus();
+        }
+    }
+
+    /// <summary>Reopens an individual item row.</summary>
+    public void ReopenItem(Guid itemRowId)
+    {
+        var item = _items.FirstOrDefault(i => i.Id == itemRowId);
+        if (item == null || !item.IsClosed) return;
+        item.IsClosed = false;
+        UpdateFulfillmentStatus();
+    }
+}
+
+public class PurchaseOrderItem : CreationAuditedEntity<Guid>, IMultiTenant
+{
+    public Guid? TenantId { get; set; }
+    public Guid PurchaseOrderId { get; set; }
+    /// <summary>Zero-based row position within the document (ERPNext idx); the database gives no ordering guarantee.</summary>
+    public int Idx { get; set; }
+    public Guid ItemId { get; set; }
+    public string Description { get; set; } = null!;
+    public string Uom { get; set; } = "Unit";
+    public decimal Quantity { get; set; }
+    public decimal UnitPrice { get; set; }
+    public decimal TaxAmount { get; set; }
+    public decimal LineTotal => Quantity * UnitPrice;
+    public Guid? ProjectId { get; set; }
+
+    /// <summary>Whether this individual row is closed (per ERPNext PR #57596).</summary>
+    public bool IsClosed { get; set; }
+
+    /// <summary>Whether goods are drop-shipped (delivered directly to customer by supplier).</summary>
+    public bool DeliveredBySupplier { get; set; }
+
+    /// <summary>Item's stock UOM. From Item master.</summary>
+    public string StockUom { get; set; } = "Unit";
+
+    /// <summary>Conversion factor: transaction UOM → stock UOM.</summary>
+    public decimal ConversionFactor { get; set; } = 1m;
+
+    /// <summary>Quantity in stock UOM = Quantity × ConversionFactor.</summary>
+    public decimal StockQty => Quantity * ConversionFactor;
+
+    /// <summary>Rate per stock UOM = UnitPrice / ConversionFactor (gotcha #198).</summary>
+    public decimal StockUomRate => ConversionFactor > 0 ? Math.Round(UnitPrice / ConversionFactor, 4) : UnitPrice;
+
+    /// <summary>Quantity already received via Purchase Receipts.</summary>
+    public decimal ReceivedQty { get; set; }
+
+    /// <summary>Date of first receipt against this item (for lead time tracking).</summary>
+    public DateTime? FirstReceiptDate { get; set; }
+
+    /// <summary>Date of last/most recent receipt (for delivery performance tracking).</summary>
+    public DateTime? LastReceiptDate { get; set; }
+
+    /// <summary>Actual delivery lead time in days (from PO date to first receipt). Null if not yet received.</summary>
+    public int? ActualLeadTimeDays(DateTime orderDate) =>
+        FirstReceiptDate.HasValue ? (int)(FirstReceiptDate.Value.Date - orderDate.Date).TotalDays : null;
+
+    /// <summary>Quantity already billed via Purchase Invoices.</summary>
+    public decimal BilledQty { get; set; }
+
+    /// <summary>Remaining qty to receive.</summary>
+    public decimal PendingReceiptQty => IsClosed ? 0 : Math.Max(0, Math.Round(Quantity - ReceivedQty, 4));
+
+    /// <summary>
+    /// Computes maximum receivable quantity including over-receipt allowance percentage.
+    /// Per ERPNext PR #61640 / commit d220e14b15: when the UOM must be a whole number,
+    /// the allowed over-receipt ceiling is floored to a whole number.
+    /// </summary>
+    public decimal GetMaxReceivableQty(decimal allowancePct = 0m, bool mustBeWholeNumber = false)
+    {
+        var maxAllowed = Math.Round(Quantity * (1m + allowancePct / 100m), 4);
+        return mustBeWholeNumber ? Math.Floor(maxAllowed) : maxAllowed;
+    }
+
+    /// <summary>Remaining qty to bill.</summary>
+    public decimal PendingBillingQty => IsClosed ? 0 : Math.Max(0, Math.Round(Quantity - BilledQty, 4));
+
+    /// <summary>Target warehouse for receipt.</summary>
+    public Guid? WarehouseId { get; set; }
+
+    /// <summary>Expense or asset account for budgeting and accounting.</summary>
+    public Guid? ExpenseAccountId { get; set; }
+
+    /// <summary>Link to Material Request item (for MR fulfillment tracking).</summary>
+    public Guid? MaterialRequestItemId { get; set; }
+
+    /// <summary>Link to Supplier Quotation item (for SQ fulfillment tracking).</summary>
+    public Guid? SupplierQuotationItemId { get; set; }
+
+    /// <summary>Source Sales Order (ERPNext Purchase Order Item.sales_order) — set when created from an SO.</summary>
+    public Guid? SalesOrderId { get; set; }
+
+    /// <summary>Source Sales Order row (ERPNext sales_order_item) — drives SO Item.OrderedQty on submit/cancel.</summary>
+    public Guid? SalesOrderItemId { get; set; }
+
+    /// <summary>Blanket Order (Buying) this line draws from — qty deducted from the blanket allocation on submit.</summary>
+    public Guid? BlanketOrderId { get; set; }
+
+    /// <summary>Per-item expected delivery date (overrides parent PO ExpectedDeliveryDate).
+    /// Per ERPNext: each PO item can have its own expected_delivery_date.</summary>
+    public DateTime? ExpectedDeliveryDate { get; set; }
+
+    /// <summary>Supplier's promised delivery date for this specific item.
+    /// Per ERPNext: suppliers can confirm different dates per item via portal.</summary>
+    public DateTime? SupplierPromisedDate { get; set; }
+
+    /// <summary>Whether supplier has confirmed this item's delivery.</summary>
+    public bool IsSupplierConfirmed { get; set; }
+
+    /// <summary>Effective expected date: supplier promised (if confirmed) → per-item → parent PO.</summary>
+    public DateTime? GetEffectiveExpectedDate(DateTime? parentExpectedDate) =>
+        (IsSupplierConfirmed && SupplierPromisedDate.HasValue)
+            ? SupplierPromisedDate
+            : ExpectedDeliveryDate ?? parentExpectedDate;
+
+    /// <summary>Whether this item is overdue for delivery (past effective expected date + not fully received).</summary>
+    public bool IsOverdue(DateTime asOfDate, DateTime? parentExpectedDate)
+    {
+        var effectiveDate = GetEffectiveExpectedDate(parentExpectedDate);
+        return effectiveDate.HasValue && effectiveDate.Value.Date < asOfDate.Date && PendingReceiptQty > 0;
+    }
+
+    /// <summary>Days overdue for this item (0 if not overdue).</summary>
+    public int DaysOverdue(DateTime asOfDate, DateTime? parentExpectedDate)
+    {
+        var effectiveDate = GetEffectiveExpectedDate(parentExpectedDate);
+        if (!effectiveDate.HasValue || effectiveDate.Value.Date >= asOfDate.Date || PendingReceiptQty <= 0)
+            return 0;
+        return (int)(asOfDate.Date - effectiveDate.Value.Date).TotalDays;
+    }
+
+    /// <summary>Records supplier confirmation for this item with promised delivery date.</summary>
+    public void ConfirmBySupplier(DateTime promisedDate)
+    {
+        IsSupplierConfirmed = true;
+        SupplierPromisedDate = promisedDate;
+    }
+
+    protected PurchaseOrderItem() { }
+    public PurchaseOrderItem(Guid id, Guid purchaseOrderId, Guid itemId, string description, decimal quantity, decimal unitPrice, decimal taxAmount, string uom, Guid? projectId = null)
+        : base(id)
+    {
+        PurchaseOrderId = purchaseOrderId; ItemId = itemId; Description = description;
+        Quantity = quantity; UnitPrice = unitPrice; TaxAmount = taxAmount; Uom = uom;
+        ProjectId = projectId;
+    }
+}

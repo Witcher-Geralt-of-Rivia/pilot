@@ -1,0 +1,329 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Inventory.Entities;
+using Volo.Abp;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Domain.Services;
+
+namespace MyERP.Inventory.DomainServices;
+
+/// <summary>
+/// Domain service for generating period-end stock closing snapshots.
+/// Per ERPNext: stock closing entries avoid full SLE scans for balance reports.
+///
+/// Algorithm:
+/// 1. Find the latest submitted closing for the company (incremental base)
+/// 2. Determine scan range: previous_closing.ToDate+1 to new closing ToDate
+/// 3. Load opening balances from previous closing (or empty if first)
+/// 4. Apply all SLE delta for the scan range (group by item+warehouse)
+/// 5. For FIFO/LIFO items, persist the queue state as JSON
+/// 6. Write StockClosingBalance rows and submit
+///
+/// Per DO-NOT rules:
+/// - Must use incremental logic (reprocessing all SLE is too slow)
+/// - Stock Balance report uses latest closing as opening (optimization)
+/// </summary>
+public class StockClosingService : DomainService
+{
+    private readonly IRepository<StockClosingEntry, Guid> _closingRepository;
+    private readonly IRepository<StockLedgerEntry, Guid> _sleRepository;
+
+    public StockClosingService(
+        IRepository<StockClosingEntry, Guid> closingRepository,
+        IRepository<StockLedgerEntry, Guid> sleRepository)
+    {
+        _closingRepository = closingRepository;
+        _sleRepository = sleRepository;
+    }
+
+    /// <summary>
+    /// Find the latest submitted stock closing for a company.
+    /// Returns null if no prior closing exists (first closing ever).
+    /// </summary>
+    public async Task<StockClosingEntry?> GetLatestClosingAsync(Guid companyId)
+    {
+        var query = await _closingRepository.GetQueryableAsync();
+        return query
+            .Where(c => c.CompanyId == companyId && c.Status == StockClosingStatus.Submitted)
+            .OrderByDescending(c => c.ToDate)
+            .FirstOrDefault();
+    }
+
+    /// <summary>
+    /// Check if a date is covered by an existing submitted stock closing.
+    /// If covered, reposting for that date is blocked.
+    /// </summary>
+    public async Task<bool> IsDateCoveredByClosingAsync(Guid companyId, DateTime date)
+    {
+        var query = await _closingRepository.GetQueryableAsync();
+        return query.Any(c => c.CompanyId == companyId
+                           && c.Status == StockClosingStatus.Submitted
+                           && c.ToDate >= date);
+    }
+
+    /// <summary>
+    /// Check if a date range overlaps with any existing submitted stock closing entry.
+    /// Per ERPNext PR #56877 / commit 10c6cda6db:
+    /// Two date ranges [from1, to1] and [from2, to2] overlap when from1 <= to2 && to1 >= from2.
+    /// Catches partial overlaps, containment, and enclosure.
+    /// </summary>
+    public async Task<bool> IsRangeOverlappingWithClosingAsync(Guid companyId, DateTime fromDate, DateTime toDate)
+    {
+        var query = await _closingRepository.GetQueryableAsync();
+        return query.Any(c => c.CompanyId == companyId
+                           && c.Status == StockClosingStatus.Submitted
+                           && (c.ScannedFromDate ?? DateTime.MinValue) <= toDate
+                           && c.ToDate >= fromDate);
+    }
+
+    /// <summary>
+    /// Check if a later submitted stock closing entry exists for the company.
+    /// Per ERPNext PR #60127: closing balances are chained, so cancelling or regenerating
+    /// an earlier closing is blocked if a later closing was built on it.
+    /// </summary>
+    public async Task<bool> HasLaterSubmittedClosingAsync(Guid companyId, DateTime toDate)
+    {
+        var query = await _closingRepository.GetQueryableAsync();
+        return query.Any(c => c.CompanyId == companyId
+                           && c.Status == StockClosingStatus.Submitted
+                           && c.ToDate > toDate);
+    }
+
+    /// <summary>
+    /// Regenerate balances for an existing submitted stock closing entry.
+    /// Per ERPNext PR #60127:
+    /// - Only allowed for Submitted entries
+    /// - Blocked if a later closing exists for the company
+    /// - Clears previous balances and rescans SLE delta
+    /// </summary>
+    public async Task<StockClosingEntry> RegenerateClosingAsync(Guid closingId)
+    {
+        var closing = await _closingRepository.GetAsync(closingId);
+        if (closing.Status != StockClosingStatus.Submitted)
+            throw new BusinessException(MyERPDomainErrorCodes.StockClosingMustBeSubmittedToGenerate);
+
+        var hasLater = await HasLaterSubmittedClosingAsync(closing.CompanyId, closing.ToDate);
+        if (hasLater)
+            throw new BusinessException(MyERPDomainErrorCodes.StockClosingCannotRegenerateWithLaterClosing);
+
+        closing.ClearBalances();
+
+        // 1. Find previous closing before this one
+        var query = await _closingRepository.GetQueryableAsync();
+        var previousClosing = query
+            .Where(c => c.CompanyId == closing.CompanyId
+                     && c.Status == StockClosingStatus.Submitted
+                     && c.Id != closing.Id
+                     && c.ToDate < closing.ToDate)
+            .OrderByDescending(c => c.ToDate)
+            .FirstOrDefault();
+
+        var scanFromDate = previousClosing?.ToDate.AddDays(1) ?? DateTime.MinValue;
+        closing.PreviousClosingEntryId = previousClosing?.Id;
+        closing.ScannedFromDate = scanFromDate == DateTime.MinValue ? null : scanFromDate;
+
+        // 2. Load opening balances from previous closing
+        var balances = new Dictionary<(Guid ItemId, Guid WarehouseId), StockBalanceAccumulator>();
+        if (previousClosing != null)
+        {
+            foreach (var prev in previousClosing.Balances)
+            {
+                balances[(prev.ItemId, prev.WarehouseId)] = new StockBalanceAccumulator
+                {
+                    Qty = prev.Qty,
+                    StockValue = prev.StockValue,
+                    ValuationRate = prev.ValuationRate,
+                    FifoQueue = prev.FifoQueue,
+                };
+            }
+        }
+
+        // 3. Apply SLE delta
+        var sleQuery = await _sleRepository.GetQueryableAsync();
+        var deltaEntries = sleQuery
+            .Where(s => s.CompanyId == closing.CompanyId
+                     && s.PostingDate >= scanFromDate
+                     && s.PostingDate <= closing.ToDate)
+            .OrderBy(s => s.PostingDate)
+            .ThenBy(s => s.CreationTime)
+            .ToList();
+
+        foreach (var sle in deltaEntries)
+        {
+            var key = (sle.ItemId, sle.WarehouseId);
+            if (!balances.TryGetValue(key, out var acc))
+            {
+                acc = new StockBalanceAccumulator();
+                balances[key] = acc;
+            }
+
+            acc.Qty += sle.QuantityChange;
+            acc.StockValue += sle.StockValue;
+            acc.ValuationRate = acc.Qty != 0 ? acc.StockValue / acc.Qty : 0;
+
+            if (!string.IsNullOrEmpty(sle.StockQueue))
+                acc.FifoQueue = sle.StockQueue;
+        }
+
+        // 4. Populate balances
+        var newBalances = new List<StockClosingBalance>();
+        foreach (var kvp in balances)
+        {
+            if (kvp.Value.Qty == 0 && kvp.Value.StockValue == 0)
+                continue;
+
+            newBalances.Add(new StockClosingBalance(
+                GuidGenerator.Create(),
+                closing.Id,
+                kvp.Key.ItemId,
+                kvp.Key.WarehouseId,
+                kvp.Value.Qty,
+                kvp.Value.StockValue,
+                kvp.Value.ValuationRate,
+                kvp.Value.FifoQueue));
+        }
+
+        closing.ReplaceBalances(newBalances);
+        await _closingRepository.UpdateAsync(closing);
+        return closing;
+    }
+
+    /// <summary>
+    /// Generate a stock closing entry for a company up to the specified date.
+    /// Uses incremental logic: builds on the latest previous closing.
+    ///
+    /// Per ERPNext:
+    /// - Reads opening balances from previous closing entry
+    /// - Scans only the SLE delta since the previous closing
+    /// - Groups by (item, warehouse) and aggregates qty/value
+    /// - For FIFO/LIFO items, persists the stock queue as JSON
+    /// </summary>
+    public async Task<StockClosingEntry> GenerateClosingAsync(
+        Guid companyId, DateTime toDate, Guid? tenantId = null)
+    {
+        if (companyId == Guid.Empty)
+            throw new BusinessException(MyERPDomainErrorCodes.StockClosingCompanyRequired);
+
+        var maxAllowedDate = DateTime.Today > DateTime.UtcNow.Date ? DateTime.Today : DateTime.UtcNow.Date;
+        if (toDate.Date > maxAllowedDate)
+            throw new BusinessException(MyERPDomainErrorCodes.StockClosingFutureDateNotAllowed);
+
+        // 1. Find previous closing (incremental base)
+        var previousClosing = await GetLatestClosingAsync(companyId);
+
+        // 2. Determine scan range
+        var scanFromDate = previousClosing?.ToDate.AddDays(1) ?? DateTime.MinValue;
+
+        // 3. Load opening balances from previous closing
+        var balances = new Dictionary<(Guid ItemId, Guid WarehouseId), StockBalanceAccumulator>();
+        if (previousClosing != null)
+        {
+            foreach (var prev in previousClosing.Balances)
+            {
+                balances[(prev.ItemId, prev.WarehouseId)] = new StockBalanceAccumulator
+                {
+                    Qty = prev.Qty,
+                    StockValue = prev.StockValue,
+                    ValuationRate = prev.ValuationRate,
+                    FifoQueue = prev.FifoQueue,
+                };
+            }
+        }
+
+        // 4. Apply SLE delta for the scan range
+        var sleQuery = await _sleRepository.GetQueryableAsync();
+        var deltaEntries = sleQuery
+            .Where(s => s.CompanyId == companyId
+                     && s.PostingDate >= scanFromDate
+                     && s.PostingDate <= toDate)
+            .OrderBy(s => s.PostingDate)
+            .ThenBy(s => s.CreationTime)
+            .ToList();
+
+        foreach (var sle in deltaEntries)
+        {
+            var key = (sle.ItemId, sle.WarehouseId);
+            if (!balances.TryGetValue(key, out var acc))
+            {
+                acc = new StockBalanceAccumulator();
+                balances[key] = acc;
+            }
+
+            acc.Qty += sle.QuantityChange;
+            acc.StockValue += sle.StockValue;
+            acc.ValuationRate = acc.Qty != 0 ? acc.StockValue / acc.Qty : 0;
+
+            // Preserve FIFO/LIFO queue from SLE if available
+            if (!string.IsNullOrEmpty(sle.StockQueue))
+                acc.FifoQueue = sle.StockQueue;
+        }
+
+        // 5. Create the closing entry
+        var closing = new StockClosingEntry(
+            GuidGenerator.Create(), companyId, toDate, tenantId);
+        closing.PreviousClosingEntryId = previousClosing?.Id;
+        closing.ScannedFromDate = scanFromDate == DateTime.MinValue ? null : scanFromDate;
+
+        // 6. Add balance snapshots
+        foreach (var kvp in balances)
+        {
+            if (kvp.Value.Qty == 0 && kvp.Value.StockValue == 0)
+                continue; // Skip zero-balance entries
+
+            closing.AddBalance(
+                kvp.Key.ItemId,
+                kvp.Key.WarehouseId,
+                kvp.Value.Qty,
+                kvp.Value.StockValue,
+                kvp.Value.ValuationRate,
+                kvp.Value.FifoQueue);
+        }
+
+        await _closingRepository.InsertAsync(closing);
+        return closing;
+    }
+
+    /// <summary>
+    /// Get stock balance for reporting, using the latest closing as optimization.
+    /// Returns the opening balance as of the closing date, or empty if no closing.
+    /// </summary>
+    public async Task<Dictionary<(Guid ItemId, Guid WarehouseId), StockBalanceAccumulator>>
+        GetOpeningBalancesFromClosingAsync(Guid companyId, DateTime asOfDate)
+    {
+        var query = await _closingRepository.GetQueryableAsync();
+        var bestClosing = query
+            .Where(c => c.CompanyId == companyId
+                     && c.Status == StockClosingStatus.Submitted
+                     && c.ToDate <= asOfDate)
+            .OrderByDescending(c => c.ToDate)
+            .FirstOrDefault();
+
+        var result = new Dictionary<(Guid, Guid), StockBalanceAccumulator>();
+        if (bestClosing == null)
+            return result;
+
+        foreach (var b in bestClosing.Balances)
+        {
+            result[(b.ItemId, b.WarehouseId)] = new StockBalanceAccumulator
+            {
+                Qty = b.Qty,
+                StockValue = b.StockValue,
+                ValuationRate = b.ValuationRate,
+                FifoQueue = b.FifoQueue,
+            };
+        }
+
+        return result;
+    }
+
+    /// <summary>Accumulator for per-item per-warehouse stock balance during closing generation.</summary>
+    public class StockBalanceAccumulator
+    {
+        public decimal Qty { get; set; }
+        public decimal StockValue { get; set; }
+        public decimal ValuationRate { get; set; }
+        public string? FifoQueue { get; set; }
+    }
+}

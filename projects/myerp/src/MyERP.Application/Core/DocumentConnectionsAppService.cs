@@ -1,0 +1,1679 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Sales.Entities;
+using MyERP.Purchasing.Entities;
+using MyERP.Inventory.Entities;
+using MyERP.Accounting.Entities;
+using MyERP.Manufacturing.Entities;
+using MyERP.Assets.Entities;
+using MyERP.Projects.Entities;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+
+namespace MyERP.Core;
+
+/// <summary>
+/// Returns linked/related documents for a given source document (connections panel).
+/// Per ERPNext dashboard.py pattern: shows upstream sources + downstream creations + payments.
+/// </summary>
+[Authorize]
+public class DocumentConnectionsAppService : ApplicationService, IDocumentConnectionsAppService
+{
+    public async Task<DocumentConnectionsDto> GetConnectionsAsync(string documentType, Guid documentId)
+    {
+        return documentType switch
+        {
+            "SalesInvoice" => await GetSalesInvoiceConnectionsAsync(documentId),
+            "PurchaseInvoice" => await GetPurchaseInvoiceConnectionsAsync(documentId),
+            "SalesOrder" => await GetSalesOrderConnectionsAsync(documentId),
+            "PurchaseOrder" => await GetPurchaseOrderConnectionsAsync(documentId),
+            "DeliveryNote" => await GetDeliveryNoteConnectionsAsync(documentId),
+            "PurchaseReceipt" => await GetPurchaseReceiptConnectionsAsync(documentId),
+            "PaymentEntry" => await GetPaymentEntryConnectionsAsync(documentId),
+            "StockEntry" => await GetStockEntryConnectionsAsync(documentId),
+            "WorkOrder" => await GetWorkOrderConnectionsAsync(documentId),
+            "Quotation" => await GetQuotationConnectionsAsync(documentId),
+            "Customer" => await GetCustomerConnectionsAsync(documentId),
+            "Supplier" => await GetSupplierConnectionsAsync(documentId),
+            "MaterialRequest" => await GetMaterialRequestConnectionsAsync(documentId),
+            "SupplierQuotation" => await GetSupplierQuotationConnectionsAsync(documentId),
+            "ProductionPlan" => await GetProductionPlanConnectionsAsync(documentId),
+            "JobCard" => await GetJobCardConnectionsAsync(documentId),
+            "BillOfMaterials" or "BOM" => await GetBillOfMaterialsConnectionsAsync(documentId),
+            "JournalEntry" => await GetJournalEntryConnectionsAsync(documentId),
+            "SupplierScorecard" => await GetSupplierScorecardConnectionsAsync(documentId),
+            _ => new DocumentConnectionsDto()
+        };
+    }
+
+    private async Task<DocumentConnectionsDto> GetSalesInvoiceConnectionsAsync(Guid id)
+    {
+        var result = new DocumentConnectionsDto();
+
+        // Payment group
+        var peRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PaymentEntry, Guid>>();
+        var peQuery = await peRepo.GetQueryableAsync();
+        var payments = peQuery
+            .Where(pe => pe.References.Any(r => r.ReferenceType == "SalesInvoice" && r.ReferenceId == id)
+                         || pe.AgainstInvoiceId == id)
+            .Select(pe => new ConnectionDocumentDto
+            {
+                Id = pe.Id,
+                DocumentNumber = pe.PaymentNumber,
+                Status = pe.Status.ToString(),
+                Amount = pe.PaidAmount,
+                Date = pe.PostingDate,
+                Route = "/accounting/payments/" + pe.Id
+            }).ToList();
+
+        // Returns
+        var siRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesInvoice, Guid>>();
+        var siQuery = await siRepo.GetQueryableAsync();
+        var returns = siQuery
+            .Where(si => si.ReturnAgainstId == id)
+            .Select(si => new ConnectionDocumentDto
+            {
+                Id = si.Id,
+                DocumentNumber = si.InvoiceNumber,
+                Status = si.Status.ToString(),
+                Amount = si.GrandTotal,
+                Date = si.IssueDate,
+                Route = "/sales/invoices/" + si.Id
+            }).ToList();
+
+        // Source: SO via items
+        var si = await siRepo.GetAsync(id);
+        var soIds = si.Items.Where(i => i.SalesOrderItemId.HasValue)
+            .Select(i => i.SalesOrderItemId!.Value).Distinct().ToList();
+
+        var soConnections = new List<ConnectionDocumentDto>();
+        if (soIds.Any())
+        {
+            var soItemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesOrderItem, Guid>>();
+            var soItemQuery = await soItemRepo.GetQueryableAsync();
+            var linkedSoIds = soItemQuery.Where(soi => soIds.Contains(soi.Id))
+                .Select(soi => soi.SalesOrderId).Distinct().ToList();
+
+            var soRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesOrder, Guid>>();
+            var soQuery = await soRepo.GetQueryableAsync();
+            soConnections = soQuery.Where(so => linkedSoIds.Contains(so.Id))
+                .Select(so => new ConnectionDocumentDto
+                {
+                    Id = so.Id,
+                    DocumentNumber = so.OrderNumber,
+                    Status = so.Status.ToString(),
+                    Amount = so.GrandTotal,
+                    Date = so.OrderDate,
+                    Route = "/sales/orders/" + so.Id
+                }).ToList();
+        }
+
+        // Source: DN via items
+        var dnIds = si.Items.Where(i => i.DeliveryNoteItemId.HasValue)
+            .Select(i => i.DeliveryNoteItemId!.Value).Distinct().ToList();
+
+        var dnConnections = new List<ConnectionDocumentDto>();
+        if (dnIds.Any())
+        {
+            var dnRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<DeliveryNote, Guid>>();
+            var dnQuery = await dnRepo.GetQueryableAsync();
+            // Items link to DN item IDs, we need DN IDs — query DN items to get parent IDs
+            var dnItemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<DeliveryNoteItem, Guid>>();
+            var dnItemQuery = await dnItemRepo.GetQueryableAsync();
+            var linkedDnIds = dnItemQuery.Where(dni => dnIds.Contains(dni.Id))
+                .Select(dni => dni.DeliveryNoteId).Distinct().ToList();
+
+            dnConnections = dnQuery.Where(dn => linkedDnIds.Contains(dn.Id))
+                .Select(dn => new ConnectionDocumentDto
+                {
+                    Id = dn.Id,
+                    DocumentNumber = dn.DeliveryNumber,
+                    Status = dn.Status.ToString(),
+                    Date = dn.PostingDate,
+                    Route = "/sales/delivery-notes/" + dn.Id
+                }).ToList();
+        }
+
+        // Build groups
+        var paymentGroup = new ConnectionGroupDto { Label = "Payment", Items = new() };
+        if (payments.Any())
+            paymentGroup.Items.Add(new ConnectionItemDto
+            {
+                DocumentType = "Payment Entry",
+                Count = payments.Count,
+                Route = "/accounting/payments",
+                Documents = payments
+            });
+
+        var referenceGroup = new ConnectionGroupDto { Label = "Reference", Items = new() };
+        if (soConnections.Any())
+            referenceGroup.Items.Add(new ConnectionItemDto
+            {
+                DocumentType = "Sales Order",
+                Count = soConnections.Count,
+                Route = "/sales/orders",
+                Documents = soConnections
+            });
+        if (dnConnections.Any())
+            referenceGroup.Items.Add(new ConnectionItemDto
+            {
+                DocumentType = "Delivery Note",
+                Count = dnConnections.Count,
+                Route = "/sales/delivery-notes",
+                Documents = dnConnections
+            });
+
+        var returnGroup = new ConnectionGroupDto { Label = "Returns", Items = new() };
+        if (returns.Any())
+            returnGroup.Items.Add(new ConnectionItemDto
+            {
+                DocumentType = "Credit Note",
+                Count = returns.Count,
+                Route = "/sales/invoices",
+                Documents = returns
+            });
+
+        // Timesheets billed to this SI (via TimesheetDetail rows)
+        var tsRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Timesheet, Guid>>();
+        var tsQuery = await tsRepo.GetQueryableAsync();
+        var timesheets = tsQuery.Where(ts => ts.Details.Any(d => d.SalesInvoiceId == id))
+            .Select(ts => new ConnectionDocumentDto
+            {
+                Id = ts.Id, DocumentNumber = ts.StartDate.ToString("d") + " - " + ts.EndDate.ToString("d"),
+                Status = ts.Status.ToString(), Date = ts.StartDate, Route = "/projects/timesheets/" + ts.Id
+            }).ToList();
+
+        // Dunning notices issued for this SI (via DunningOverduePayment rows)
+        var dunRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Dunning, Guid>>();
+        var dunQuery = await dunRepo.GetQueryableAsync();
+        var dunnings = dunQuery.Where(d => d.OverduePayments.Any(op => op.SalesInvoiceId == id))
+            .Select(d => new ConnectionDocumentDto
+            {
+                Id = d.Id, Status = d.Status.ToString(), Date = d.PostingDate, Route = "/sales/dunnings/" + d.Id
+            }).ToList();
+
+        var otherGroup = new ConnectionGroupDto { Label = "Other", Items = new() };
+        if (timesheets.Any())
+            otherGroup.Items.Add(new ConnectionItemDto { DocumentType = "Timesheet", Count = timesheets.Count, Route = "/projects/timesheets", Documents = timesheets });
+        if (dunnings.Any())
+            otherGroup.Items.Add(new ConnectionItemDto { DocumentType = "Dunning", Count = dunnings.Count, Route = "/sales/dunnings", Documents = dunnings });
+
+        if (paymentGroup.Items.Any()) result.Groups.Add(paymentGroup);
+        if (referenceGroup.Items.Any()) result.Groups.Add(referenceGroup);
+        if (returnGroup.Items.Any()) result.Groups.Add(returnGroup);
+        if (otherGroup.Items.Any()) result.Groups.Add(otherGroup);
+
+        return result;
+    }
+
+    private async Task<DocumentConnectionsDto> GetPurchaseInvoiceConnectionsAsync(Guid id)
+    {
+        var result = new DocumentConnectionsDto();
+
+        var peRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PaymentEntry, Guid>>();
+        var peQuery = await peRepo.GetQueryableAsync();
+        var payments = peQuery
+            .Where(pe => pe.References.Any(r => r.ReferenceType == "PurchaseInvoice" && r.ReferenceId == id)
+                         || pe.AgainstInvoiceId == id)
+            .Select(pe => new ConnectionDocumentDto
+            {
+                Id = pe.Id, DocumentNumber = pe.PaymentNumber, Status = pe.Status.ToString(),
+                Amount = pe.PaidAmount, Date = pe.PostingDate, Route = "/accounting/payments/" + pe.Id
+            }).ToList();
+
+        var piRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseInvoice, Guid>>();
+        var piQuery = await piRepo.GetQueryableAsync();
+        var returns = piQuery.Where(pi => pi.ReturnAgainstId == id)
+            .Select(pi => new ConnectionDocumentDto
+            {
+                Id = pi.Id, DocumentNumber = pi.InvoiceNumber, Status = pi.Status.ToString(),
+                Amount = pi.GrandTotal, Date = pi.IssueDate, Route = "/purchasing/invoices/" + pi.Id
+            }).ToList();
+
+        var pi = await piRepo.GetAsync(id);
+        var poIds = pi.Items.Where(i => i.PurchaseOrderItemId.HasValue)
+            .Select(i => i.PurchaseOrderItemId!.Value).Distinct().ToList();
+
+        var poConnections = new List<ConnectionDocumentDto>();
+        if (poIds.Any())
+        {
+            var poItemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseOrderItem, Guid>>();
+            var poItemQuery = await poItemRepo.GetQueryableAsync();
+            var linkedPoIds = poItemQuery.Where(poi => poIds.Contains(poi.Id))
+                .Select(poi => poi.PurchaseOrderId).Distinct().ToList();
+
+            var poRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseOrder, Guid>>();
+            var poQuery = await poRepo.GetQueryableAsync();
+            poConnections = poQuery.Where(po => linkedPoIds.Contains(po.Id))
+                .Select(po => new ConnectionDocumentDto
+                {
+                    Id = po.Id, DocumentNumber = po.OrderNumber, Status = po.Status.ToString(),
+                    Amount = po.GrandTotal, Date = po.OrderDate, Route = "/purchasing/orders/" + po.Id
+                }).ToList();
+        }
+
+        var paymentGroup = new ConnectionGroupDto { Label = "Payment", Items = new() };
+        if (payments.Any())
+            paymentGroup.Items.Add(new ConnectionItemDto { DocumentType = "Payment Entry", Count = payments.Count, Route = "/accounting/payments", Documents = payments });
+
+        var refGroup = new ConnectionGroupDto { Label = "Reference", Items = new() };
+        if (poConnections.Any())
+            refGroup.Items.Add(new ConnectionItemDto { DocumentType = "Purchase Order", Count = poConnections.Count, Route = "/purchasing/orders", Documents = poConnections });
+
+        // Linked Purchase Receipts (via PI items referencing PR items)
+        var prIds = pi.Items.Where(i => i.PurchaseReceiptItemId.HasValue)
+            .Select(i => i.PurchaseReceiptItemId!.Value).Distinct().ToList();
+        var prConnections = new List<ConnectionDocumentDto>();
+        if (prIds.Any())
+        {
+            var prRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseReceipt, Guid>>();
+            var prQuery = await prRepo.GetQueryableAsync();
+            prConnections = prQuery
+                .Where(pr => pr.Items.Any(i => prIds.Contains(i.Id)))
+                .Select(pr => new ConnectionDocumentDto
+                {
+                    Id = pr.Id, DocumentNumber = pr.ReceiptNumber, Status = pr.Status.ToString(),
+                    Date = pr.PostingDate, Route = "/purchasing/receipts/" + pr.Id
+                }).ToList();
+        }
+        if (prConnections.Any())
+            refGroup.Items.Add(new ConnectionItemDto { DocumentType = "Purchase Receipt", Count = prConnections.Count, Route = "/purchasing/receipts", Documents = prConnections });
+
+        var returnGroup = new ConnectionGroupDto { Label = "Returns", Items = new() };
+        if (returns.Any())
+            returnGroup.Items.Add(new ConnectionItemDto { DocumentType = "Debit Note", Count = returns.Count, Route = "/purchasing/invoices", Documents = returns });
+
+        // Assets capitalized from this PI
+        var assetRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Asset, Guid>>();
+        var assetQuery = await assetRepo.GetQueryableAsync();
+        var assets = assetQuery.Where(a => a.PurchaseInvoiceId == id)
+            .Select(a => new ConnectionDocumentDto
+            {
+                Id = a.Id, DocumentNumber = a.AssetName, Status = a.Status.ToString(),
+                Route = "/assets/" + a.Id
+            }).ToList();
+
+        // Landed Cost Vouchers that allocated charges to this PI
+        var lciRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<LandedCostItem, Guid>>();
+        var lciQuery = await lciRepo.GetQueryableAsync();
+        var lcvIds = lciQuery.Where(lci => lci.ReceiptType == "PurchaseInvoice" && lci.ReceiptId == id)
+            .Select(lci => lci.LandedCostVoucherId).Distinct().ToList();
+
+        var lcvConnections = new List<ConnectionDocumentDto>();
+        if (lcvIds.Any())
+        {
+            var lcvRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<LandedCostVoucher, Guid>>();
+            var lcvQuery = await lcvRepo.GetQueryableAsync();
+            lcvConnections = lcvQuery.Where(lcv => lcvIds.Contains(lcv.Id))
+                .Select(lcv => new ConnectionDocumentDto
+                {
+                    Id = lcv.Id, DocumentNumber = lcv.VoucherNumber, Status = lcv.Status.ToString(),
+                    Date = lcv.PostingDate, Route = "/inventory/landed-costs/" + lcv.Id
+                }).ToList();
+        }
+
+        var otherGroup = new ConnectionGroupDto { Label = "Other", Items = new() };
+        if (assets.Any())
+            otherGroup.Items.Add(new ConnectionItemDto { DocumentType = "Asset", Count = assets.Count, Route = "/assets", Documents = assets });
+        if (lcvConnections.Any())
+            otherGroup.Items.Add(new ConnectionItemDto { DocumentType = "Landed Cost Voucher", Count = lcvConnections.Count, Route = "/inventory/landed-costs", Documents = lcvConnections });
+
+        if (paymentGroup.Items.Any()) result.Groups.Add(paymentGroup);
+        if (refGroup.Items.Any()) result.Groups.Add(refGroup);
+        if (returnGroup.Items.Any()) result.Groups.Add(returnGroup);
+        if (otherGroup.Items.Any()) result.Groups.Add(otherGroup);
+
+        return result;
+    }
+
+    private async Task<DocumentConnectionsDto> GetSalesOrderConnectionsAsync(Guid id)
+    {
+        var result = new DocumentConnectionsDto();
+
+        // Delivery Notes linked to this SO
+        var dnRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<DeliveryNote, Guid>>();
+        var dnQuery = await dnRepo.GetQueryableAsync();
+        var dns = dnQuery.Where(dn => dn.SalesOrderId == id)
+            .Select(dn => new ConnectionDocumentDto
+            {
+                Id = dn.Id, DocumentNumber = dn.DeliveryNumber, Status = dn.Status.ToString(),
+                Date = dn.PostingDate, Route = "/sales/delivery-notes/" + dn.Id
+            }).ToList();
+
+        // Sales Invoices linked via items — matched the same way GetPurchaseOrderConnectionsAsync
+        // matches Purchase Invoices to a Purchase Order below: resolve this order's own item ids,
+        // then filter invoices whose items reference one of them.
+        var soRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesOrder, Guid>>();
+        var so = await soRepo.GetAsync(id);
+        var soItemIds = so.Items.Select(i => i.Id).ToList();
+
+        var siRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesInvoice, Guid>>();
+        var siQuery = await siRepo.GetQueryableAsync();
+        var sis = siQuery
+            .Where(si => si.Items.Any(i => i.SalesOrderItemId.HasValue && soItemIds.Contains(i.SalesOrderItemId.Value)))
+            .Select(si => new ConnectionDocumentDto
+            {
+                Id = si.Id, DocumentNumber = si.InvoiceNumber, Status = si.Status.ToString(),
+                Amount = si.GrandTotal, Date = si.IssueDate, Route = "/sales/invoices/" + si.Id
+            }).ToList();
+
+        // Payment Entries
+        var peRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PaymentEntry, Guid>>();
+        var peQuery = await peRepo.GetQueryableAsync();
+        var payments = peQuery
+            .Where(pe => pe.AgainstOrderId == id && pe.AgainstOrderType == "SalesOrder")
+            .Select(pe => new ConnectionDocumentDto
+            {
+                Id = pe.Id, DocumentNumber = pe.PaymentNumber, Status = pe.Status.ToString(),
+                Amount = pe.PaidAmount, Date = pe.PostingDate, Route = "/accounting/payments/" + pe.Id
+            }).ToList();
+
+        // Work Orders
+        var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+        var woQuery = await woRepo.GetQueryableAsync();
+        var wos = woQuery.Where(wo => wo.SalesOrderId == id)
+            .Select(wo => new ConnectionDocumentDto
+            {
+                Id = wo.Id, DocumentNumber = wo.WorkOrderNumber, Status = wo.Status.ToString(),
+                Date = wo.PlannedStartDate, Route = "/manufacturing/work-orders/" + wo.Id
+            }).ToList();
+
+        // Pick Lists
+        var plRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PickList, Guid>>();
+        var plQuery = await plRepo.GetQueryableAsync();
+        var pickLists = plQuery.Where(pl => pl.SalesOrderId == id)
+            .Select(pl => new ConnectionDocumentDto
+            {
+                Id = pl.Id, DocumentNumber = pl.PickListNumber, Status = pl.Status.ToString(),
+                Route = "/inventory/pick-lists/" + pl.Id
+            }).ToList();
+
+        // Purchase Orders (internal transactions / drop-ship linked to this SO, per ERPNext commit e3e6503076)
+        var poRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseOrder, Guid>>();
+        var poQuery = await poRepo.GetQueryableAsync();
+        var pos = poQuery.Where(po => po.InterCompanySalesOrderId == id)
+            .Select(po => new ConnectionDocumentDto
+            {
+                Id = po.Id, DocumentNumber = po.OrderNumber, Status = po.Status.ToString(),
+                Amount = po.GrandTotal, Date = po.OrderDate, Route = "/purchasing/orders/" + po.Id
+            }).ToList();
+
+        var refGroup = new ConnectionGroupDto { Label = "Reference", Items = new() };
+        if (pos.Any())
+            refGroup.Items.Add(new ConnectionItemDto { DocumentType = "Purchase Order", Count = pos.Count, Route = "/purchasing/orders", Documents = pos });
+
+        var fulfillGroup = new ConnectionGroupDto { Label = "Fulfillment", Items = new() };
+        if (dns.Any())
+            fulfillGroup.Items.Add(new ConnectionItemDto { DocumentType = "Delivery Note", Count = dns.Count, Route = "/sales/delivery-notes", Documents = dns });
+        if (pickLists.Any())
+            fulfillGroup.Items.Add(new ConnectionItemDto { DocumentType = "Pick List", Count = pickLists.Count, Route = "/inventory/pick-lists", Documents = pickLists });
+
+        var billingGroup = new ConnectionGroupDto { Label = "Billing", Items = new() };
+        if (sis.Any())
+            billingGroup.Items.Add(new ConnectionItemDto { DocumentType = "Sales Invoice", Count = sis.Count, Route = "/sales/invoices", Documents = sis });
+
+        var paymentGroup = new ConnectionGroupDto { Label = "Payment", Items = new() };
+        if (payments.Any())
+            paymentGroup.Items.Add(new ConnectionItemDto { DocumentType = "Payment Entry", Count = payments.Count, Route = "/accounting/payments", Documents = payments });
+
+        var mfgGroup = new ConnectionGroupDto { Label = "Manufacturing", Items = new() };
+        if (wos.Any())
+            mfgGroup.Items.Add(new ConnectionItemDto { DocumentType = "Work Order", Count = wos.Count, Route = "/manufacturing/work-orders", Documents = wos });
+
+        if (refGroup.Items.Any()) result.Groups.Add(refGroup);
+        if (fulfillGroup.Items.Any()) result.Groups.Add(fulfillGroup);
+        if (billingGroup.Items.Any()) result.Groups.Add(billingGroup);
+        if (paymentGroup.Items.Any()) result.Groups.Add(paymentGroup);
+        if (mfgGroup.Items.Any()) result.Groups.Add(mfgGroup);
+
+        return result;
+    }
+
+    private async Task<DocumentConnectionsDto> GetPurchaseOrderConnectionsAsync(Guid id)
+    {
+        var result = new DocumentConnectionsDto();
+
+        var prRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseReceipt, Guid>>();
+        var prQuery = await prRepo.GetQueryableAsync();
+        var receipts = prQuery.Where(pr => pr.PurchaseOrderId == id)
+            .Select(pr => new ConnectionDocumentDto
+            {
+                Id = pr.Id, DocumentNumber = pr.ReceiptNumber, Status = pr.Status.ToString(),
+                Date = pr.PostingDate, Route = "/purchasing/receipts/" + pr.Id
+            }).ToList();
+
+        // Linked Purchase Invoices (via PI items referencing this PO's items)
+        var poRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseOrder, Guid>>();
+        var po = await poRepo.GetAsync(id);
+        var poItemIds = po.Items.Select(i => i.Id).ToList();
+
+        var piRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseInvoice, Guid>>();
+        var piQuery = await piRepo.GetQueryableAsync();
+        var invoices = piQuery
+            .Where(pi => pi.Items.Any(i => i.PurchaseOrderItemId.HasValue && poItemIds.Contains(i.PurchaseOrderItemId.Value)))
+            .Select(pi => new ConnectionDocumentDto
+            {
+                Id = pi.Id, DocumentNumber = pi.InvoiceNumber, Status = pi.Status.ToString(),
+                Amount = pi.GrandTotal, Date = pi.IssueDate, Route = "/purchasing/invoices/" + pi.Id
+            }).ToList();
+
+        var peRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PaymentEntry, Guid>>();
+        var peQuery = await peRepo.GetQueryableAsync();
+        var payments = peQuery
+            .Where(pe => pe.AgainstOrderId == id && pe.AgainstOrderType == "PurchaseOrder")
+            .Select(pe => new ConnectionDocumentDto
+            {
+                Id = pe.Id, DocumentNumber = pe.PaymentNumber, Status = pe.Status.ToString(),
+                Amount = pe.PaidAmount, Date = pe.PostingDate, Route = "/accounting/payments/" + pe.Id
+            }).ToList();
+
+        // Source Supplier Quotation
+        var sqConnections = new List<ConnectionDocumentDto>();
+        if (po.SupplierQuotationId.HasValue)
+        {
+            var sqRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SupplierQuotation, Guid>>();
+            var sq = await sqRepo.FindAsync(po.SupplierQuotationId.Value);
+            if (sq != null)
+                sqConnections.Add(new ConnectionDocumentDto
+                {
+                    Id = sq.Id, DocumentNumber = sq.QuotationNumber, Status = sq.Status.ToString(),
+                    Route = "/purchasing/supplier-quotations/" + sq.Id
+                });
+        }
+
+        // Source Sales Order (inter-company transaction)
+        var soConnections = new List<ConnectionDocumentDto>();
+        if (po.InterCompanySalesOrderId.HasValue)
+        {
+            var soRepoForPo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesOrder, Guid>>();
+            var linkedSo = await soRepoForPo.FindAsync(po.InterCompanySalesOrderId.Value);
+            if (linkedSo != null)
+                soConnections.Add(new ConnectionDocumentDto
+                {
+                    Id = linkedSo.Id, DocumentNumber = linkedSo.OrderNumber, Status = linkedSo.Status.ToString(),
+                    Amount = linkedSo.GrandTotal, Date = linkedSo.OrderDate, Route = "/sales/orders/" + linkedSo.Id
+                });
+        }
+
+        var receivingGroup = new ConnectionGroupDto { Label = "Receiving", Items = new() };
+        if (receipts.Any())
+            receivingGroup.Items.Add(new ConnectionItemDto { DocumentType = "Purchase Receipt", Count = receipts.Count, Route = "/purchasing/receipts", Documents = receipts });
+
+        var billingGroup = new ConnectionGroupDto { Label = "Billing", Items = new() };
+        if (invoices.Any())
+            billingGroup.Items.Add(new ConnectionItemDto { DocumentType = "Purchase Invoice", Count = invoices.Count, Route = "/purchasing/invoices", Documents = invoices });
+
+        var paymentGroup = new ConnectionGroupDto { Label = "Payment", Items = new() };
+        if (payments.Any())
+            paymentGroup.Items.Add(new ConnectionItemDto { DocumentType = "Payment Entry", Count = payments.Count, Route = "/accounting/payments", Documents = payments });
+
+        var refGroup = new ConnectionGroupDto { Label = "Reference", Items = new() };
+        if (sqConnections.Any())
+            refGroup.Items.Add(new ConnectionItemDto { DocumentType = "Supplier Quotation", Count = sqConnections.Count, Route = "/purchasing/supplier-quotations", Documents = sqConnections });
+        if (soConnections.Any())
+            refGroup.Items.Add(new ConnectionItemDto { DocumentType = "Sales Order", Count = soConnections.Count, Route = "/sales/orders", Documents = soConnections });
+
+        if (refGroup.Items.Any()) result.Groups.Add(refGroup);
+        if (receivingGroup.Items.Any()) result.Groups.Add(receivingGroup);
+        if (billingGroup.Items.Any()) result.Groups.Add(billingGroup);
+        if (paymentGroup.Items.Any()) result.Groups.Add(paymentGroup);
+
+        return result;
+    }
+
+    private async Task<DocumentConnectionsDto> GetDeliveryNoteConnectionsAsync(Guid id)
+    {
+        var result = new DocumentConnectionsDto();
+
+        // Source SO
+        var dnRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<DeliveryNote, Guid>>();
+        var dn = await dnRepo.GetAsync(id);
+
+        // Linked SI — matched by this DN's own item ids, same pattern as GetPurchaseOrderConnectionsAsync.
+        var dnItemIds = dn.Items.Select(i => i.Id).ToList();
+        var siRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesInvoice, Guid>>();
+        var siQuery = await siRepo.GetQueryableAsync();
+        var invoices = siQuery
+            .Where(si => si.Items.Any(i => i.DeliveryNoteItemId.HasValue && dnItemIds.Contains(i.DeliveryNoteItemId.Value)))
+            .Select(si => new ConnectionDocumentDto
+            {
+                Id = si.Id, DocumentNumber = si.InvoiceNumber, Status = si.Status.ToString(),
+                Amount = si.GrandTotal, Date = si.IssueDate, Route = "/sales/invoices/" + si.Id
+            }).ToList();
+
+        var soConnections = new List<ConnectionDocumentDto>();
+        if (dn.SalesOrderId.HasValue)
+        {
+            var soRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesOrder, Guid>>();
+            var so = await soRepo.FindAsync(dn.SalesOrderId.Value);
+            if (so != null)
+                soConnections.Add(new ConnectionDocumentDto
+                {
+                    Id = so.Id, DocumentNumber = so.OrderNumber, Status = so.Status.ToString(),
+                    Amount = so.GrandTotal, Date = so.OrderDate, Route = "/sales/orders/" + so.Id
+                });
+        }
+
+        var billingGroup = new ConnectionGroupDto { Label = "Billing", Items = new() };
+        if (invoices.Any())
+            billingGroup.Items.Add(new ConnectionItemDto { DocumentType = "Sales Invoice", Count = invoices.Count, Route = "/sales/invoices", Documents = invoices });
+
+        var refGroup = new ConnectionGroupDto { Label = "Reference", Items = new() };
+        if (soConnections.Any())
+            refGroup.Items.Add(new ConnectionItemDto { DocumentType = "Sales Order", Count = soConnections.Count, Route = "/sales/orders", Documents = soConnections });
+
+        // Quality Inspections against this DN
+        var qiRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<QualityInspection, Guid>>();
+        var qiQuery = await qiRepo.GetQueryableAsync();
+        var inspections = qiQuery.Where(qi => qi.ReferenceType == "DeliveryNote" && qi.ReferenceId == id)
+            .Select(qi => new ConnectionDocumentDto
+            {
+                Id = qi.Id, DocumentNumber = qi.InspectionNumber, Status = qi.DocStatus.ToString(),
+                Date = qi.InspectionDate, Route = "/inventory/quality-inspections/" + qi.Id
+            }).ToList();
+
+        // Packing Slips
+        var psRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PackingSlip, Guid>>();
+        var psQuery = await psRepo.GetQueryableAsync();
+        var packingSlips = psQuery.Where(ps => ps.DeliveryNoteId == id)
+            .Select(ps => new ConnectionDocumentDto
+            {
+                Id = ps.Id, DocumentNumber = "Cases " + ps.FromCaseNo + "-" + ps.ToCaseNo,
+                Route = "/sales/packing-slips/" + ps.Id
+            }).ToList();
+
+        // Shipments (many-to-many via ShipmentDeliveryNote)
+        var shipRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Shipment, Guid>>();
+        var shipQuery = await shipRepo.GetQueryableAsync();
+        var shipments = shipQuery.Where(sh => sh.DeliveryNotes.Any(dnl => dnl.DeliveryNoteId == id))
+            .Select(sh => new ConnectionDocumentDto
+            {
+                Id = sh.Id, DocumentNumber = sh.ShipmentNumber, Status = sh.Status.ToString(),
+                Route = "/sales/shipments/" + sh.Id
+            }).ToList();
+
+        var otherGroup = new ConnectionGroupDto { Label = "Other", Items = new() };
+        if (inspections.Any())
+            otherGroup.Items.Add(new ConnectionItemDto { DocumentType = "Quality Inspection", Count = inspections.Count, Route = "/inventory/quality-inspections", Documents = inspections });
+        if (packingSlips.Any())
+            otherGroup.Items.Add(new ConnectionItemDto { DocumentType = "Packing Slip", Count = packingSlips.Count, Route = "/sales/packing-slips", Documents = packingSlips });
+        if (shipments.Any())
+            otherGroup.Items.Add(new ConnectionItemDto { DocumentType = "Shipment", Count = shipments.Count, Route = "/sales/shipments", Documents = shipments });
+
+        if (refGroup.Items.Any()) result.Groups.Add(refGroup);
+        if (billingGroup.Items.Any()) result.Groups.Add(billingGroup);
+        if (otherGroup.Items.Any()) result.Groups.Add(otherGroup);
+
+        return result;
+    }
+
+    private async Task<DocumentConnectionsDto> GetPurchaseReceiptConnectionsAsync(Guid id)
+    {
+        var result = new DocumentConnectionsDto();
+
+        var prRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseReceipt, Guid>>();
+        var pr = await prRepo.GetAsync(id);
+        var poConnections = new List<ConnectionDocumentDto>();
+        if (pr.PurchaseOrderId.HasValue)
+        {
+            var poRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseOrder, Guid>>();
+            var po = await poRepo.FindAsync(pr.PurchaseOrderId.Value);
+            if (po != null)
+                poConnections.Add(new ConnectionDocumentDto
+                {
+                    Id = po.Id, DocumentNumber = po.OrderNumber, Status = po.Status.ToString(),
+                    Amount = po.GrandTotal, Date = po.OrderDate, Route = "/purchasing/orders/" + po.Id
+                });
+        }
+
+        // Linked Purchase Invoices (via PI items referencing this PR's items) — reverse of the
+        // lookup GetPurchaseInvoiceConnectionsAsync already does the other way around.
+        var prItemIds = pr.Items.Select(i => i.Id).ToList();
+        var piRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseInvoice, Guid>>();
+        var piQuery = await piRepo.GetQueryableAsync();
+        var invoices = piQuery
+            .Where(pi => pi.Items.Any(i => i.PurchaseReceiptItemId.HasValue && prItemIds.Contains(i.PurchaseReceiptItemId.Value)))
+            .Select(pi => new ConnectionDocumentDto
+            {
+                Id = pi.Id, DocumentNumber = pi.InvoiceNumber, Status = pi.Status.ToString(),
+                Amount = pi.GrandTotal, Date = pi.IssueDate, Route = "/purchasing/invoices/" + pi.Id
+            }).ToList();
+
+        // Quality Inspections against this PR
+        var qiRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<QualityInspection, Guid>>();
+        var qiQuery = await qiRepo.GetQueryableAsync();
+        var inspections = qiQuery.Where(qi => qi.ReferenceType == "PurchaseReceipt" && qi.ReferenceId == id)
+            .Select(qi => new ConnectionDocumentDto
+            {
+                Id = qi.Id, DocumentNumber = qi.InspectionNumber, Status = qi.DocStatus.ToString(),
+                Date = qi.InspectionDate, Route = "/inventory/quality-inspections/" + qi.Id
+            }).ToList();
+
+        // Landed Cost Vouchers that allocated charges to this PR
+        var lciRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<LandedCostItem, Guid>>();
+        var lciQuery = await lciRepo.GetQueryableAsync();
+        var lcvIds = lciQuery.Where(lci => lci.ReceiptType == "PurchaseReceipt" && lci.ReceiptId == id)
+            .Select(lci => lci.LandedCostVoucherId).Distinct().ToList();
+
+        var lcvConnections = new List<ConnectionDocumentDto>();
+        if (lcvIds.Any())
+        {
+            var lcvRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<LandedCostVoucher, Guid>>();
+            var lcvQuery = await lcvRepo.GetQueryableAsync();
+            lcvConnections = lcvQuery.Where(lcv => lcvIds.Contains(lcv.Id))
+                .Select(lcv => new ConnectionDocumentDto
+                {
+                    Id = lcv.Id, DocumentNumber = lcv.VoucherNumber, Status = lcv.Status.ToString(),
+                    Date = lcv.PostingDate, Route = "/inventory/landed-costs/" + lcv.Id
+                }).ToList();
+        }
+
+        var refGroup = new ConnectionGroupDto { Label = "Reference", Items = new() };
+        if (poConnections.Any())
+            refGroup.Items.Add(new ConnectionItemDto { DocumentType = "Purchase Order", Count = poConnections.Count, Route = "/purchasing/orders", Documents = poConnections });
+
+        var billingGroup = new ConnectionGroupDto { Label = "Billing", Items = new() };
+        if (invoices.Any())
+            billingGroup.Items.Add(new ConnectionItemDto { DocumentType = "Purchase Invoice", Count = invoices.Count, Route = "/purchasing/invoices", Documents = invoices });
+
+        var otherGroup = new ConnectionGroupDto { Label = "Other", Items = new() };
+        if (inspections.Any())
+            otherGroup.Items.Add(new ConnectionItemDto { DocumentType = "Quality Inspection", Count = inspections.Count, Route = "/inventory/quality-inspections", Documents = inspections });
+        if (lcvConnections.Any())
+            otherGroup.Items.Add(new ConnectionItemDto { DocumentType = "Landed Cost Voucher", Count = lcvConnections.Count, Route = "/inventory/landed-costs", Documents = lcvConnections });
+
+        if (refGroup.Items.Any()) result.Groups.Add(refGroup);
+        if (billingGroup.Items.Any()) result.Groups.Add(billingGroup);
+        if (otherGroup.Items.Any()) result.Groups.Add(otherGroup);
+        return result;
+    }
+
+    private async Task<DocumentConnectionsDto> GetPaymentEntryConnectionsAsync(Guid id)
+    {
+        // Per ERPNext PR #62486 / commit d21ffbde86 (payment_entry_dashboard.py):
+        // Expose Journal Entries (including Exchange Gain/Loss JEs and GL postings) referencing this Payment Entry.
+        var result = new DocumentConnectionsDto();
+        var jeRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<JournalEntry, Guid>>();
+        var jeQuery = await jeRepo.WithDetailsAsync(j => j.Lines);
+
+        var journals = jeQuery
+            .Where(j => (j.ReferenceType == "PaymentEntry" && j.ReferenceId == id)
+                     || j.Lines.Any(l => l.AgainstVoucherType == "PaymentEntry" && l.AgainstVoucherId == id))
+            .OrderByDescending(j => j.PostingDate)
+            .Select(j => new ConnectionDocumentDto
+            {
+                Id = j.Id,
+                DocumentNumber = j.EntryNumber ?? string.Empty,
+                Status = j.Status.ToString(),
+                Amount = j.TotalDebit,
+                Date = j.PostingDate,
+                Route = "/accounting/journal-entries/" + j.Id
+            })
+            .ToList();
+
+        if (journals.Any())
+        {
+            result.Groups.Add(new ConnectionGroupDto
+            {
+                Label = "Accounting",
+                Items = new()
+                {
+                    new ConnectionItemDto
+                    {
+                        DocumentType = "Journal Entry",
+                        Count = journals.Count,
+                        Route = "/accounting/journal-entries",
+                        Documents = journals
+                    }
+                }
+            });
+        }
+
+        return result;
+    }
+
+    private async Task<DocumentConnectionsDto> GetStockEntryConnectionsAsync(Guid id)
+    {
+        var result = new DocumentConnectionsDto();
+
+        var seRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<StockEntry, Guid>>();
+        var se = await seRepo.GetAsync(id);
+
+        if (se.WorkOrderId.HasValue)
+        {
+            var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+            var wo = await woRepo.FindAsync(se.WorkOrderId.Value);
+            if (wo != null)
+            {
+                var refGroup = new ConnectionGroupDto
+                {
+                    Label = "Reference",
+                    Items = new()
+                    {
+                        new ConnectionItemDto
+                        {
+                            DocumentType = "Work Order", Count = 1, Route = "/manufacturing/work-orders",
+                            Documents = new()
+                            {
+                                new ConnectionDocumentDto
+                                {
+                                    Id = wo.Id, DocumentNumber = wo.WorkOrderNumber, Status = wo.Status.ToString(),
+                                    Date = wo.PlannedStartDate, Route = "/manufacturing/work-orders/" + wo.Id
+                                }
+                            }
+                        }
+                    }
+                };
+                result.Groups.Add(refGroup);
+            }
+        }
+
+        return result;
+    }
+
+    private async Task<DocumentConnectionsDto> GetWorkOrderConnectionsAsync(Guid id)
+    {
+        var result = new DocumentConnectionsDto();
+
+        // Stock Entries linked to this WO
+        var seRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<StockEntry, Guid>>();
+        var seQuery = await seRepo.GetQueryableAsync();
+        var ses = seQuery.Where(se => se.WorkOrderId == id)
+            .Select(se => new ConnectionDocumentDto
+            {
+                Id = se.Id, DocumentNumber = se.EntryNumber, Status = se.Status.ToString(),
+                Date = se.PostingDate, Route = "/inventory/stock-entries/" + se.Id
+            }).ToList();
+
+        // Job Cards
+        var jcRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<JobCard, Guid>>();
+        var jcQuery = await jcRepo.GetQueryableAsync();
+        var jcs = jcQuery.Where(jc => jc.WorkOrderId == id)
+            .Select(jc => new ConnectionDocumentDto
+            {
+                Id = jc.Id, DocumentNumber = jc.SequenceId.ToString(), Status = jc.Status.ToString(),
+                Route = "/manufacturing/job-cards/" + jc.Id
+            }).ToList();
+
+        var prodGroup = new ConnectionGroupDto { Label = "Production", Items = new() };
+        if (ses.Any())
+            prodGroup.Items.Add(new ConnectionItemDto { DocumentType = "Stock Entry", Count = ses.Count, Route = "/inventory/stock-entries", Documents = ses });
+        if (jcs.Any())
+            prodGroup.Items.Add(new ConnectionItemDto { DocumentType = "Job Card", Count = jcs.Count, Route = "/manufacturing/job-cards", Documents = jcs });
+
+        if (prodGroup.Items.Any()) result.Groups.Add(prodGroup);
+
+        // Source SO
+        var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+        var wo = await woRepo.GetAsync(id);
+        if (wo.SalesOrderId.HasValue)
+        {
+            var soRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesOrder, Guid>>();
+            var so = await soRepo.FindAsync(wo.SalesOrderId.Value);
+            if (so != null)
+            {
+                var refGroup = new ConnectionGroupDto
+                {
+                    Label = "Reference",
+                    Items = new()
+                    {
+                        new ConnectionItemDto
+                        {
+                            DocumentType = "Sales Order", Count = 1, Route = "/sales/orders",
+                            Documents = new()
+                            {
+                                new ConnectionDocumentDto
+                                {
+                                    Id = so.Id, DocumentNumber = so.OrderNumber, Status = so.Status.ToString(),
+                                    Amount = so.GrandTotal, Date = so.OrderDate, Route = "/sales/orders/" + so.Id
+                                }
+                            }
+                        }
+                    }
+                };
+                result.Groups.Add(refGroup);
+            }
+        }
+
+        return result;
+    }
+
+    private async Task<DocumentConnectionsDto> GetQuotationConnectionsAsync(Guid id)
+    {
+        var result = new DocumentConnectionsDto();
+
+        var soRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesOrder, Guid>>();
+        var soQuery = await soRepo.GetQueryableAsync();
+        var orders = soQuery.Where(so => so.QuotationId == id)
+            .Select(so => new ConnectionDocumentDto
+            {
+                Id = so.Id, DocumentNumber = so.OrderNumber, Status = so.Status.ToString(),
+                Amount = so.GrandTotal, Date = so.OrderDate, Route = "/sales/orders/" + so.Id
+            }).ToList();
+
+        var conversionGroup = new ConnectionGroupDto { Label = "Conversion", Items = new() };
+        if (orders.Any())
+            conversionGroup.Items.Add(new ConnectionItemDto { DocumentType = "Sales Order", Count = orders.Count, Route = "/sales/orders", Documents = orders });
+
+        if (conversionGroup.Items.Any()) result.Groups.Add(conversionGroup);
+        return result;
+    }
+
+    private async Task<DocumentConnectionsDto> GetCustomerConnectionsAsync(Guid customerId)
+    {
+        var result = new DocumentConnectionsDto();
+
+        // Pre Sales
+        var preSalesGroup = new ConnectionGroupDto { Label = "Pre Sales", Items = new() };
+        var oppRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<CRM.Entities.Opportunity, Guid>>();
+        var oppQuery = await oppRepo.GetQueryableAsync();
+        var opps = oppQuery.Where(o => o.CustomerId == customerId)
+            .Select(o => new ConnectionDocumentDto
+            {
+                Id = o.Id,
+                DocumentNumber = o.OpportunityNumber,
+                Status = o.Status.ToString(),
+                Amount = o.OpportunityAmount,
+                Date = o.CreationTime,
+                Route = "/crm/opportunities/" + o.Id
+            }).ToList();
+        if (opps.Any()) preSalesGroup.Items.Add(new ConnectionItemDto { DocumentType = "Opportunity", Count = opps.Count, Route = "/crm/opportunities", Documents = opps });
+
+        var qRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Quotation, Guid>>();
+        var qQuery = await qRepo.GetQueryableAsync();
+        var quotes = qQuery.Where(q => q.CustomerId == customerId)
+            .Select(q => new ConnectionDocumentDto
+            {
+                Id = q.Id,
+                DocumentNumber = q.QuotationNumber,
+                Status = q.Status.ToString(),
+                Amount = q.GrandTotal,
+                Date = q.IssueDate,
+                Route = "/sales/quotations/" + q.Id
+            }).ToList();
+        if (quotes.Any()) preSalesGroup.Items.Add(new ConnectionItemDto { DocumentType = "Quotation", Count = quotes.Count, Route = "/sales/quotations", Documents = quotes });
+        if (preSalesGroup.Items.Any()) result.Groups.Add(preSalesGroup);
+
+        // Orders
+        var ordersGroup = new ConnectionGroupDto { Label = "Orders", Items = new() };
+        var soRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesOrder, Guid>>();
+        var soQuery = await soRepo.GetQueryableAsync();
+        var sos = soQuery.Where(s => s.CustomerId == customerId)
+            .Select(s => new ConnectionDocumentDto
+            {
+                Id = s.Id,
+                DocumentNumber = s.OrderNumber,
+                Status = s.Status.ToString(),
+                Amount = s.GrandTotal,
+                Date = s.OrderDate,
+                Route = "/sales/orders/" + s.Id
+            }).ToList();
+        if (sos.Any()) ordersGroup.Items.Add(new ConnectionItemDto { DocumentType = "SalesOrder", Count = sos.Count, Route = "/sales/orders", Documents = sos });
+
+        var dnRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<DeliveryNote, Guid>>();
+        var dnQuery = await dnRepo.GetQueryableAsync();
+        var dns = dnQuery.Where(d => d.CustomerId == customerId)
+            .Select(d => new ConnectionDocumentDto
+            {
+                Id = d.Id,
+                DocumentNumber = d.DeliveryNumber,
+                Status = d.Status.ToString(),
+                Date = d.PostingDate,
+                Route = "/sales/deliveries/" + d.Id
+            }).ToList();
+        if (dns.Any()) ordersGroup.Items.Add(new ConnectionItemDto { DocumentType = "DeliveryNote", Count = dns.Count, Route = "/sales/deliveries", Documents = dns });
+
+        var siRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesInvoice, Guid>>();
+        var siQuery = await siRepo.GetQueryableAsync();
+        var sis = siQuery.Where(s => s.CustomerId == customerId)
+            .Select(s => new ConnectionDocumentDto
+            {
+                Id = s.Id,
+                DocumentNumber = s.InvoiceNumber,
+                Status = s.Status.ToString(),
+                Amount = s.GrandTotal,
+                Date = s.IssueDate,
+                Route = "/sales/invoices/" + s.Id
+            }).ToList();
+        if (sis.Any()) ordersGroup.Items.Add(new ConnectionItemDto { DocumentType = "SalesInvoice", Count = sis.Count, Route = "/sales/invoices", Documents = sis });
+        if (ordersGroup.Items.Any()) result.Groups.Add(ordersGroup);
+
+        // Payments
+        var paymentsGroup = new ConnectionGroupDto { Label = "Payments", Items = new() };
+        var peRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PaymentEntry, Guid>>();
+        var peQuery = await peRepo.GetQueryableAsync();
+        var pes = peQuery.Where(p => p.PartyType == "Customer" && p.PartyId == customerId)
+            .Select(p => new ConnectionDocumentDto
+            {
+                Id = p.Id,
+                DocumentNumber = p.PaymentNumber,
+                Status = p.Status.ToString(),
+                Amount = p.PaidAmount,
+                Date = p.PostingDate,
+                Route = "/accounting/payments/" + p.Id
+            }).ToList();
+        if (pes.Any()) paymentsGroup.Items.Add(new ConnectionItemDto { DocumentType = "PaymentEntry", Count = pes.Count, Route = "/accounting/payments", Documents = pes });
+
+        // Dunning (Per ERPNext PR #46716 / commit 638d825d8c: add Dunning to customer dashboard)
+        var dunRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Dunning, Guid>>();
+        var dunQuery = await dunRepo.GetQueryableAsync();
+        var duns = dunQuery.Where(d => d.CustomerId == customerId)
+            .Select(d => new ConnectionDocumentDto
+            {
+                Id = d.Id,
+                Status = d.Status.ToString(),
+                Amount = d.GrandTotal,
+                Date = d.PostingDate,
+                Route = "/sales/dunnings/" + d.Id
+            }).ToList();
+        if (duns.Any()) paymentsGroup.Items.Add(new ConnectionItemDto { DocumentType = "Dunning", Count = duns.Count, Route = "/sales/dunnings", Documents = duns });
+        if (paymentsGroup.Items.Any()) result.Groups.Add(paymentsGroup);
+
+        return result;
+    }
+
+    private async Task<DocumentConnectionsDto> GetSupplierScorecardConnectionsAsync(Guid id)
+    {
+        var result = new DocumentConnectionsDto();
+        var periodRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<ScorecardPeriod, Guid>>();
+        var periodQuery = await periodRepo.GetQueryableAsync();
+        var periods = periodQuery.Where(p => p.SupplierScorecardId == id)
+            .OrderByDescending(p => p.StartDate)
+            .Select(p => new ConnectionDocumentDto
+            {
+                Id = p.Id,
+                DocumentNumber = p.StartDate.ToString("yyyy-MM-dd") + " - " + p.EndDate.ToString("yyyy-MM-dd"),
+                Status = p.IsSubmitted ? "Submitted" : "Pending",
+                Amount = p.TotalScore,
+                Date = p.StartDate,
+                Route = "/purchasing/supplier-scorecards/" + id
+            }).ToList();
+
+        if (periods.Any())
+        {
+            var scorecardsGroup = new ConnectionGroupDto { Label = "Scorecards", Items = new() };
+            scorecardsGroup.Items.Add(new ConnectionItemDto
+            {
+                DocumentType = "Supplier Scorecard Period",
+                Count = periods.Count,
+                Route = "/purchasing/supplier-scorecards/" + id,
+                Documents = periods
+            });
+            result.Groups.Add(scorecardsGroup);
+        }
+
+        return result;
+    }
+
+    private async Task<DocumentConnectionsDto> GetSupplierConnectionsAsync(Guid supplierId)
+    {
+        var result = new DocumentConnectionsDto();
+
+        // Procurement: RFQ, Supplier Quotation
+        var procGroup = new ConnectionGroupDto { Label = "Procurement", Items = new() };
+        var rfqRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<RequestForQuotation, Guid>>();
+        var rfqSupplierRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<RfqSupplier, Guid>>();
+        var rfqSupplierQuery = await rfqSupplierRepo.GetQueryableAsync();
+        var rfqIds = rfqSupplierQuery.Where(s => s.SupplierId == supplierId).Select(s => s.RequestForQuotationId).Distinct().ToList();
+
+        if (rfqIds.Any())
+        {
+            var rfqQuery = await rfqRepo.GetQueryableAsync();
+            var rfqs = rfqQuery.Where(r => rfqIds.Contains(r.Id))
+                .Select(r => new ConnectionDocumentDto
+                {
+                    Id = r.Id,
+                    DocumentNumber = r.RfqNumber,
+                    Status = r.Status.ToString(),
+                    Date = r.TransactionDate,
+                    Route = "/purchasing/rfq/" + r.Id
+                }).ToList();
+            if (rfqs.Any()) procGroup.Items.Add(new ConnectionItemDto { DocumentType = "Request for Quotation", Count = rfqs.Count, Route = "/purchasing/rfq", Documents = rfqs });
+        }
+
+        var sqRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SupplierQuotation, Guid>>();
+        var sqQuery = await sqRepo.GetQueryableAsync();
+        var sqs = sqQuery.Where(s => s.SupplierId == supplierId)
+            .Select(s => new ConnectionDocumentDto
+            {
+                Id = s.Id,
+                DocumentNumber = s.QuotationNumber,
+                Status = s.Status.ToString(),
+                Amount = s.GrandTotal,
+                Date = s.TransactionDate,
+                Route = "/purchasing/supplier-quotations/" + s.Id
+            }).ToList();
+        if (sqs.Any()) procGroup.Items.Add(new ConnectionItemDto { DocumentType = "Supplier Quotation", Count = sqs.Count, Route = "/purchasing/supplier-quotations", Documents = sqs });
+        if (procGroup.Items.Any()) result.Groups.Add(procGroup);
+
+        // Orders: Purchase Order, Purchase Receipt, Purchase Invoice
+        var ordersGroup = new ConnectionGroupDto { Label = "Orders", Items = new() };
+        var poRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseOrder, Guid>>();
+        var poQuery = await poRepo.GetQueryableAsync();
+        var pos = poQuery.Where(p => p.SupplierId == supplierId)
+            .Select(p => new ConnectionDocumentDto
+            {
+                Id = p.Id,
+                DocumentNumber = p.OrderNumber,
+                Status = p.Status.ToString(),
+                Amount = p.GrandTotal,
+                Date = p.OrderDate,
+                Route = "/purchasing/orders/" + p.Id
+            }).ToList();
+        if (pos.Any()) ordersGroup.Items.Add(new ConnectionItemDto { DocumentType = "Purchase Order", Count = pos.Count, Route = "/purchasing/orders", Documents = pos });
+
+        var prRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseReceipt, Guid>>();
+        var prQuery = await prRepo.GetQueryableAsync();
+        var prs = prQuery.Where(p => p.SupplierId == supplierId)
+            .Select(p => new ConnectionDocumentDto
+            {
+                Id = p.Id,
+                DocumentNumber = p.ReceiptNumber,
+                Status = p.Status.ToString(),
+                Amount = p.GrandTotal,
+                Date = p.PostingDate,
+                Route = "/purchasing/receipts/" + p.Id
+            }).ToList();
+        if (prs.Any()) ordersGroup.Items.Add(new ConnectionItemDto { DocumentType = "Purchase Receipt", Count = prs.Count, Route = "/purchasing/receipts", Documents = prs });
+
+        var piRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseInvoice, Guid>>();
+        var piQuery = await piRepo.GetQueryableAsync();
+        var pis = piQuery.Where(p => p.SupplierId == supplierId)
+            .Select(p => new ConnectionDocumentDto
+            {
+                Id = p.Id,
+                DocumentNumber = p.InvoiceNumber,
+                Status = p.Status.ToString(),
+                Amount = p.GrandTotal,
+                Date = p.IssueDate,
+                Route = "/purchasing/invoices/" + p.Id
+            }).ToList();
+        if (pis.Any()) ordersGroup.Items.Add(new ConnectionItemDto { DocumentType = "Purchase Invoice", Count = pis.Count, Route = "/purchasing/invoices", Documents = pis });
+        if (ordersGroup.Items.Any()) result.Groups.Add(ordersGroup);
+
+        // Payments: Payment Entry
+        var paymentsGroup = new ConnectionGroupDto { Label = "Payments", Items = new() };
+        var peRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PaymentEntry, Guid>>();
+        var peQuery = await peRepo.GetQueryableAsync();
+        var pes = peQuery.Where(p => p.PartyType == "Supplier" && p.PartyId == supplierId)
+            .Select(p => new ConnectionDocumentDto
+            {
+                Id = p.Id,
+                DocumentNumber = p.PaymentNumber,
+                Status = p.Status.ToString(),
+                Amount = p.PaidAmount,
+                Date = p.PostingDate,
+                Route = "/accounting/payments/" + p.Id
+            }).ToList();
+        if (pes.Any()) paymentsGroup.Items.Add(new ConnectionItemDto { DocumentType = "Payment Entry", Count = pes.Count, Route = "/accounting/payments", Documents = pes });
+        if (paymentsGroup.Items.Any()) result.Groups.Add(paymentsGroup);
+
+        // Evaluation: Supplier Scorecard
+        var evalGroup = new ConnectionGroupDto { Label = "Evaluation", Items = new() };
+        var scRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SupplierScorecard, Guid>>();
+        var scQuery = await scRepo.GetQueryableAsync();
+        var scs = scQuery.Where(s => s.SupplierId == supplierId)
+            .Select(s => new ConnectionDocumentDto
+            {
+                Id = s.Id,
+                DocumentNumber = s.CurrentStanding ?? "Scorecard",
+                Amount = s.Score,
+                Route = "/purchasing/supplier-scorecards/" + s.Id
+            }).ToList();
+        if (scs.Any()) evalGroup.Items.Add(new ConnectionItemDto { DocumentType = "Supplier Scorecard", Count = scs.Count, Route = "/purchasing/supplier-scorecards", Documents = scs });
+        if (evalGroup.Items.Any()) result.Groups.Add(evalGroup);
+
+        return result;
+    }
+
+    private async Task<DocumentConnectionsDto> GetMaterialRequestConnectionsAsync(Guid id)
+    {
+        var result = new DocumentConnectionsDto();
+        var mrRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<MaterialRequest, Guid>>();
+        var mr = await mrRepo.GetAsync(id);
+        var mrItemIds = mr.Items.Select(i => i.Id).ToList();
+
+        // Procurement: RFQ, Supplier Quotation, Purchase Order
+        var procGroup = new ConnectionGroupDto { Label = "Procurement", Items = new() };
+
+        if (mrItemIds.Any())
+        {
+            var rfqItemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<RfqItem, Guid>>();
+            var rfqItemQuery = await rfqItemRepo.GetQueryableAsync();
+            var rfqIds = rfqItemQuery.Where(i => i.MaterialRequestItemId.HasValue && mrItemIds.Contains(i.MaterialRequestItemId.Value))
+                .Select(i => i.RequestForQuotationId).Distinct().ToList();
+
+            if (rfqIds.Any())
+            {
+                var rfqRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<RequestForQuotation, Guid>>();
+                var rfqQuery = await rfqRepo.GetQueryableAsync();
+                var rfqs = rfqQuery.Where(r => rfqIds.Contains(r.Id))
+                    .Select(r => new ConnectionDocumentDto
+                    {
+                        Id = r.Id, DocumentNumber = r.RfqNumber, Status = r.Status.ToString(), Date = r.TransactionDate, Route = "/purchasing/rfq/" + r.Id
+                    }).ToList();
+                if (rfqs.Any()) procGroup.Items.Add(new ConnectionItemDto { DocumentType = "Request for Quotation", Count = rfqs.Count, Route = "/purchasing/rfq", Documents = rfqs });
+            }
+
+            var sqItemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SupplierQuotationItem, Guid>>();
+            var sqItemQuery = await sqItemRepo.GetQueryableAsync();
+            var sqIds = sqItemQuery.Where(i => i.MaterialRequestItemId.HasValue && mrItemIds.Contains(i.MaterialRequestItemId.Value))
+                .Select(i => i.SupplierQuotationId).Distinct().ToList();
+
+            if (sqIds.Any())
+            {
+                var sqRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SupplierQuotation, Guid>>();
+                var sqQuery = await sqRepo.GetQueryableAsync();
+                var sqs = sqQuery.Where(s => sqIds.Contains(s.Id))
+                    .Select(s => new ConnectionDocumentDto
+                    {
+                        Id = s.Id, DocumentNumber = s.QuotationNumber, Status = s.Status.ToString(), Amount = s.GrandTotal, Date = s.TransactionDate, Route = "/purchasing/supplier-quotations/" + s.Id
+                    }).ToList();
+                if (sqs.Any()) procGroup.Items.Add(new ConnectionItemDto { DocumentType = "Supplier Quotation", Count = sqs.Count, Route = "/purchasing/supplier-quotations", Documents = sqs });
+            }
+
+            var poItemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseOrderItem, Guid>>();
+            var poItemQuery = await poItemRepo.GetQueryableAsync();
+            var poIds = poItemQuery.Where(i => i.MaterialRequestItemId.HasValue && mrItemIds.Contains(i.MaterialRequestItemId.Value))
+                .Select(i => i.PurchaseOrderId).Distinct().ToList();
+
+            if (poIds.Any())
+            {
+                var poRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseOrder, Guid>>();
+                var poQuery = await poRepo.GetQueryableAsync();
+                var pos = poQuery.Where(p => poIds.Contains(p.Id))
+                    .Select(p => new ConnectionDocumentDto
+                    {
+                        Id = p.Id, DocumentNumber = p.OrderNumber, Status = p.Status.ToString(), Amount = p.GrandTotal, Date = p.OrderDate, Route = "/purchasing/orders/" + p.Id
+                    }).ToList();
+                if (pos.Any()) procGroup.Items.Add(new ConnectionItemDto { DocumentType = "Purchase Order", Count = pos.Count, Route = "/purchasing/orders", Documents = pos });
+            }
+        }
+        if (procGroup.Items.Any()) result.Groups.Add(procGroup);
+
+        // Manufacturing: Work Order
+        if (mr.WorkOrderId.HasValue)
+        {
+            var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+            var wo = await woRepo.FindAsync(mr.WorkOrderId.Value);
+            if (wo != null)
+            {
+                result.Groups.Add(new ConnectionGroupDto
+                {
+                    Label = "Manufacturing",
+                    Items = new()
+                    {
+                        new ConnectionItemDto
+                        {
+                            DocumentType = "Work Order", Count = 1, Route = "/manufacturing/work-orders",
+                            Documents = new()
+                            {
+                                new ConnectionDocumentDto
+                                {
+                                    Id = wo.Id, DocumentNumber = wo.WorkOrderNumber, Status = wo.Status.ToString(), Date = wo.PlannedStartDate, Route = "/manufacturing/work-orders/" + wo.Id
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        // Stock: Stock Entry
+        if (mrItemIds.Any())
+        {
+            var seItemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<StockEntryItem, Guid>>();
+            var seItemQuery = await seItemRepo.GetQueryableAsync();
+            var seIds = seItemQuery.Where(i => i.MaterialRequestItemId.HasValue && mrItemIds.Contains(i.MaterialRequestItemId.Value))
+                .Select(i => i.StockEntryId).Distinct().ToList();
+
+            if (seIds.Any())
+            {
+                var seRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<StockEntry, Guid>>();
+                var seQuery = await seRepo.GetQueryableAsync();
+                var ses = seQuery.Where(s => seIds.Contains(s.Id))
+                    .Select(s => new ConnectionDocumentDto
+                    {
+                        Id = s.Id, DocumentNumber = s.EntryNumber, Status = s.Status.ToString(), Date = s.PostingDate, Route = "/inventory/stock-entries/" + s.Id
+                    }).ToList();
+                if (ses.Any())
+                {
+                    result.Groups.Add(new ConnectionGroupDto
+                    {
+                        Label = "Stock",
+                        Items = new() { new ConnectionItemDto { DocumentType = "Stock Entry", Count = ses.Count, Route = "/inventory/stock-entries", Documents = ses } }
+                    });
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private async Task<DocumentConnectionsDto> GetSupplierQuotationConnectionsAsync(Guid id)
+    {
+        var result = new DocumentConnectionsDto();
+        var sqRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SupplierQuotation, Guid>>();
+        var sq = await sqRepo.GetAsync(id);
+        var sqItemIds = sq.Items.Select(i => i.Id).ToList();
+
+        // Orders: Purchase Order
+        if (sqItemIds.Any())
+        {
+            var poItemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseOrderItem, Guid>>();
+            var poItemQuery = await poItemRepo.GetQueryableAsync();
+            var poIds = poItemQuery.Where(p => p.SupplierQuotationItemId.HasValue && sqItemIds.Contains(p.SupplierQuotationItemId.Value))
+                .Select(p => p.PurchaseOrderId).Distinct().ToList();
+
+            if (poIds.Any())
+            {
+                var poRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseOrder, Guid>>();
+                var poQuery = await poRepo.GetQueryableAsync();
+                var pos = poQuery.Where(p => poIds.Contains(p.Id))
+                    .Select(p => new ConnectionDocumentDto
+                    {
+                        Id = p.Id, DocumentNumber = p.OrderNumber, Status = p.Status.ToString(), Amount = p.GrandTotal, Date = p.OrderDate, Route = "/purchasing/orders/" + p.Id
+                    }).ToList();
+                if (pos.Any())
+                {
+                    result.Groups.Add(new ConnectionGroupDto
+                    {
+                        Label = "Orders",
+                        Items = new() { new ConnectionItemDto { DocumentType = "Purchase Order", Count = pos.Count, Route = "/purchasing/orders", Documents = pos } }
+                    });
+                }
+            }
+        }
+
+        // Reference: RFQ
+        if (sq.RequestForQuotationId.HasValue)
+        {
+            var rfqRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<RequestForQuotation, Guid>>();
+            var rfq = await rfqRepo.FindAsync(sq.RequestForQuotationId.Value);
+            if (rfq != null)
+            {
+                result.Groups.Add(new ConnectionGroupDto
+                {
+                    Label = "Reference",
+                    Items = new()
+                    {
+                        new ConnectionItemDto
+                        {
+                            DocumentType = "Request for Quotation", Count = 1, Route = "/purchasing/rfq",
+                            Documents = new()
+                            {
+                                new ConnectionDocumentDto
+                                {
+                                    Id = rfq.Id, DocumentNumber = rfq.RfqNumber, Status = rfq.Status.ToString(),
+                                    Date = rfq.TransactionDate, Route = "/purchasing/rfq/" + rfq.Id
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        return result;
+    }
+
+    private async Task<DocumentConnectionsDto> GetProductionPlanConnectionsAsync(Guid id)
+    {
+        var result = new DocumentConnectionsDto();
+        var ppRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<ProductionPlan, Guid>>();
+        var plan = await ppRepo.GetAsync(id);
+
+        // Manufacturing: Work Orders
+        var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+        var woQuery = await woRepo.GetQueryableAsync();
+        var planItemWoIds = plan.PlannedItems.Where(pi => pi.WorkOrderId.HasValue).Select(pi => pi.WorkOrderId!.Value).ToList();
+        var wos = woQuery.Where(w => w.ProductionPlanId == id || planItemWoIds.Contains(w.Id))
+            .Select(w => new ConnectionDocumentDto
+            {
+                Id = w.Id, DocumentNumber = w.WorkOrderNumber, Status = w.Status.ToString(), Date = w.PlannedStartDate, Route = "/manufacturing/work-orders/" + w.Id
+            }).ToList();
+        if (wos.Any())
+        {
+            result.Groups.Add(new ConnectionGroupDto
+            {
+                Label = "Manufacturing",
+                Items = new() { new ConnectionItemDto { DocumentType = "Work Order", Count = wos.Count, Route = "/manufacturing/work-orders", Documents = wos } }
+            });
+        }
+
+        // Stock: Material Requests
+        var mrIds = plan.PlannedItems.Where(p => p.MaterialRequestId.HasValue).Select(p => p.MaterialRequestId!.Value).Distinct().ToList();
+        if (mrIds.Any())
+        {
+            var mrRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<MaterialRequest, Guid>>();
+            var mrQuery = await mrRepo.GetQueryableAsync();
+            var mrs = mrQuery.Where(m => mrIds.Contains(m.Id))
+                .Select(m => new ConnectionDocumentDto
+                {
+                    Id = m.Id, DocumentNumber = m.RequestNumber, Status = m.Status.ToString(), Date = m.RequestDate, Route = "/purchasing/material-requests/" + m.Id
+                }).ToList();
+            if (mrs.Any())
+            {
+                result.Groups.Add(new ConnectionGroupDto
+                {
+                    Label = "Stock",
+                    Items = new() { new ConnectionItemDto { DocumentType = "Material Request", Count = mrs.Count, Route = "/purchasing/material-requests", Documents = mrs } }
+                });
+            }
+        }
+
+        // Orders: Sales Orders
+        var soIds = plan.PlannedItems.Where(p => p.SalesOrderId.HasValue).Select(p => p.SalesOrderId!.Value).Distinct().ToList();
+        if (soIds.Any())
+        {
+            var soRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesOrder, Guid>>();
+            var soQuery = await soRepo.GetQueryableAsync();
+            var sos = soQuery.Where(s => soIds.Contains(s.Id))
+                .Select(s => new ConnectionDocumentDto
+                {
+                    Id = s.Id, DocumentNumber = s.OrderNumber, Status = s.Status.ToString(), Amount = s.GrandTotal, Date = s.OrderDate, Route = "/sales/orders/" + s.Id
+                }).ToList();
+            if (sos.Any())
+            {
+                result.Groups.Add(new ConnectionGroupDto
+                {
+                    Label = "Orders",
+                    Items = new() { new ConnectionItemDto { DocumentType = "Sales Order", Count = sos.Count, Route = "/sales/orders", Documents = sos } }
+                });
+            }
+        }
+
+        return result;
+    }
+
+    private async Task<DocumentConnectionsDto> GetJobCardConnectionsAsync(Guid id)
+    {
+        var result = new DocumentConnectionsDto();
+        var jcRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<JobCard, Guid>>();
+        var jc = await jcRepo.GetAsync(id);
+
+        // Manufacturing: Parent Work Order
+        var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+        var wo = await woRepo.FindAsync(jc.WorkOrderId);
+        if (wo != null)
+        {
+            result.Groups.Add(new ConnectionGroupDto
+            {
+                Label = "Manufacturing",
+                Items = new()
+                {
+                    new ConnectionItemDto
+                    {
+                        DocumentType = "Work Order", Count = 1, Route = "/manufacturing/work-orders",
+                        Documents = new()
+                        {
+                            new ConnectionDocumentDto
+                            {
+                                Id = wo.Id, DocumentNumber = wo.WorkOrderNumber, Status = wo.Status.ToString(), Date = wo.PlannedStartDate, Route = "/manufacturing/work-orders/" + wo.Id
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Stock: Stock Entries linked to this Job Card
+        var seRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<StockEntry, Guid>>();
+        var seQuery = await seRepo.GetQueryableAsync();
+        var ses = seQuery.Where(s => s.JobCardId == id)
+            .Select(s => new ConnectionDocumentDto
+            {
+                Id = s.Id, DocumentNumber = s.EntryNumber, Status = s.Status.ToString(), Date = s.PostingDate, Route = "/inventory/stock-entries/" + s.Id
+            }).ToList();
+        if (ses.Any())
+        {
+            result.Groups.Add(new ConnectionGroupDto
+            {
+                Label = "Stock",
+                Items = new() { new ConnectionItemDto { DocumentType = "Stock Entry", Count = ses.Count, Route = "/inventory/stock-entries", Documents = ses } }
+            });
+        }
+
+        return result;
+    }
+
+    private async Task<DocumentConnectionsDto> GetBillOfMaterialsConnectionsAsync(Guid id)
+    {
+        var result = new DocumentConnectionsDto();
+
+        // Manufacturing: Work Orders, Job Cards, Production Plans
+        var mfgGroup = new ConnectionGroupDto { Label = "Manufacturing", Items = new() };
+        var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+        var woQuery = await woRepo.GetQueryableAsync();
+        var wos = woQuery.Where(w => w.BomId == id)
+            .Select(w => new ConnectionDocumentDto
+            {
+                Id = w.Id, DocumentNumber = w.WorkOrderNumber, Status = w.Status.ToString(), Date = w.PlannedStartDate, Route = "/manufacturing/work-orders/" + w.Id
+            }).ToList();
+        if (wos.Any()) mfgGroup.Items.Add(new ConnectionItemDto { DocumentType = "Work Order", Count = wos.Count, Route = "/manufacturing/work-orders", Documents = wos });
+
+        var jcRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<JobCard, Guid>>();
+        var jcQuery = await jcRepo.GetQueryableAsync();
+        var jcs = jcQuery.Where(j => j.SemiFgBomId == id)
+            .Select(j => new ConnectionDocumentDto
+            {
+                Id = j.Id, DocumentNumber = j.SequenceId.ToString(), Status = j.Status.ToString(), Route = "/manufacturing/job-cards/" + j.Id
+            }).ToList();
+        if (jcs.Any()) mfgGroup.Items.Add(new ConnectionItemDto { DocumentType = "Job Card", Count = jcs.Count, Route = "/manufacturing/job-cards", Documents = jcs });
+
+        var ppiRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<ProductionPlanItem, Guid>>();
+        var ppiQuery = await ppiRepo.GetQueryableAsync();
+        var ppIds = ppiQuery.Where(pi => pi.BomId == id).Select(pi => pi.ProductionPlanId).Distinct().ToList();
+        if (ppIds.Any())
+        {
+            var ppRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<ProductionPlan, Guid>>();
+            var ppQuery = await ppRepo.GetQueryableAsync();
+            var pps = ppQuery.Where(p => ppIds.Contains(p.Id))
+                .Select(p => new ConnectionDocumentDto
+                {
+                    Id = p.Id, DocumentNumber = p.PlanNumber, Status = p.Status.ToString(), Date = p.PostingDate, Route = "/manufacturing/production-plans/" + p.Id
+                }).ToList();
+            if (pps.Any()) mfgGroup.Items.Add(new ConnectionItemDto { DocumentType = "Production Plan", Count = pps.Count, Route = "/manufacturing/production-plans", Documents = pps });
+        }
+        if (mfgGroup.Items.Any()) result.Groups.Add(mfgGroup);
+
+        return result;
+    }
+
+    private async Task<DocumentConnectionsDto> GetJournalEntryConnectionsAsync(Guid id)
+    {
+        var result = new DocumentConnectionsDto();
+        var jeRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<JournalEntry, Guid>>();
+        var je = await jeRepo.GetAsync(id);
+
+        // Payments: Payment Entries referencing this JE
+        var peRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PaymentEntry, Guid>>();
+        var peQuery = await peRepo.GetQueryableAsync();
+        var pes = peQuery.Where(p => p.References.Any(r => r.ReferenceType == "JournalEntry" && r.ReferenceId == id))
+            .Select(p => new ConnectionDocumentDto
+            {
+                Id = p.Id, DocumentNumber = p.PaymentNumber, Status = p.Status.ToString(), Amount = p.PaidAmount, Date = p.PostingDate, Route = "/accounting/payments/" + p.Id
+            }).ToList();
+        if (pes.Any())
+        {
+            result.Groups.Add(new ConnectionGroupDto
+            {
+                Label = "Payments",
+                Items = new() { new ConnectionItemDto { DocumentType = "Payment Entry", Count = pes.Count, Route = "/accounting/payments", Documents = pes } }
+            });
+        }
+
+        // Reversals: JEs reversing this one
+        var jeQuery = await jeRepo.GetQueryableAsync();
+        var reversals = jeQuery.Where(j => j.ReversalOfId == id)
+            .Select(j => new ConnectionDocumentDto
+            {
+                Id = j.Id, DocumentNumber = j.EntryNumber, Status = j.Status.ToString(), Date = j.PostingDate, Route = "/accounting/journal-entries/" + j.Id
+            }).ToList();
+        if (reversals.Any())
+        {
+            result.Groups.Add(new ConnectionGroupDto
+            {
+                Label = "Reversals",
+                Items = new() { new ConnectionItemDto { DocumentType = "Journal Entry", Count = reversals.Count, Route = "/accounting/journal-entries", Documents = reversals } }
+            });
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Finds draft documents of a target type created from/linking back to a source document.
+    /// Warns the user when attempting to create duplicate downstream documents (PR #57299 / get_existing_drafts).
+    /// </summary>
+    public async Task<List<ExistingDraftDto>> GetExistingDraftsAsync(string sourceDocType, Guid sourceId, string targetDocType)
+    {
+        var drafts = new List<ExistingDraftDto>();
+
+        switch ((sourceDocType, targetDocType))
+        {
+            case ("SalesOrder", "DeliveryNote"):
+            {
+                var dnRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<DeliveryNote, Guid>>();
+                var query = await dnRepo.GetQueryableAsync();
+                drafts.AddRange(query
+                    .Where(dn => dn.Status == DocumentStatus.Draft && dn.SalesOrderId == sourceId)
+                    .Select(dn => new ExistingDraftDto
+                    {
+                        Id = dn.Id,
+                        DocumentNumber = dn.DeliveryNumber,
+                        TargetDocType = "DeliveryNote",
+                        Amount = dn.GrandTotal,
+                        Date = dn.PostingDate
+                    }));
+                break;
+            }
+            case ("SalesOrder", "SalesInvoice"):
+            {
+                var soItemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesOrderItem, Guid>>();
+                var soItemQuery = await soItemRepo.GetQueryableAsync();
+                var soItemIds = soItemQuery.Where(i => i.SalesOrderId == sourceId).Select(i => (Guid?)i.Id).ToList();
+
+                var siRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesInvoice, Guid>>();
+                var query = await siRepo.GetQueryableAsync();
+                drafts.AddRange(query
+                    .Where(si => si.Status == DocumentStatus.Draft && si.Items.Any(i => i.SalesOrderItemId.HasValue && soItemIds.Contains(i.SalesOrderItemId)))
+                    .Select(si => new ExistingDraftDto
+                    {
+                        Id = si.Id,
+                        DocumentNumber = si.InvoiceNumber,
+                        TargetDocType = "SalesInvoice",
+                        Amount = si.GrandTotal,
+                        Date = si.IssueDate
+                    }));
+                break;
+            }
+            case ("SalesOrder", "PickList"):
+            {
+                var plRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PickList, Guid>>();
+                var query = await plRepo.GetQueryableAsync();
+                drafts.AddRange(query
+                    .Where(pl => pl.Status == DocumentStatus.Draft && pl.SalesOrderId == sourceId)
+                    .Select(pl => new ExistingDraftDto
+                    {
+                        Id = pl.Id,
+                        DocumentNumber = pl.PickListNumber ?? string.Empty,
+                        TargetDocType = "PickList",
+                        Amount = null,
+                        Date = pl.CreationTime
+                    }));
+                break;
+            }
+            case ("SalesOrder", "WorkOrder"):
+            {
+                var woRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkOrder, Guid>>();
+                var query = await woRepo.GetQueryableAsync();
+                drafts.AddRange(query
+                    .Where(wo => wo.Status == Manufacturing.WorkOrderStatus.Draft && wo.SalesOrderId == sourceId)
+                    .Select(wo => new ExistingDraftDto
+                    {
+                        Id = wo.Id,
+                        DocumentNumber = wo.WorkOrderNumber,
+                        TargetDocType = "WorkOrder",
+                        Amount = null,
+                        Date = wo.CreationTime
+                    }));
+                break;
+            }
+            case ("PurchaseOrder", "PurchaseReceipt"):
+            {
+                var prRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseReceipt, Guid>>();
+                var query = await prRepo.GetQueryableAsync();
+                drafts.AddRange(query
+                    .Where(pr => pr.Status == DocumentStatus.Draft && pr.PurchaseOrderId == sourceId)
+                    .Select(pr => new ExistingDraftDto
+                    {
+                        Id = pr.Id,
+                        DocumentNumber = pr.ReceiptNumber,
+                        TargetDocType = "PurchaseReceipt",
+                        Amount = pr.GrandTotal,
+                        Date = pr.PostingDate
+                    }));
+                break;
+            }
+            case ("PurchaseOrder", "PurchaseInvoice"):
+            {
+                var poItemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseOrderItem, Guid>>();
+                var poItemQuery = await poItemRepo.GetQueryableAsync();
+                var poItemIds = poItemQuery.Where(i => i.PurchaseOrderId == sourceId).Select(i => (Guid?)i.Id).ToList();
+
+                var piRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseInvoice, Guid>>();
+                var query = await piRepo.GetQueryableAsync();
+                drafts.AddRange(query
+                    .Where(pi => pi.Status == DocumentStatus.Draft && pi.Items.Any(i => i.PurchaseOrderItemId.HasValue && poItemIds.Contains(i.PurchaseOrderItemId)))
+                    .Select(pi => new ExistingDraftDto
+                    {
+                        Id = pi.Id,
+                        DocumentNumber = pi.InvoiceNumber,
+                        TargetDocType = "PurchaseInvoice",
+                        Amount = pi.GrandTotal,
+                        Date = pi.IssueDate
+                    }));
+                break;
+            }
+            case ("Quotation", "SalesOrder"):
+            {
+                var soRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<SalesOrder, Guid>>();
+                var query = await soRepo.GetQueryableAsync();
+                drafts.AddRange(query
+                    .Where(so => so.Status == DocumentStatus.Draft && so.QuotationId == sourceId)
+                    .Select(so => new ExistingDraftDto
+                    {
+                        Id = so.Id,
+                        DocumentNumber = so.OrderNumber,
+                        TargetDocType = "SalesOrder",
+                        Amount = so.GrandTotal,
+                        Date = so.OrderDate
+                    }));
+                break;
+            }
+            case ("Opportunity", "Quotation"):
+            {
+                var qRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Quotation, Guid>>();
+                var query = await qRepo.GetQueryableAsync();
+                drafts.AddRange(query
+                    .Where(q => q.Status == DocumentStatus.Draft && q.OpportunityId == sourceId)
+                    .Select(q => new ExistingDraftDto
+                    {
+                        Id = q.Id,
+                        DocumentNumber = q.QuotationNumber,
+                        TargetDocType = "Quotation",
+                        Amount = q.GrandTotal,
+                        Date = q.IssueDate
+                    }));
+                break;
+            }
+        }
+
+        return drafts;
+    }
+}

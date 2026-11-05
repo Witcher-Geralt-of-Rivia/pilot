@@ -1,0 +1,280 @@
+import { Component, OnInit, inject, signal } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { ReactiveFormsModule, FormBuilder, FormArray, Validators } from '@angular/forms';
+import { Router, ActivatedRoute } from '@angular/router';
+import { LocalizationPipe } from '@abp/ng.core';
+import { ToasterService } from '@abp/ng.theme.shared';
+import { PickListService } from '../../proxy/inventory/pick-list.service';
+import { CreatePickListDto } from '../../proxy/inventory/models';
+import { CompanyContextService } from '../../shared/services/company-context.service';
+import { SaveShortcutDirective } from '../../shared/directives/save-shortcut.directive';
+import { BreadcrumbComponent } from '../../shared/components/breadcrumb/breadcrumb.component';
+import { SalesOrderService } from '../../proxy/sales/sales-order.service';
+import { WarehouseService } from '../../proxy/inventory/warehouse.service';
+import { CustomerService } from '../../proxy/sales/customer.service';
+import { ItemService } from '../../proxy/inventory/item.service';
+
+@Component({
+  selector: 'app-pick-list-form',
+  standalone: true,
+  imports: [CommonModule, ReactiveFormsModule, LocalizationPipe, SaveShortcutDirective, BreadcrumbComponent],
+  template: `
+    <app-breadcrumb />
+    <div class="container-fluid py-3">
+      <h4 class="mb-3">
+        <i class="fa fa-clipboard-list me-2 text-primary"></i>
+        {{ '::NewPickList' | abpLocalization }}
+      </h4>
+
+      <form [formGroup]="form" (appSaveShortcut)="save()">
+        <div class="card shadow-sm mb-3">
+          <div class="card-header"><h6 class="mb-0">{{ '::PickListDetails' | abpLocalization }}</h6></div>
+          <div class="card-body">
+            <div class="row g-3">
+              <div class="col-md-4">
+                <label class="form-label">{{ '::Purpose' | abpLocalization }} *</label>
+                <select class="form-select" formControlName="purpose">
+                  <option value="Delivery">{{ '::Delivery' | abpLocalization }}</option>
+                  <option value="MaterialTransfer">{{ '::MaterialTransfer' | abpLocalization }}</option>
+                  <option value="MaterialTransferForManufacture">{{ '::MaterialTransferForManufacture' | abpLocalization }}</option>
+                </select>
+              </div>
+              <div class="col-md-4">
+                <label class="form-label">{{ '::Customer' | abpLocalization }}</label>
+                <select class="form-select" formControlName="customerId">
+                  <option value="">{{ '::SelectCustomer' | abpLocalization }}</option>
+                  @for (c of customers(); track c.id) {
+                    <option [value]="c.id">{{ c.name }}</option>
+                  }
+                </select>
+              </div>
+              <div class="col-md-4">
+                <label class="form-label">{{ '::SalesOrder' | abpLocalization }}</label>
+                <select class="form-select" formControlName="salesOrderId" (change)="onSalesOrderChange()">
+                  <option value="">{{ '::None' | abpLocalization }}</option>
+                  @for (so of salesOrders(); track so.id) {
+                    <option [value]="so.id">{{ so.orderNumber }}</option>
+                  }
+                </select>
+              </div>
+              <div class="col-md-4 d-flex align-items-end">
+                <div class="form-check mb-2">
+                  <input type="checkbox" class="form-check-input" id="pickManually" formControlName="pickManually">
+                  <label class="form-check-label" for="pickManually">{{ '::PickManually' | abpLocalization }}</label>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Items -->
+        <div class="card shadow-sm mb-3">
+          <div class="card-header d-flex justify-content-between align-items-center">
+            <h6 class="mb-0">{{ '::Items' | abpLocalization }}</h6>
+            <button type="button" class="btn btn-outline-primary btn-sm" (click)="addItem()">
+              <i class="fa fa-plus me-1"></i>{{ '::AddItem' | abpLocalization }}
+            </button>
+          </div>
+          <div class="card-body p-0">
+            <table class="table mb-0">
+              <thead>
+                <tr>
+                  <th>{{ '::Item' | abpLocalization }}</th>
+                  <th>{{ '::Warehouse' | abpLocalization }}</th>
+                  <th>{{ '::Quantity' | abpLocalization }}</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody formArrayName="items">
+                @for (item of itemsArray.controls; track $index; let i = $index) {
+                  <tr [formGroupName]="i">
+                    <td>
+                      <select class="form-select form-select-sm" formControlName="itemId">
+                        <option value="">{{ '::SelectItem' | abpLocalization }}</option>
+                        @for (it of availableItems(); track it.id) {
+                          <option [value]="it.id">{{ it.itemCode }} — {{ it.itemName }}</option>
+                        }
+                      </select>
+                    </td>
+                    <td>
+                      <select class="form-select form-select-sm" formControlName="warehouseId">
+                        <option value="">{{ '::SelectWarehouse' | abpLocalization }}</option>
+                        @for (w of warehouses(); track w.id) {
+                          <option [value]="w.id">{{ w.name }}</option>
+                        }
+                      </select>
+                    </td>
+                    <td><input type="number" class="form-control form-control-sm" formControlName="quantity" min="0.01" step="0.01"></td>
+                    <td>
+                      <button type="button" class="btn btn-outline-danger btn-sm" (click)="removeItem(i)">
+                        <i class="fa fa-trash"></i>
+                      </button>
+                    </td>
+                  </tr>
+                }
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="d-flex justify-content-end gap-2">
+          <button type="button" class="btn btn-outline-secondary" routerLink="/inventory/pick-lists">{{ '::Cancel' | abpLocalization }}</button>
+          <button type="button" class="btn btn-primary" (click)="save()" [disabled]="saving()">
+            <i class="fa fa-save me-1"></i>{{ '::Save' | abpLocalization }}
+          </button>
+        </div>
+      </form>
+    </div>
+  `,
+})
+export class PickListFormComponent implements OnInit {
+  private fb = inject(FormBuilder);
+  private router = inject(Router);
+  private route = inject(ActivatedRoute);
+  private service = inject(PickListService);
+  private toaster = inject(ToasterService);
+  private companyContext = inject(CompanyContextService);
+  private salesOrderProxyService = inject(SalesOrderService);
+  private warehouseService = inject(WarehouseService);
+  private customerService = inject(CustomerService);
+  private itemService = inject(ItemService);
+
+  saving = signal(false);
+  customers = signal<any[]>([]);
+  salesOrders = signal<any[]>([]);
+  availableItems = signal<any[]>([]);
+  warehouses = signal<any[]>([]);
+
+  form = this.fb.group({
+    companyId: ['', Validators.required],
+    purpose: ['Delivery'],
+    customerId: [''],
+    salesOrderId: [''],
+    pickManually: [false],
+    items: this.fb.array([]),
+  });
+
+  get itemsArray() { return this.form.get('items') as FormArray; }
+
+  ngOnInit() {
+    const cid = this.companyContext.currentCompanyId();
+    if (cid) this.form.patchValue({ companyId: cid });
+
+    const params = this.route.snapshot.queryParams;
+    if (params['customerId']) this.form.patchValue({ customerId: params['customerId'] });
+    if (params['companyId']) this.form.patchValue({ companyId: params['companyId'] });
+
+    this.customerService.getList({ skipCount: 0, maxResultCount: 200 } as any).subscribe({
+      next: (res: any) => this.customers.set((res.items || []).map((c: any) => ({ id: c.id, name: c.name || c.customerName }))),
+      error: () => {},
+    });
+    this.itemService.getList({ skipCount: 0, maxResultCount: 500 } as any).subscribe({
+      next: (res: any) => this.availableItems.set(res.items || []),
+      error: () => {},
+    });
+    this.warehouseService.getList({ skipCount: 0, maxResultCount: 100, sorting: '' }).subscribe({
+      next: (res: any) => this.warehouses.set(res.items || []),
+      error: () => {},
+    });
+    this.salesOrderProxyService.getList({ skipCount: 0, maxResultCount: 100 } as any).subscribe({
+      next: (res: any) => this.salesOrders.set((res.items || []).filter((so: any) => so.status !== 'Draft' && so.status !== 'Cancelled' && so.status !== 'Closed')),
+      error: () => {},
+    });
+
+    if (params['salesOrderId']) {
+      this.form.patchValue({ salesOrderId: params['salesOrderId'] });
+      this.populateFromSalesOrder(params['salesOrderId']);
+    } else {
+      this.addItem();
+    }
+  }
+
+  onSalesOrderChange() {
+    const soId = this.form.get('salesOrderId')?.value;
+    if (soId) {
+      this.populateFromSalesOrder(soId);
+    }
+  }
+
+  private populateFromSalesOrder(salesOrderId: string) {
+    this.salesOrderProxyService.get(salesOrderId).subscribe({
+      next: (so: any) => {
+        if (so.customerId) this.form.patchValue({ customerId: so.customerId });
+        if (so.companyId) this.form.patchValue({ companyId: so.companyId });
+
+        const defaultWh = this.warehouses()[0]?.id ?? '';
+        // Per ERPNext commit 754475b51a: skip closed, drop-ship, skip-delivery, and already delivered rows
+        const pickableRows = (so.items || []).filter((row: any) =>
+          !row.isClosed
+          && !row.deliveredBySupplier
+          && !row.skipDelivery
+          && Math.abs(row.deliveredQty ?? 0) < Math.abs(row.quantity ?? 0)
+        );
+
+        this.itemsArray.clear();
+        for (const row of pickableRows) {
+          const factor = row.conversionFactor > 0 ? row.conversionFactor : 1;
+          const pickedInOrderUom = (row.pickedQty ?? 0) / factor;
+          const remainingOrderQty = (row.quantity ?? 0) - Math.max(pickedInOrderUom, row.deliveredQty ?? 0);
+          const stockQty = Math.round(remainingOrderQty * factor * 10000) / 10000;
+          if (stockQty <= 0) continue;
+
+          this.itemsArray.push(this.fb.group({
+            itemId: [row.itemId, Validators.required],
+            warehouseId: [row.warehouseId || defaultWh, Validators.required],
+            quantity: [stockQty, [Validators.required, Validators.min(0.01)]],
+            sourceDocumentItemId: [row.id || ''],
+          }));
+        }
+
+        if (this.itemsArray.length === 0) {
+          this.addItem();
+        }
+      },
+      error: () => {
+        if (this.itemsArray.length === 0) this.addItem();
+      },
+    });
+  }
+
+  addItem() {
+    this.itemsArray.push(this.fb.group({
+      itemId: ['', Validators.required],
+      warehouseId: ['', Validators.required],
+      quantity: [1, [Validators.required, Validators.min(0.01)]],
+      sourceDocumentItemId: [''],
+    }));
+  }
+
+  removeItem(i: number) { this.itemsArray.removeAt(i); }
+
+  save() {
+    if (this.form.invalid || this.saving()) return;
+    this.saving.set(true);
+
+    const raw = this.form.getRawValue();
+    const dto: CreatePickListDto = {
+      companyId: raw.companyId || undefined,
+      purpose: raw.purpose || 'Delivery',
+      customerId: raw.customerId || undefined,
+      salesOrderId: raw.salesOrderId || undefined,
+      pickManually: raw.pickManually ?? false,
+      items: (raw.items || []).filter((i: any) => i.itemId).map((i: any) => ({
+        itemId: i.itemId,
+        warehouseId: i.warehouseId,
+        qty: Number(i.quantity),
+        sourceDocumentItemId: i.sourceDocumentItemId || undefined,
+      })),
+    };
+
+    this.service.create(dto).subscribe({
+      next: (created) => {
+        this.toaster.success('::SuccessfullyCreated');
+        this.router.navigate(['/inventory/pick-lists', created.id]);
+      },
+      error: () => this.saving.set(false),
+    });
+  }
+
+  hasUnsavedChanges() { return this.form.dirty; }
+}

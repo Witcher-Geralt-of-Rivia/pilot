@@ -1,0 +1,798 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Accounting.DomainServices;
+using MyERP.Accounting.Entities;
+using MyERP.Permissions;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Guids;
+
+namespace MyERP.Accounting;
+
+[Authorize(MyERPPermissions.PaymentEntries.Default)]
+public class BankReconciliationAppService : ApplicationService, IBankReconciliationAppService
+{
+    private readonly IRepository<BankTransaction, Guid> _repository;
+    private readonly IRepository<PaymentEntry, Guid> _paymentEntryRepository;
+    private readonly IRepository<JournalEntry, Guid> _journalEntryRepository;
+    private readonly IRepository<BankAccount, Guid> _bankAccountRepository;
+    private readonly BankAutoMatchService _autoMatchService;
+    private readonly BankInternalTransferService _internalTransferService;
+
+    public BankReconciliationAppService(
+        IRepository<BankTransaction, Guid> repository,
+        IRepository<PaymentEntry, Guid> paymentEntryRepository,
+        IRepository<JournalEntry, Guid> journalEntryRepository,
+        IRepository<BankAccount, Guid> bankAccountRepository,
+        BankAutoMatchService autoMatchService,
+        BankInternalTransferService internalTransferService)
+    {
+        _repository = repository;
+        _paymentEntryRepository = paymentEntryRepository;
+        _journalEntryRepository = journalEntryRepository;
+        _bankAccountRepository = bankAccountRepository;
+        _autoMatchService = autoMatchService;
+        _internalTransferService = internalTransferService;
+    }
+
+    public async Task<PagedResultDto<BankTransactionDto>> GetTransactionsAsync(GetBankTransactionsDto input)
+    {
+        // Per ERPNext PR #59081 / commit 970f32a342: validate date range
+        if (input.DateFrom.HasValue && input.DateTo.HasValue && input.DateFrom.Value > input.DateTo.Value)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.DateRangeInvalid)
+                .WithData("reason", "From Date cannot be greater than To Date");
+        }
+
+        var query = await _repository.GetQueryableAsync();
+        query = query.Where(t => t.BankAccountId == input.BankAccountId);
+
+        if (input.IsReconciled.HasValue)
+            query = query.Where(t => t.IsReconciled == input.IsReconciled.Value);
+        if (input.DateFrom.HasValue)
+            query = query.Where(t => t.TransactionDate >= input.DateFrom.Value);
+        if (input.DateTo.HasValue)
+            query = query.Where(t => t.TransactionDate <= input.DateTo.Value);
+
+        var totalCount = query.Count();
+        var items = query
+            .OrderByDescending(t => t.TransactionDate)
+            .Skip(input.SkipCount)
+            .Take(input.MaxResultCount)
+            .ToList();
+
+        return new PagedResultDto<BankTransactionDto>(
+            totalCount,
+            items.Select(ObjectMapper.Map<BankTransaction, BankTransactionDto>).ToList());
+    }
+
+    public async Task<BankTransactionDto> ReconcileAsync(ReconcileBankTransactionDto input)
+    {
+        var tx = await _repository.GetAsync(input.TransactionId);
+
+        if (tx.IsReconciled)
+            throw new Volo.Abp.BusinessException("MyERP:02048")
+                .WithData("transactionId", tx.Id);
+
+        if (input.PaymentEntryId.HasValue == input.JournalEntryId.HasValue)
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Exactly one of PaymentEntryId or JournalEntryId must be set.");
+
+        // Prevent the same voucher from being reconciled against more than one bank transaction —
+        // MyERP's model links a voucher 1:1 to a bank transaction (no partial-allocation child
+        // table like ERPNext's), so a second reconciliation of an already-linked voucher would
+        // silently overwrite which statement line it's cleared against.
+        var txQuery = await _repository.GetQueryableAsync();
+        var alreadyAllocated = input.PaymentEntryId.HasValue
+            ? txQuery.Any(t => t.Id != tx.Id && t.IsReconciled && t.PaymentEntryId == input.PaymentEntryId.Value)
+            : txQuery.Any(t => t.Id != tx.Id && t.IsReconciled && t.JournalEntryId == input.JournalEntryId!.Value);
+        if (alreadyAllocated)
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "This voucher is already reconciled against another bank transaction.");
+
+        // A statement-line match is the most authoritative "this cleared the bank" signal there
+        // is — feed it into ClearanceDate so the Bank Reconciliation Statement (which reads
+        // ClearanceDate, not BankTransaction.IsReconciled) actually reflects statement matches
+        // instead of only entries separately marked cleared via BankClearanceAppService.
+        // Authorize write permission on the underlying target voucher (ERPNext PR #59358).
+        if (input.PaymentEntryId.HasValue)
+        {
+            await CheckPolicyAsync(MyERPPermissions.PaymentEntries.Edit);
+            var pe = await _paymentEntryRepository.GetAsync(input.PaymentEntryId.Value);
+            tx.Reconcile(pe.Id, input.MatchedDocumentRef);
+            pe.SetClearanceDate(tx.TransactionDate);
+            await _paymentEntryRepository.UpdateAsync(pe);
+        }
+        else
+        {
+            await CheckPolicyAsync(MyERPPermissions.JournalEntries.Post);
+            var je = await _journalEntryRepository.GetAsync(input.JournalEntryId!.Value);
+            tx.ReconcileWithJournalEntry(je.Id, input.MatchedDocumentRef);
+            je.SetClearanceDate(tx.TransactionDate);
+            await _journalEntryRepository.UpdateAsync(je);
+        }
+
+        await _repository.UpdateAsync(tx);
+        return ObjectMapper.Map<BankTransaction, BankTransactionDto>(tx);
+    }
+
+    public async Task<BankTransactionDto> UnreconcileAsync(Guid id)
+    {
+        var tx = await _repository.GetAsync(id);
+        var previousPaymentEntryId = tx.PaymentEntryId;
+        var previousJournalEntryId = tx.JournalEntryId;
+        tx.Unreconcile();
+        await _repository.UpdateAsync(tx);
+
+        if (previousPaymentEntryId.HasValue)
+        {
+            await CheckPolicyAsync(MyERPPermissions.PaymentEntries.Edit);
+            var pe = await _paymentEntryRepository.FindAsync(previousPaymentEntryId.Value);
+            if (pe != null && pe.ClearanceDate == tx.TransactionDate)
+            {
+                pe.SetClearanceDate(null);
+                await _paymentEntryRepository.UpdateAsync(pe);
+            }
+        }
+        else if (previousJournalEntryId.HasValue)
+        {
+            await CheckPolicyAsync(MyERPPermissions.JournalEntries.Post);
+            var je = await _journalEntryRepository.FindAsync(previousJournalEntryId.Value);
+            if (je != null && je.ClearanceDate == tx.TransactionDate)
+            {
+                je.SetClearanceDate(null);
+                await _journalEntryRepository.UpdateAsync(je);
+            }
+        }
+
+        return ObjectMapper.Map<BankTransaction, BankTransactionDto>(tx);
+    }
+
+    public async Task<BankTransactionDto> ImportTransactionAsync(ImportBankTransactionDto input)
+    {
+        var tx = new BankTransaction(
+            GuidGenerator.Create(),
+            input.CompanyId,
+            input.BankAccountId,
+            input.TransactionDate,
+            input.Description,
+            input.Amount,
+            CurrentTenant.Id)
+        {
+            ReferenceNumber = input.ReferenceNumber
+        };
+
+        await _repository.InsertAsync(tx);
+        return ObjectMapper.Map<BankTransaction, BankTransactionDto>(tx);
+    }
+
+    public async Task<AutoMatchResultDto> AutoMatchAsync(Guid bankAccountId, Guid companyId)
+    {
+        var result = await _autoMatchService.AutoMatchAsync(bankAccountId, companyId);
+        return new AutoMatchResultDto
+        {
+            MatchedCount = result.MatchedCount,
+            PartiallyReconciledCount = result.PartiallyReconciledCount,
+            UnmatchedCount = result.UnmatchedCount,
+        };
+    }
+
+    public async Task<BankReconciliationSummaryDto> GetSummaryAsync(Guid bankAccountId)
+    {
+        var query = await _repository.GetQueryableAsync();
+        var txs = query.Where(t => t.BankAccountId == bankAccountId).ToList();
+
+        return new BankReconciliationSummaryDto
+        {
+            TotalTransactions = txs.Count,
+            ReconciledCount = txs.Count(t => t.IsReconciled),
+            UnreconciledCount = txs.Count(t => !t.IsReconciled),
+            TotalDeposits = txs.Where(t => t.Amount > 0).Sum(t => t.Amount),
+            TotalWithdrawals = txs.Where(t => t.Amount < 0).Sum(t => Math.Abs(t.Amount)),
+            UnreconciledBalance = txs.Where(t => !t.IsReconciled).Sum(t => t.Amount),
+        };
+    }
+
+    /// <summary>
+    /// Returns ranked match candidates for manual reconciliation.
+    /// Per ERPNext: manual matching shows all candidates sorted by composite rank.
+    /// </summary>
+    public async Task<List<MatchCandidateDto>> GetMatchCandidatesAsync(Guid bankTransactionId, Guid companyId, IEnumerable<string>? documentTypes = null)
+    {
+        var candidates = await _autoMatchService.GetMatchCandidatesAsync(bankTransactionId, companyId, documentTypes);
+        return candidates.Select(c => new MatchCandidateDto
+        {
+            VoucherType = c.VoucherType,
+            PaymentEntryId = c.PaymentEntryId,
+            JournalEntryId = c.JournalEntryId,
+            PaymentNumber = c.PaymentNumber,
+            Amount = c.Amount,
+            PostingDate = c.PostingDate,
+            ReferenceNumber = c.ReferenceNumber,
+            Rank = c.Rank,
+        }).ToList();
+    }
+
+    /// <summary>
+    /// Searches for a mirror bank transaction (opposite-sign in different bank account).
+    /// Per ERPNext search_for_transfer_transaction: respects AccountsSettings.transfer_match_days (default 3).
+    /// </summary>
+    public async Task<MirrorTransactionDto?> SearchForMirrorTransactionAsync(Guid transactionId)
+    {
+        var settingsRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<AccountsSettings, Guid>>();
+        var settings = (await settingsRepo.GetQueryableAsync()).FirstOrDefault();
+        var matchDays = settings != null && settings.TransferMatchDays >= 0
+            ? settings.TransferMatchDays
+            : BankInternalTransferService.DefaultTransferMatchDays;
+
+        var result = await _internalTransferService.SearchForMirrorTransactionAsync(transactionId, matchDays);
+        if (result == null) return null;
+
+        return new MirrorTransactionDto
+        {
+            TransactionId = result.TransactionId,
+            BankAccountId = result.BankAccountId,
+            ReferenceNumber = result.ReferenceNumber,
+            TransactionDate = result.TransactionDate,
+            Deposit = result.Deposit,
+            Withdrawal = result.Withdrawal,
+            CurrencyCode = result.CurrencyCode,
+        };
+    }
+
+    /// <summary>
+    /// Creates an Internal Transfer Payment Entry from a bank transaction.
+    /// Per ERPNext create_internal_transfer: creates PE, reconciles source + mirror.
+    /// </summary>
+    [Authorize(MyERPPermissions.PaymentEntries.Create)]
+    public async Task<InternalTransferResultDto> CreateInternalTransferAsync(CreateInternalTransferDto input)
+    {
+        var tx = await _repository.GetAsync(input.BankTransactionId);
+
+        // tx.BankAccountId is a BankAccount.Id, not a GL Account.Id — BankAccount has its own
+        // separate AccountId linking it 1:1 to the real GL account. Using the BankAccount's own
+        // Id directly here would point the transfer's PaidFromAccountId at a non-existent GL
+        // account (this was previously left as a raw pass-through with a "resolve in production"
+        // comment — every internal transfer created through this path referenced a phantom account).
+        var sourceBankAccount = await _bankAccountRepository.GetAsync(tx.BankAccountId);
+        var sourceBankGlId = sourceBankAccount.AccountId;
+
+        var spec = _internalTransferService.BuildInternalTransfer(
+            tx, sourceBankGlId, input.TargetBankAccountGlId, input.CompanyId);
+
+        // Create the Internal Transfer Payment Entry
+        var pe = new PaymentEntry(
+            GuidGenerator.Create(),
+            spec.CompanyId,
+            PaymentType.InternalTransfer,
+            spec.PostingDate,
+            spec.Amount,
+            spec.PaidFromAccountId,
+            spec.PaidToAccountId,
+            CurrentTenant.Id)
+        {
+            ReferenceNumber = spec.ReferenceNumber,
+            ReferenceDate = spec.PostingDate,
+            PaymentNumber = await GenerateInternalTransferNumberAsync(spec.CompanyId),
+        };
+
+        pe.Submit();
+        pe.Post();
+        pe.SetClearanceDate(spec.PostingDate);
+        await _paymentEntryRepository.InsertAsync(pe);
+
+        // Reconcile both sides (source + mirror)
+        await _internalTransferService.ReconcileBothSidesAsync(
+            input.BankTransactionId,
+            input.MirrorTransactionId,
+            pe.Id,
+            pe.PaymentNumber);
+
+        return new InternalTransferResultDto
+        {
+            PaymentEntryId = pe.Id,
+            PaymentNumber = pe.PaymentNumber,
+            SourceTransactionId = input.BankTransactionId,
+            MirrorTransactionId = input.MirrorTransactionId,
+        };
+    }
+
+    /// <summary>
+    /// Creates a Payment Entry directly from a bank transaction and auto-reconciles it.
+    /// Per ERPNext banking module (gotcha #784): sets reconciliation_type = "Voucher Created".
+    /// Deposit transactions → Receive type PE (money in from customer).
+    /// Withdrawal transactions → Pay type PE (money out to supplier).
+    /// </summary>
+    [Authorize(MyERPPermissions.PaymentEntries.Create)]
+    public async Task<VoucherCreatedResultDto> CreatePaymentEntryFromTransactionAsync(CreatePEFromTransactionDto input)
+    {
+        var tx = await _repository.GetAsync(input.BankTransactionId);
+
+        if (tx.IsReconciled)
+        {
+            throw new Volo.Abp.BusinessException("MyERP:02048")
+                .WithData("transactionId", tx.Id);
+        }
+
+        // Determine payment type from transaction direction
+        // Positive amount (deposit) = money received → Receive type
+        // Negative amount (withdrawal) = money paid → Pay type
+        var isDeposit = tx.Amount > 0;
+        var paymentType = isDeposit ? PaymentType.Receive : PaymentType.Pay;
+        var amount = Math.Abs(tx.Amount);
+
+        // Resolve paid-from and paid-to based on direction:
+        // Receive: paid_from = party account (customer), paid_to = bank account
+        // Pay: paid_from = bank account, paid_to = party account (supplier)
+        var paidFromAccountId = isDeposit ? input.PartyAccountId : input.BankAccountId;
+        var paidToAccountId = isDeposit ? input.BankAccountId : input.PartyAccountId;
+
+        // Generate PE number
+        var numberGenerator = LazyServiceProvider.LazyGetRequiredService<Core.DomainServices.IDocumentNumberGenerator>();
+        var peNumber = await numberGenerator.GenerateAsync("PE", input.CompanyId, tx.TransactionDate);
+
+        // Create the Payment Entry
+        var pe = new PaymentEntry(
+            GuidGenerator.Create(),
+            input.CompanyId,
+            paymentType,
+            tx.TransactionDate,
+            amount,
+            paidFromAccountId,
+            paidToAccountId,
+            CurrentTenant.Id)
+        {
+            PaymentNumber = peNumber,
+            ReferenceNumber = tx.ReferenceNumber,
+            PartyType = input.PartyType,
+            PartyId = input.PartyId,
+            ModeOfPaymentId = input.ModeOfPaymentId,
+            CurrencyCode = tx.CurrencyCode ?? "MYR",
+        };
+
+        // Link to invoice if specified (enables outstanding reduction on post)
+        if (input.AgainstInvoiceId.HasValue)
+        {
+            pe.AgainstInvoiceId = input.AgainstInvoiceId.Value;
+            pe.AgainstInvoiceType = input.PartyType == "Customer" ? "SalesInvoice" : "PurchaseInvoice";
+        }
+
+        // Submit + Post the PE atomically (bank reconciliation creates posted entries)
+        pe.Submit();
+        pe.Post();
+        pe.SetClearanceDate(tx.TransactionDate);
+        await _paymentEntryRepository.InsertAsync(pe);
+
+        // Auto-reconcile: link bank transaction to the newly created PE
+        tx.Reconcile(pe.Id, pe.PaymentNumber);
+        await _repository.UpdateAsync(tx);
+
+        // Audit trail
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "PaymentEntry", pe.Id, "Posted",
+            input.CompanyId, peNumber, "Draft", "Posted",
+            CurrentUser.Id, details: $"Created from bank transaction: {tx.Description}",
+            tenantId: CurrentTenant.Id));
+
+        return new VoucherCreatedResultDto
+        {
+            PaymentEntryId = pe.Id,
+            PaymentNumber = peNumber,
+            Amount = amount,
+            PaymentType = paymentType.ToString(),
+            BankTransactionId = tx.Id,
+            IsReconciled = true,
+        };
+    }
+
+    /// <summary>
+    /// Creates a Journal Entry directly from a bank transaction and auto-reconciles it.
+    /// Per ERPNext: create_journal_entry_bts() in bank_reconciliation_tool.py.
+    /// Used for booking bank charges, interest income, tax payments, contra entries, etc.
+    /// Deposit: Debit Bank GL account, Credit Second account.
+    /// Withdrawal: Debit Second account, Credit Bank GL account.
+    /// </summary>
+    [Authorize(MyERPPermissions.JournalEntries.Create)]
+    public async Task<JournalEntryCreatedResultDto> CreateJournalEntryFromTransactionAsync(CreateJEFromTransactionDto input)
+    {
+        var tx = await _repository.GetAsync(input.BankTransactionId);
+        if (tx.IsReconciled)
+        {
+            throw new Volo.Abp.BusinessException("MyERP:02048")
+                .WithData("transactionId", tx.Id);
+        }
+
+        var sourceBankAccount = await _bankAccountRepository.GetAsync(tx.BankAccountId);
+        var bankGlAccountId = sourceBankAccount.AccountId;
+
+        var isDeposit = tx.Deposit > 0 || tx.Amount > 0;
+        var amount = tx.Deposit > 0 ? tx.Deposit : (tx.Withdrawal > 0 ? tx.Withdrawal : Math.Abs(tx.Amount));
+
+        if (amount <= 0)
+        {
+            throw new Volo.Abp.BusinessException("MyERP:02001")
+                .WithData("reason", "Amount must be greater than zero.");
+        }
+
+        // Validate party if second account is Receivable or Payable
+        var accountRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Account, Guid>>();
+        var secondAccount = await accountRepo.FindAsync(input.SecondAccountId);
+        if (secondAccount != null && (secondAccount.AccountSubType == AccountSubType.AccountsReceivable || secondAccount.AccountSubType == AccountSubType.AccountsPayable))
+        {
+            if (string.IsNullOrWhiteSpace(input.PartyType) || !input.PartyId.HasValue)
+            {
+                throw new Volo.Abp.UserFriendlyException($"Party Type and Party are required for Receivable / Payable account {secondAccount.AccountName}");
+            }
+        }
+
+        // Resolve active Fiscal Year
+        var fyRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<FiscalYear, Guid>>();
+        var fyQuery = await fyRepo.GetQueryableAsync();
+        var fy = fyQuery.FirstOrDefault(f => f.CompanyId == input.CompanyId
+            && f.StartDate <= tx.TransactionDate && f.EndDate >= tx.TransactionDate);
+        var fiscalYearId = fy?.Id ?? input.CompanyId;
+
+        // Generate Journal Entry Number
+        string entryNumber;
+        try
+        {
+            var numberGenerator = LazyServiceProvider.LazyGetRequiredService<Core.DomainServices.IDocumentNumberGenerator>();
+            entryNumber = await numberGenerator.GenerateAsync("JournalEntry", input.CompanyId, tx.TransactionDate);
+        }
+        catch (BusinessException ex) when (ex.Code == MyERPDomainErrorCodes.DocumentSeriesNotConfigured)
+        {
+            try
+            {
+                var numberGenerator = LazyServiceProvider.LazyGetRequiredService<Core.DomainServices.IDocumentNumberGenerator>();
+                entryNumber = await numberGenerator.GenerateAsync("JE", input.CompanyId, tx.TransactionDate);
+            }
+            catch (BusinessException innerEx) when (innerEx.Code == MyERPDomainErrorCodes.DocumentSeriesNotConfigured)
+            {
+                entryNumber = $"JE-{tx.TransactionDate:yyyyMMdd}-{GuidGenerator.Create().ToString("N")[..6].ToUpperInvariant()}";
+            }
+        }
+
+        var je = new JournalEntry(GuidGenerator.Create(), input.CompanyId, fiscalYearId, tx.TransactionDate, CurrentTenant.Id)
+        {
+            EntryNumber = entryNumber,
+            VoucherType = input.VoucherType,
+            ReferenceType = "BankTransaction",
+            ReferenceId = tx.Id,
+            ReferenceNumber = tx.ReferenceNumber,
+            Narration = input.Narration ?? tx.Description,
+        };
+
+        // Bank GL account line: Debit on deposit, Credit on withdrawal
+        je.AddFullLine(
+            accountId: bankGlAccountId,
+            amount: amount,
+            isDebit: isDeposit,
+            description: tx.Description,
+            costCenterId: input.CostCenterId);
+
+        // Second account line: Credit on deposit, Debit on withdrawal
+        je.AddFullLine(
+            accountId: input.SecondAccountId,
+            amount: amount,
+            isDebit: !isDeposit,
+            description: input.Narration ?? tx.Description,
+            partyId: input.PartyId,
+            partyType: input.PartyType,
+            costCenterId: input.CostCenterId);
+
+        // Submit + Post atomically (bank reconciliation creates posted entries)
+        je.Post();
+        je.SetClearanceDate(tx.TransactionDate);
+        await _journalEntryRepository.InsertAsync(je);
+
+        // Auto-reconcile: link bank transaction to the newly created JE
+        tx.ReconcileWithJournalEntry(je.Id, je.EntryNumber);
+        await _repository.UpdateAsync(tx);
+
+        // Audit log
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "JournalEntry", je.Id, "Posted",
+            input.CompanyId, entryNumber, "Draft", "Posted",
+            CurrentUser.Id, details: $"Created from bank transaction: {tx.Description}",
+            tenantId: CurrentTenant.Id));
+
+        return new JournalEntryCreatedResultDto
+        {
+            JournalEntryId = je.Id,
+            EntryNumber = entryNumber,
+            Amount = amount,
+            VoucherType = input.VoucherType.ToString(),
+            BankTransactionId = tx.Id,
+            IsReconciled = true,
+        };
+    }
+
+    /// <summary>
+    /// Bank Reconciliation Statement: GL balance - uncleared items = expected bank balance.
+    /// Per ERPNext Bank Reconciliation Statement report logic.
+    /// </summary>
+    public async Task<BankReconciliationStatementDto> GetReconciliationStatementAsync(
+        GetBankReconciliationStatementInput input)
+    {
+        // Step 1: Get bank GL account and currencies
+        var accountRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Account, Guid>>();
+        var account = await accountRepo.FindAsync(input.BankAccountId);
+        var accountName = account?.AccountName ?? "Bank Account";
+
+        var companyRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<MyERP.Core.Entities.Company, Guid>>();
+        var company = await companyRepo.FindAsync(input.CompanyId);
+        var companyCurrency = company?.CurrencyCode ?? "MYR";
+        var bankCurrency = account?.Currency ?? companyCurrency;
+
+        // Step 2: Calculate GL balance for the bank account as of report date
+        // Sum all posted JE lines hitting this account up to report date
+        var jeLineRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<JournalEntryLine, Guid>>();
+        var jeRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<JournalEntry, Guid>>();
+
+        var postedJeIds = (await jeRepo.GetQueryableAsync())
+            .Where(je => je.CompanyId == input.CompanyId
+                && je.Status == Core.DocumentStatus.Posted
+                && je.PostingDate <= input.ReportDate)
+            .Select(je => je.Id)
+            .ToList();
+
+        var lines = (await jeLineRepo.GetQueryableAsync())
+            .Where(l => postedJeIds.Contains(l.JournalEntryId)
+                && l.AccountId == input.BankAccountId
+                && (l.FinanceBook == null || l.FinanceBook == ""))
+            .ToList();
+
+        var totalDebit = lines.Where(l => l.IsDebit)
+            .Sum(l => GetAmountInBankCurrency(bankCurrency, companyCurrency, l.AmountInAccountCurrency != 0 ? l.AmountInAccountCurrency : l.Amount, l.Amount));
+        var totalCredit = lines.Where(l => !l.IsDebit)
+            .Sum(l => GetAmountInBankCurrency(bankCurrency, companyCurrency, l.AmountInAccountCurrency != 0 ? l.AmountInAccountCurrency : l.Amount, l.Amount));
+        var glBalance = totalDebit - totalCredit;
+
+        // Step 3: Find uncleared entries (posted payments/journals that hit GL but have no
+        // ClearanceDate yet or ClearanceDate > ReportDate).
+        // Per ERPNext: outstanding = entries without clearance_date or cleared after report date.
+        var peQuery = await _paymentEntryRepository.GetQueryableAsync();
+        var unclearedPEs = peQuery
+            .Where(pe => pe.CompanyId == input.CompanyId
+                && pe.Status == Core.DocumentStatus.Posted
+                && pe.PostingDate <= input.ReportDate
+                && (pe.ClearanceDate == null || pe.ClearanceDate > input.ReportDate)
+                && (pe.PaidFromAccountId == input.BankAccountId || pe.PaidToAccountId == input.BankAccountId))
+            .ToList();
+
+        var unclearedEntries = new List<BankStatementEntryDto>();
+        decimal outstandingDeposits = 0;
+        decimal outstandingPayments = 0;
+
+        foreach (var pe in unclearedPEs)
+        {
+            // Determine direction: money INTO bank (deposit) or OUT of bank (payment)
+            // Per ERPNext PR #57740: match bank-side amount (ReceivedAmountAfterTax on deposit, PaidAmountAfterTax on withdrawal)
+            // Per ERPNext PR #60024: pick base amount only when bank is in company currency, otherwise paid amount.
+            var isDeposit = pe.PaidToAccountId == input.BankAccountId;
+            var bankSideAmount = pe.GetBankSideAmount(isDeposit);
+            var baseSideAmount = isDeposit
+                ? (pe.BaseReceivedAmount != 0 ? pe.BaseReceivedAmount : bankSideAmount * (pe.TargetExchangeRate > 0 ? pe.TargetExchangeRate : pe.ExchangeRate))
+                : (pe.BaseAmount != 0 ? pe.BaseAmount : bankSideAmount * pe.ExchangeRate);
+            var amount = GetAmountInBankCurrency(bankCurrency, companyCurrency, bankSideAmount, baseSideAmount);
+
+            if (isDeposit)
+                outstandingDeposits += amount;
+            else
+                outstandingPayments += amount;
+
+            unclearedEntries.Add(new BankStatementEntryDto
+            {
+                PostingDate = pe.PostingDate,
+                DocumentType = "Payment Entry",
+                DocumentNumber = pe.PaymentNumber ?? pe.Id.ToString()[..8],
+                DocumentId = pe.Id,
+                Debit = isDeposit ? amount : 0,
+                Credit = isDeposit ? 0 : amount,
+                ReferenceNumber = pe.ReferenceNumber,
+                ClearanceDate = pe.ClearanceDate,
+                PartyName = null,
+                AccountCurrency = bankCurrency
+            });
+        }
+
+        // Uncleared Journal Entries touching this account.
+        // Per ERPNext bank_clearance.py / bank_reconciliation_statement.py: opening entries excluded, lines aggregated per JE.
+        // Includes any non-opening JE touching this account whose ClearanceDate is null or > ReportDate.
+        var unclearedJEs = (await jeRepo.GetQueryableAsync())
+            .Where(je => je.CompanyId == input.CompanyId
+                && je.Status == Core.DocumentStatus.Posted
+                && !je.IsOpening
+                && (je.ClearanceDate == null || je.ClearanceDate > input.ReportDate)
+                && je.PostingDate <= input.ReportDate)
+            .ToList();
+
+        if (unclearedJEs.Count > 0)
+        {
+            var unclearedJeIds = unclearedJEs.Select(je => je.Id).ToHashSet();
+            var jeLinesOnAccount = (await jeLineRepo.GetQueryableAsync())
+                .Where(l => l.AccountId == input.BankAccountId
+                    && unclearedJeIds.Contains(l.JournalEntryId)
+                    && (l.FinanceBook == null || l.FinanceBook == ""))
+                .ToList();
+
+            foreach (var group in jeLinesOnAccount.GroupBy(l => l.JournalEntryId))
+            {
+                var je = unclearedJEs.First(j => j.Id == group.Key);
+                var debit = group.Where(l => l.IsDebit)
+                    .Sum(l => GetAmountInBankCurrency(bankCurrency, companyCurrency, l.AmountInAccountCurrency != 0 ? l.AmountInAccountCurrency : l.Amount, l.Amount));
+                var credit = group.Where(l => !l.IsDebit)
+                    .Sum(l => GetAmountInBankCurrency(bankCurrency, companyCurrency, l.AmountInAccountCurrency != 0 ? l.AmountInAccountCurrency : l.Amount, l.Amount));
+
+                if (debit == 0 && credit == 0) continue;
+
+                outstandingDeposits += debit;
+                outstandingPayments += credit;
+
+                unclearedEntries.Add(new BankStatementEntryDto
+                {
+                    PostingDate = je.PostingDate,
+                    DocumentType = "Journal Entry",
+                    DocumentNumber = je.EntryNumber ?? je.Id.ToString()[..8],
+                    DocumentId = je.Id,
+                    Debit = debit,
+                    Credit = credit,
+                    ReferenceNumber = je.ReferenceNumber,
+                    ClearanceDate = je.ClearanceDate,
+                    PartyName = null,
+                    AccountCurrency = bankCurrency
+                });
+            }
+        }
+
+        // Step 4: Amounts not reflected in system (Cheques and Deposits incorrectly cleared)
+        // Per ERPNext get_amounts_not_reflected_in_system:
+        // Entries posted AFTER ReportDate but cleared ON OR BEFORE ReportDate.
+        var notReflectedPEs = peQuery
+            .Where(pe => pe.CompanyId == input.CompanyId
+                && pe.Status == Core.DocumentStatus.Posted
+                && pe.PostingDate > input.ReportDate
+                && pe.ClearanceDate != null
+                && pe.ClearanceDate <= input.ReportDate
+                && (pe.PaidFromAccountId == input.BankAccountId || pe.PaidToAccountId == input.BankAccountId))
+            .ToList();
+
+        decimal notReflectedPeAmount = 0m;
+        foreach (var pe in notReflectedPEs)
+        {
+            var isDeposit = pe.PaidToAccountId == input.BankAccountId;
+            var bankSideAmount = pe.GetBankSideAmount(isDeposit);
+            var baseSideAmount = isDeposit
+                ? (pe.BaseReceivedAmount != 0 ? pe.BaseReceivedAmount : bankSideAmount * (pe.TargetExchangeRate > 0 ? pe.TargetExchangeRate : pe.ExchangeRate))
+                : (pe.BaseAmount != 0 ? pe.BaseAmount : bankSideAmount * pe.ExchangeRate);
+            var amount = GetAmountInBankCurrency(bankCurrency, companyCurrency, bankSideAmount, baseSideAmount);
+            if (isDeposit)
+                notReflectedPeAmount += amount;
+            else
+                notReflectedPeAmount -= amount;
+        }
+
+        var notReflectedJEs = (await jeRepo.GetQueryableAsync())
+            .Where(je => je.CompanyId == input.CompanyId
+                && je.Status == Core.DocumentStatus.Posted
+                && !je.IsOpening
+                && je.PostingDate > input.ReportDate
+                && je.ClearanceDate != null
+                && je.ClearanceDate <= input.ReportDate)
+            .ToList();
+
+        decimal notReflectedJeAmount = 0m;
+        if (notReflectedJEs.Count > 0)
+        {
+            var notReflectedJeIds = notReflectedJEs.Select(je => je.Id).ToHashSet();
+            var notReflectedLines = (await jeLineRepo.GetQueryableAsync())
+                .Where(l => l.AccountId == input.BankAccountId
+                    && notReflectedJeIds.Contains(l.JournalEntryId)
+                    && (l.FinanceBook == null || l.FinanceBook == ""))
+                .ToList();
+
+            foreach (var l in notReflectedLines)
+            {
+                var amount = GetAmountInBankCurrency(bankCurrency, companyCurrency, l.AmountInAccountCurrency != 0 ? l.AmountInAccountCurrency : l.Amount, l.Amount);
+                if (l.IsDebit)
+                    notReflectedJeAmount += amount;
+                else
+                    notReflectedJeAmount -= amount;
+            }
+        }
+
+        var amountsNotReflectedInSystem = notReflectedPeAmount + notReflectedJeAmount;
+
+        return new BankReconciliationStatementDto
+        {
+            GlBalance = glBalance,
+            OutstandingDeposits = outstandingDeposits,
+            OutstandingPayments = outstandingPayments,
+            AmountsNotReflectedInSystem = amountsNotReflectedInSystem,
+            UnclearedEntries = unclearedEntries.OrderBy(e => e.PostingDate).ToList(),
+            CurrencyCode = bankCurrency,
+            ReportDate = input.ReportDate,
+            BankAccountName = accountName
+        };
+    }
+
+    /// <summary>
+    /// Matches ledger amount for banks in a third currency per ERPNext PR #60024 / commit 48062658ed:
+    /// "The bank ledger holds the base amount only when the bank is in company currency, otherwise the paid amount."
+    /// </summary>
+    public static decimal GetAmountInBankCurrency(string bankCurrency, string companyCurrency, decimal amount, decimal baseAmount)
+    {
+        return string.Equals(bankCurrency, companyCurrency, StringComparison.OrdinalIgnoreCase)
+            ? baseAmount
+            : amount;
+    }
+
+    /// <summary>
+    /// Returns the GL balance of the bank account up to the specified date, cleared or uncleared.
+    /// Maps to ERPNext accounts/doctype/bank_reconciliation_tool get_account_opening_balance.
+    /// Per ERPNext PR #60523 / commit 1fc15db869.
+    /// </summary>
+    public async Task<decimal> GetAccountOpeningBalanceAsync(Guid bankAccountId, DateTime tillDate)
+    {
+        var bankAccountRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<BankAccount, Guid>>();
+        var accountRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Account, Guid>>();
+        var companyRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<MyERP.Core.Entities.Company, Guid>>();
+        var jeLineRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<JournalEntryLine, Guid>>();
+        var jeRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<JournalEntry, Guid>>();
+
+        var bankAccount = await bankAccountRepo.FindAsync(bankAccountId);
+        var glAccountId = bankAccount?.AccountId ?? bankAccountId;
+
+        var account = await accountRepo.FindAsync(glAccountId);
+        var companyId = bankAccount?.CompanyId ?? account?.CompanyId ?? Guid.Empty;
+        var company = companyId != Guid.Empty ? await companyRepo.FindAsync(companyId) : null;
+        var companyCurrency = company?.CurrencyCode ?? "MYR";
+        var bankCurrency = account?.Currency ?? companyCurrency;
+
+        var postedJeIds = (await jeRepo.GetQueryableAsync())
+            .Where(je => (companyId == Guid.Empty || je.CompanyId == companyId)
+                && je.Status == Core.DocumentStatus.Posted
+                && je.PostingDate <= tillDate)
+            .Select(je => je.Id)
+            .ToList();
+
+        var lines = (await jeLineRepo.GetQueryableAsync())
+            .Where(l => postedJeIds.Contains(l.JournalEntryId)
+                && l.AccountId == glAccountId
+                && (l.FinanceBook == null || l.FinanceBook == ""))
+            .ToList();
+
+        var totalDebit = lines.Where(l => l.IsDebit)
+            .Sum(l => GetAmountInBankCurrency(bankCurrency, companyCurrency, l.AmountInAccountCurrency != 0 ? l.AmountInAccountCurrency : l.Amount, l.Amount));
+        var totalCredit = lines.Where(l => !l.IsDebit)
+            .Sum(l => GetAmountInBankCurrency(bankCurrency, companyCurrency, l.AmountInAccountCurrency != 0 ? l.AmountInAccountCurrency : l.Amount, l.Amount));
+
+        return totalDebit - totalCredit;
+    }
+
+
+    /// <summary>
+    /// Regular Payment Entry number series when configured; otherwise a timestamp number with a random
+    /// suffix. The bare per-second timestamp violated the unique (tenant, company, number) index when
+    /// two transfers were reconciled within the same second.
+    /// </summary>
+    private async Task<string> GenerateInternalTransferNumberAsync(Guid companyId)
+    {
+        try
+        {
+            return await LazyServiceProvider.LazyGetRequiredService<MyERP.Core.DomainServices.IDocumentNumberGenerator>()
+                .GenerateAsync("PaymentEntry", companyId);
+        }
+        catch (Volo.Abp.BusinessException ex) when (ex.Code == MyERPDomainErrorCodes.DocumentSeriesNotConfigured)
+        {
+            return $"PE-IT-{DateTime.UtcNow:yyyyMMddHHmmss}-{Guid.NewGuid().ToString("N")[..4].ToUpperInvariant()}";
+        }
+    }
+}

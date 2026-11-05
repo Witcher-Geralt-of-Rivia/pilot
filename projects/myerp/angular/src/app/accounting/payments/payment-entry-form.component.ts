@@ -1,0 +1,758 @@
+import { Component, inject, OnInit, signal, computed } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { ReactiveFormsModule, FormsModule, FormBuilder, Validators } from '@angular/forms';
+import { Router, ActivatedRoute } from '@angular/router';
+import { CurrencyExchangeService } from '../../proxy/accounting/currency-exchange.service';
+import { ProjectService } from '../../proxy/projects/project.service';
+import { CostCenterService } from '../../proxy/accounting/cost-center.service';
+import { PageModule } from '@abp/ng.components/page';
+import { LocalizationPipe, LocalizationService } from '@abp/ng.core';
+import { ToasterService } from '@abp/ng.theme.shared';
+import { PaymentEntryService } from '../../proxy/accounting/payment-entry.service';
+import { BankAccountService } from '../../proxy/accounting/bank-account.service';
+import { AccountService } from '../../proxy/accounting/account.service';
+import { CustomerService } from '../../proxy/sales/customer.service';
+import { SupplierService } from '../../proxy/purchasing/supplier.service';
+import type { AccountDto, BankAccountDto, CreatePaymentEntryDto, PaymentEntryTaxDto } from '../../proxy/accounting/models';
+import { AccountSubType } from '../../proxy/accounting/account-sub-type.enum';
+import { PaymentTaxChargeType } from '../../proxy/accounting/payment-tax-charge-type.enum';
+import { TaxAddDeduct } from '../../proxy/accounting/tax-add-deduct.enum';
+
+import { AutoValidationDirective } from '../../shared/directives/auto-validation.directive';
+import { SaveShortcutDirective } from '../../shared/directives/save-shortcut.directive';
+import { CompanyContextService } from '../../shared/services/company-context.service';
+
+@Component({
+  selector: 'app-payment-entry-form',
+  standalone: true,
+  imports: [
+    CommonModule, ReactiveFormsModule, FormsModule, PageModule, AutoValidationDirective, SaveShortcutDirective, LocalizationPipe],
+  templateUrl: './payment-entry-form.component.html',
+  styleUrls: ['./payment-entry-form.component.scss'],
+})
+export class PaymentEntryFormComponent implements OnInit {
+  private fb = inject(FormBuilder);
+  private router = inject(Router);
+  private route = inject(ActivatedRoute);
+  private paymentService = inject(PaymentEntryService);
+  private accountService = inject(AccountService);
+  private customerService = inject(CustomerService);
+  private supplierService = inject(SupplierService);
+  private toaster = inject(ToasterService);
+  private localization = inject(LocalizationService);
+  private companyContext = inject(CompanyContextService);
+  private currencyExchangeService = inject(CurrencyExchangeService);
+  private projectService = inject(ProjectService);
+  private costCenterService = inject(CostCenterService);
+  private bankAccountService = inject(BankAccountService);
+
+  accounts = signal<AccountDto[]>([]);
+  bankAccounts = signal<BankAccountDto[]>([]);
+  parties = signal<{ id: string; name: string }[]>([]);
+  costCenters = signal<{ id: string; name: string }[]>([]);
+  projects = signal<{ id: string; name: string }[]>([]);
+  linkedDocLabel = signal('');
+  outstandingInvoices = signal<any[]>([]);
+  outstandingOrders = signal<any[]>([]);
+  allocations = signal<Map<string, number>>(new Map());
+  totalInvoiceOutstanding = signal(0);
+  totalOrderPending = signal(0);
+  isEditMode = false;
+  entityId: string | null = null;
+  paidFromAccountCurrency = signal<string>('MYR');
+  paidToAccountCurrency = signal<string>('MYR');
+
+  // Payment Entry tax/charge rows — PE has its own tax engine, separate from SI/PI.
+  taxRows = signal<PaymentEntryTaxDto[]>([]);
+  chargeTypes = PaymentTaxChargeType;
+  addDeductOptions = TaxAddDeduct;
+  totalTaxAmount = computed(() =>
+    this.taxRows().reduce((sum, t) => sum + (t.taxAmount ?? 0), 0)
+  );
+
+  // Filtered account lists by sub-type (per ERPNext PE account resolution)
+  bankCashAccounts = computed(() =>
+    this.accounts().filter(a => a.accountSubType === AccountSubType.BankAccount || a.accountSubType === AccountSubType.CashAccount)
+  );
+  receivableAccounts = computed(() =>
+    this.accounts().filter(a => a.accountSubType === AccountSubType.AccountsReceivable)
+  );
+  payableAccounts = computed(() =>
+    this.accounts().filter(a => a.accountSubType === AccountSubType.AccountsPayable)
+  );
+
+  // Dynamic account lists based on payment type (Receive: party=receivable, bank=paid_to; Pay: party=payable, bank=paid_from)
+  partyAccountOptions = computed(() => {
+    const type = this.form?.get('paymentType')?.value;
+    return type === 'Pay' ? this.payableAccounts() : this.receivableAccounts();
+  });
+  bankAccountOptions = computed(() => this.bankCashAccounts());
+
+  // Linked bank accounts for Internal Transfer (per ERPNext PR #60585)
+  paidFromBankAccount = computed(() => {
+    const acctId = this.form?.get('paidFromAccount')?.value;
+    if (!acctId) return null;
+    return this.bankAccounts().find(b => b.accountId === acctId && !b.isDisabled) || null;
+  });
+
+  paidToBankAccount = computed(() => {
+    const acctId = this.form?.get('paidToAccount')?.value;
+    if (!acctId) return null;
+    return this.bankAccounts().find(b => b.accountId === acctId && !b.isDisabled) || null;
+  });
+
+  totalAllocated = computed(() => {
+    let sum = 0;
+    this.allocations().forEach(v => sum += v);
+    return sum;
+  });
+
+  unallocatedAmount = computed(() => {
+    return (this.form?.get('amount')?.value ?? 0) - this.totalAllocated();
+  });
+
+  form = this.fb.group({
+    companyId: ['', Validators.required],
+    paymentType: ['Receive', Validators.required],
+    paymentDate: [new Date().toISOString().split('T')[0], Validators.required],
+    amount: [0, [Validators.required, Validators.min(0.01)]],
+    paidFromAccount: ['', Validators.required],
+    paidToAccount: ['', Validators.required],
+    modeOfPayment: [''],
+    partyType: ['Customer'],
+    partyId: [''],
+    reference: [''],
+    referenceDate: [null as Date | string | null],
+    costCenterId: [''],
+    projectId: [''],
+    remarks: [''],
+    againstInvoiceId: [''],
+    againstOrderId: [''],
+    againstOrderType: [''],
+    currency: ['MYR'],
+    exchangeRate: [1, [Validators.min(0.0001)]],
+  });
+
+  isMultiCurrency = computed(() => {
+    const currency = this.form?.get('currency')?.value;
+    return !!currency && currency !== 'MYR';
+  });
+
+  baseAmount = computed(() => {
+    const amount = this.form?.get('amount')?.value || 0;
+    const rate = this.form?.get('exchangeRate')?.value || 1;
+    return amount * rate;
+  });
+
+  ngOnInit(): void {
+    this.entityId = this.route.snapshot.paramMap.get('id');
+    this.isEditMode = !!this.entityId;
+
+    if (!this.isEditMode) {
+      const cid = this.companyContext.currentCompanyId();
+      if (cid && !this.form.get('companyId')?.value) this.form.patchValue({ companyId: cid });
+    }
+
+    this.accountService.getList({ skipCount: 0, maxResultCount: 500, sorting: 'accountCode asc' })
+      .subscribe({ next: (res) => {
+        this.accounts.set(res.items ?? []);
+        // Auto-resolve accounts once list is loaded (only for new entries)
+        if (!this.isEditMode) { this.resolveAccounts(); }
+      }, error: () => {} });
+
+    this.bankAccountService.getList({ skipCount: 0, maxResultCount: 500 } as any)
+      .subscribe({ next: (res) => {
+        this.bankAccounts.set(res.items ?? []);
+      }, error: () => {} });
+
+    // Load cost centers and projects for dimension selectors
+    this.costCenterService.getList({ skipCount: 0, maxResultCount: 500, sorting: '' } as any).subscribe({
+      next: (res) => this.costCenters.set((res.items ?? []).map((cc: any) => ({ id: cc.id, name: cc.name }))),
+      error: () => {},
+    });
+    this.projectService.getList({ skipCount: 0, maxResultCount: 500, sorting: '' } as any).subscribe({
+      next: (res) => this.projects.set((res.items ?? []).map((p: any) => ({ id: p.id, name: p.projectName ?? p.name }))),
+      error: () => {},
+    });
+
+    // Load parties based on initial party type
+    this.loadParties(this.form.get('partyType')?.value ?? 'Customer');
+
+    // Reload parties when party type changes
+    this.form.get('partyType')?.valueChanges.subscribe({ next: (type) => {
+      if (type) {
+        this.loadParties(type);
+        this.form.patchValue({ partyId: '' });
+        this.outstandingInvoices.set([]);
+        this.allocations.set(new Map());
+        this.resolveAccounts();
+      }
+    }, error: () => {} });
+
+    // Auto-resolve accounts when payment type changes
+    this.form.get('paymentType')?.valueChanges.subscribe({ next: () => {
+      this.resolveAccounts();
+    }, error: () => {} });
+
+    // Auto-resolve bank account when mode of payment changes
+    this.form.get('modeOfPayment')?.valueChanges.subscribe({ next: () => {
+      this.resolveBankAccount();
+    }, error: () => {} });
+
+    // Auto-fetch exchange rate when currency changes
+    this.form.get('currency')?.valueChanges.subscribe({ next: (currency) => {
+      if (!currency || currency === 'MYR') {
+        this.form.patchValue({ exchangeRate: 1 });
+      } else {
+        this.fetchExchangeRate(currency);
+      }
+    }, error: () => {} });
+
+    // Re-derive bank side amount when bank account changes currency (ERPNext PR #59582)
+    this.form.get('paidFromAccount')?.valueChanges.subscribe({ next: (acctId) => {
+      this.handlePaidFromAccountChange(acctId);
+    }, error: () => {} });
+
+    this.form.get('paidToAccount')?.valueChanges.subscribe({ next: (acctId) => {
+      this.handlePaidToAccountChange(acctId);
+    }, error: () => {} });
+
+    if (this.isEditMode) {
+      this.paymentService.get(this.entityId!).subscribe(pe => {
+        this.form.patchValue({
+          companyId: pe.companyId,
+          paymentType: pe.paymentType,
+          paymentDate: pe.postingDate ?? '',
+          amount: pe.paidAmount,
+          paidFromAccount: '',
+          paidToAccount: '',
+          partyType: 'Customer',
+          reference: pe.referenceNumber ?? '',
+          referenceDate: pe.referenceDate ? String(pe.referenceDate).substring(0, 10) : null,
+          remarks: '',
+        });
+        this.taxRows.set(pe.taxes ?? []);
+      });
+      return;
+    }
+
+    // Pre-fill from query params (from "Make Payment" buttons on SI/PI/SO/PO/Dunning detail)
+    const params = this.route.snapshot.queryParams;
+    if (params['dunningId']) {
+      this.linkedDocLabel.set(`Against Dunning: ${String(params['dunningId']).substring(0, 8)}...`);
+      this.paymentService.getPaymentEntryTemplate('Dunning', params['dunningId']).subscribe({
+        next: (tpl) => {
+          const emptyGuid = '00000000-0000-0000-0000-000000000000';
+          this.form.patchValue({
+            companyId: tpl.companyId ?? '',
+            paymentType: 'Receive',
+            amount: tpl.paidAmount ?? 0,
+            paidFromAccount: tpl.paidFromAccountId && tpl.paidFromAccountId !== emptyGuid ? tpl.paidFromAccountId : (this.form.get('paidFromAccount')?.value ?? ''),
+            paidToAccount: tpl.paidToAccountId && tpl.paidToAccountId !== emptyGuid ? tpl.paidToAccountId : (this.form.get('paidToAccount')?.value ?? ''),
+            partyType: tpl.partyType ?? 'Customer',
+            partyId: tpl.partyId ?? '',
+            costCenterId: tpl.costCenterId ?? '',
+            currency: tpl.paymentCurrency ?? 'MYR',
+            exchangeRate: tpl.exchangeRate ?? 1,
+          }, { emitEvent: false });
+          if (tpl.paidFromAccountCurrency) {
+            this.paidFromAccountCurrency.set(tpl.paidFromAccountCurrency);
+          }
+          if (tpl.paidToAccountCurrency) {
+            this.paidToAccountCurrency.set(tpl.paidToAccountCurrency);
+          }
+          this.taxRows.set(tpl.taxes ?? []);
+          const allocMap = new Map<string, number>();
+          for (const ref of tpl.references ?? []) {
+            if (ref.referenceId) {
+              allocMap.set(ref.referenceId, ref.allocatedAmount ?? 0);
+            }
+          }
+          this.allocations.set(allocMap);
+          this.loadParties(tpl.partyType ?? 'Customer');
+          if (tpl.partyId) {
+            this.loadOutstandingInvoices(tpl.partyType ?? 'Customer');
+          }
+        },
+        error: () => {},
+      });
+      return;
+    }
+
+    if (params['partyType']) {
+      this.form.patchValue({ partyType: params['partyType'] });
+      if (params['partyType'] === 'Supplier') {
+        this.form.patchValue({ paymentType: 'Pay' });
+      }
+    }
+    if (params['partyId']) {
+      this.form.patchValue({ partyId: params['partyId'] });
+    }
+    if (params['amount']) {
+      this.form.patchValue({ amount: parseFloat(params['amount']) });
+    }
+    if (params['companyId']) {
+      this.form.patchValue({ companyId: params['companyId'] });
+    }
+    if (params['currency'] && params['currency'] !== 'MYR') {
+      this.form.patchValue({ currency: params['currency'] });
+    }
+    if (params['againstInvoiceId']) {
+      this.form.patchValue({ againstInvoiceId: params['againstInvoiceId'] });
+      this.linkedDocLabel.set(`Against ${params['againstInvoiceType'] ?? 'Invoice'}: ${params['againstInvoiceId']?.substring(0, 8)}...`);
+    }
+    if (params['againstOrderId']) {
+      this.form.patchValue({
+        againstOrderId: params['againstOrderId'],
+        againstOrderType: params['againstOrderType'] ?? '',
+      });
+      this.linkedDocLabel.set(`Advance against ${params['againstOrderType'] ?? 'Order'}`);
+    }
+
+    // Fetch outstanding invoices when party info is available from query params
+    // partyId is now pre-filled, so loadOutstandingInvoices will succeed
+    if (params['partyType'] && params['partyId'] && params['partyType'] !== 'InternalTransfer') {
+      this.loadOutstandingInvoices(params['partyType']);
+    }
+  }
+
+  /**
+   * After outstanding invoices load, auto-select the specific invoice if navigated from "Make Payment" button.
+   * Sets allocation to the invoice's outstanding amount and auto-fills the payment amount.
+   */
+  private autoSelectInvoiceFromParams(): void {
+    const invoiceId = this.form.get('againstInvoiceId')?.value;
+    if (!invoiceId) return;
+
+    const invoices = this.outstandingInvoices();
+    const match = invoices.find((inv: any) => inv.invoiceId === invoiceId);
+    if (match) {
+      const newMap = new Map<string, number>();
+      newMap.set(match.invoiceId, match.outstanding);
+      this.allocations.set(newMap);
+      // Auto-fill amount if not already set by user or query param
+      const currentAmount = this.form.get('amount')?.value ?? 0;
+      if (currentAmount <= 0) {
+        this.form.patchValue({ amount: match.outstanding });
+      }
+      this.linkedDocLabel.set(`Against ${match.invoiceType ?? 'Invoice'}: ${match.invoiceNumber}`);
+    }
+  }
+
+  loadOutstandingInvoices(partyType: string): void {
+    const companyId = this.form.get('companyId')?.value;
+    const partyId = this.form.get('partyId')?.value;
+    if (!partyId) {
+      this.outstandingInvoices.set([]);
+      this.outstandingOrders.set([]);
+      return;
+    }
+    this.paymentService.getPartyOutstanding(partyType, partyId, companyId || '').subscribe({
+      next: (result) => {
+        this.outstandingInvoices.set(result?.invoices ?? []);
+        this.outstandingOrders.set(result?.orders ?? []);
+        this.totalInvoiceOutstanding.set(result?.totalInvoiceOutstanding ?? 0);
+        this.totalOrderPending.set(result?.totalOrderPending ?? 0);
+        this.autoSelectInvoiceFromParams();
+      },
+      error: () => {
+        this.outstandingInvoices.set([]);
+        this.outstandingOrders.set([]);
+      },
+    });
+  }
+
+  fetchExchangeRate(fromCurrency: string): void {
+    const date = this.form.get('paymentDate')?.value || new Date().toISOString().split('T')[0];
+    this.currencyExchangeService.getRate(fromCurrency, 'MYR', date).subscribe({
+      next: (res: any) => {
+        if (res?.rate) {
+          this.form.patchValue({ exchangeRate: res.rate });
+        }
+      },
+      error: () => {}
+    });
+  }
+
+  selectInvoice(inv: any): void {
+    // Legacy single-invoice path (from "Make Payment" button with single target)
+    const newMap = new Map(this.allocations());
+    newMap.clear();
+    newMap.set(inv.invoiceId, inv.outstanding);
+    this.allocations.set(newMap);
+    this.form.patchValue({
+      againstInvoiceId: inv.invoiceId,
+      amount: inv.outstanding,
+    });
+    this.linkedDocLabel.set(`Against ${inv.invoiceType}: ${inv.invoiceNumber}`);
+  }
+
+  toggleInvoice(inv: any, event: Event): void {
+    const checked = (event.target as HTMLInputElement).checked;
+    const newMap = new Map(this.allocations());
+    if (checked) {
+      // Allocate remaining unallocated or full outstanding (whichever is less)
+      const remaining = (this.form.get('amount')?.value ?? 0) - this.totalAllocated();
+      const allocateAmount = Math.min(Math.max(remaining, 0), inv.outstanding);
+      newMap.set(inv.invoiceId, allocateAmount > 0 ? allocateAmount : inv.outstanding);
+    } else {
+      newMap.delete(inv.invoiceId);
+    }
+    this.allocations.set(newMap);
+    this.syncAllocationsToForm();
+  }
+
+  updateAllocation(invoiceId: string, event: Event): void {
+    const value = parseFloat((event.target as HTMLInputElement).value) || 0;
+    const newMap = new Map(this.allocations());
+    newMap.set(invoiceId, Math.max(0, value));
+    this.allocations.set(newMap);
+    this.syncAllocationsToForm();
+  }
+
+  isInvoiceSelected(invoiceId: string): boolean {
+    return this.allocations().has(invoiceId);
+  }
+
+  getAllocatedAmount(invoiceId: string): number {
+    return this.allocations().get(invoiceId) ?? 0;
+  }
+
+  private syncAllocationsToForm(): void {
+    // If single invoice selected, set legacy field for backward compat
+    const entries = Array.from(this.allocations().entries());
+    if (entries.length === 1) {
+      this.form.patchValue({ againstInvoiceId: entries[0][0] });
+      this.linkedDocLabel.set(`Against 1 invoice`);
+    } else if (entries.length > 1) {
+      this.form.patchValue({ againstInvoiceId: '' });
+      this.linkedDocLabel.set(`Against ${entries.length} invoices`);
+    } else {
+      this.form.patchValue({ againstInvoiceId: '' });
+      this.linkedDocLabel.set('');
+    }
+  }
+
+  /**
+   * Auto-resolve paid_from and paid_to accounts based on payment type.
+   * Per ERPNext PE: Receive → FROM party receivable, TO bank; Pay → FROM bank, TO party payable
+   */
+  private resolveAccounts(): void {
+    const paymentType = this.form.get('paymentType')?.value;
+    const bankAccounts = this.bankCashAccounts();
+    const receivable = this.receivableAccounts();
+    const payable = this.payableAccounts();
+
+    if (paymentType === 'Receive') {
+      // Receive: FROM customer receivable → TO bank
+      if (receivable.length > 0 && !this.form.get('paidFromAccount')?.value) {
+        this.form.patchValue({ paidFromAccount: receivable[0].id });
+      }
+      if (bankAccounts.length > 0 && !this.form.get('paidToAccount')?.value) {
+        this.form.patchValue({ paidToAccount: bankAccounts[0].id });
+      }
+    } else if (paymentType === 'Pay') {
+      // Pay: FROM bank → TO supplier payable
+      if (bankAccounts.length > 0 && !this.form.get('paidFromAccount')?.value) {
+        this.form.patchValue({ paidFromAccount: bankAccounts[0].id });
+      }
+      if (payable.length > 0 && !this.form.get('paidToAccount')?.value) {
+        this.form.patchValue({ paidToAccount: payable[0].id });
+      }
+    }
+  }
+
+  /**
+   * Auto-resolve bank/cash account when Mode of Payment changes.
+   * Per ERPNext: Cash MoP → cash account, Bank Transfer → bank account
+   */
+  private resolveBankAccount(): void {
+    const mop = this.form.get('modeOfPayment')?.value;
+    const paymentType = this.form.get('paymentType')?.value;
+    if (!mop) return;
+
+    const bankAccounts = this.bankCashAccounts();
+    // Try to find account matching mode type (Cash→CashAccount, Wire Transfer→BankAccount)
+    const isCash = mop.toLowerCase().includes('cash');
+    const targetAccounts = bankAccounts.filter(a =>
+      isCash ? a.accountSubType === AccountSubType.CashAccount : a.accountSubType === AccountSubType.BankAccount
+    );
+    const resolvedAccount = targetAccounts.length > 0 ? targetAccounts[0].id : '';
+
+    if (resolvedAccount) {
+      if (paymentType === 'Receive') {
+        this.form.patchValue({ paidToAccount: resolvedAccount });
+      } else if (paymentType === 'Pay') {
+        this.form.patchValue({ paidFromAccount: resolvedAccount });
+      }
+    }
+  }
+
+  handlePaidFromAccountChange(acctId: string | null): void {
+    if (!acctId) return;
+    const acct = this.accounts().find(a => a.id === acctId);
+    const newCurrency = acct?.currency || 'MYR';
+    const oldCurrency = this.paidFromAccountCurrency();
+    this.paidFromAccountCurrency.set(newCurrency);
+
+    const paymentType = this.form.get('paymentType')?.value;
+    // Per ERPNext PR #59582:
+    // In Pay: paidFromAccount is bank side. When bank account currency changes and amount is set,
+    // re-derive bank side amount from party side amount using exchange rate.
+    if (paymentType === 'Pay' && oldCurrency && oldCurrency !== newCurrency) {
+      this.rederiveBankSideAmount(this.paidToAccountCurrency(), newCurrency);
+    }
+  }
+
+  handlePaidToAccountChange(acctId: string | null): void {
+    if (!acctId) return;
+    const acct = this.accounts().find(a => a.id === acctId);
+    const newCurrency = acct?.currency || 'MYR';
+    const oldCurrency = this.paidToAccountCurrency();
+    this.paidToAccountCurrency.set(newCurrency);
+
+    const paymentType = this.form.get('paymentType')?.value;
+    // Per ERPNext PR #59582:
+    // In Receive: paidToAccount is bank side. When bank account currency changes and amount is set,
+    // re-derive bank side amount from party side amount using exchange rate.
+    if (paymentType === 'Receive' && oldCurrency && oldCurrency !== newCurrency) {
+      this.rederiveBankSideAmount(this.paidFromAccountCurrency(), newCurrency);
+    }
+  }
+
+  rederiveBankSideAmount(partyCurrency: string, bankCurrency: string): void {
+    const currentAmount = this.form.get('amount')?.value ?? 0;
+    if (currentAmount <= 0) return;
+
+    if (partyCurrency === bankCurrency) {
+      this.form.patchValue({ currency: bankCurrency, exchangeRate: 1 });
+      return;
+    }
+
+    const date = this.form.get('paymentDate')?.value || new Date().toISOString().split('T')[0];
+    this.currencyExchangeService.getRate(partyCurrency, bankCurrency, date).subscribe({
+      next: (res: any) => {
+        const rate = res?.rate ?? 1;
+        this.form.patchValue({
+          currency: bankCurrency,
+          exchangeRate: rate,
+        });
+      },
+      error: () => {}
+    });
+  }
+
+  loadParties(partyType: string): void {
+    const service$: any = partyType === 'Customer'
+      ? this.customerService.getList({ skipCount: 0, maxResultCount: 200 } as any)
+      : this.supplierService.getList({ skipCount: 0, maxResultCount: 200 } as any);
+
+    service$.subscribe({
+      next: (res: any) => {
+        const items = res.items ?? [];
+        this.parties.set(items.map((p: any) => ({
+          id: p.id,
+          name: p.customerName ?? p.name ?? p.supplierName ?? p.id,
+        })));
+      },
+      error: () => this.parties.set([]),
+    });
+  }
+
+  onPartySelected(): void {
+    const partyId = this.form.get('partyId')?.value;
+    const partyType = this.form.get('partyType')?.value;
+    if (partyId && partyType) {
+      this.loadOutstandingInvoices(partyType);
+      this.resolveAccounts();
+    } else {
+      this.outstandingInvoices.set([]);
+      this.outstandingOrders.set([]);
+      this.allocations.set(new Map());
+    }
+  }
+
+  selectOrder(order: any): void {
+    this.form.patchValue({
+      againstOrderId: order.orderId,
+      againstOrderType: order.orderType,
+      amount: order.pendingAdvance,
+    });
+    this.allocations.set(new Map());
+    this.linkedDocLabel.set(`Advance against ${order.orderType}: ${order.orderNumber}`);
+  }
+
+  isAutoAllocating = signal(false);
+  writeOffSuggestion = signal(0);
+
+  /** Auto-allocate payment amount FIFO across outstanding invoices (oldest due date first).
+   * Calls backend for accurate allocation with write-off tolerance detection. */
+  autoAllocate(): void {
+    const paymentAmount = this.form.get('amount')?.value ?? 0;
+    if (paymentAmount <= 0) return;
+
+    const partyType = this.form.get('partyType')?.value;
+    const partyId = this.form.get('partyId')?.value;
+    const companyId = this.form.get('companyId')?.value;
+    if (!partyId || !companyId) return;
+
+    this.isAutoAllocating.set(true);
+    this.paymentService.autoAllocate({
+      partyType, partyId, companyId, paymentAmount, writeOffThreshold: 1.0
+    } as any).subscribe({
+      next: (result) => {
+        const newMap = new Map<string, number>();
+        for (const alloc of result.allocations ?? []) {
+          newMap.set(alloc.invoiceId, alloc.allocatedAmount);
+        }
+        this.allocations.set(newMap);
+        this.syncAllocationsToForm();
+        this.writeOffSuggestion.set(result.writeOffAmount ?? 0);
+        this.isAutoAllocating.set(false);
+
+        const count = newMap.size;
+        let msg = this.localization.instant('::AllocatedToInvoices', count.toString());
+        if (result.writeOffAmount > 0) {
+          msg += ` (${this.localization.instant('::WriteOffSuggested')}: ${result.writeOffAmount.toFixed(2)})`;
+        }
+        this.toaster.success(msg);
+      },
+      error: () => {
+        this.isAutoAllocating.set(false);
+        // Fallback: client-side FIFO allocation
+        this.autoAllocateClientSide(paymentAmount);
+      }
+    });
+  }
+
+  private autoAllocateClientSide(paymentAmount: number): void {
+    const invoices = this.outstandingInvoices();
+    if (invoices.length === 0) return;
+
+    const sorted = [...invoices].sort((a: any, b: any) =>
+      (a.dueDate ?? a.issueDate ?? '').localeCompare(b.dueDate ?? b.issueDate ?? '')
+    );
+
+    const newMap = new Map<string, number>();
+    let remaining = paymentAmount;
+
+    for (const inv of sorted) {
+      if (remaining <= 0) break;
+      const allocate = Math.min(remaining, inv.outstanding ?? 0);
+      if (allocate > 0) {
+        newMap.set(inv.invoiceId, allocate);
+        remaining -= allocate;
+      }
+    }
+
+    this.allocations.set(newMap);
+    this.syncAllocationsToForm();
+    this.writeOffSuggestion.set(remaining > 0 && remaining <= 1 ? remaining : 0);
+    this.toaster.success(this.localization.instant('::AllocatedToInvoices', newMap.size.toString()));
+  }
+
+  addTaxRow(): void {
+    this.taxRows.set([...this.taxRows(), {
+      accountId: '',
+      chargeType: PaymentTaxChargeType.Actual,
+      rate: 0,
+      taxAmount: 0,
+      includedInPaidAmount: false,
+      addDeductTax: TaxAddDeduct.Add,
+      description: '',
+      costCenterId: null,
+    }]);
+  }
+
+  removeTaxRow(index: number): void {
+    const rows = [...this.taxRows()];
+    rows.splice(index, 1);
+    this.taxRows.set(rows);
+  }
+
+  updateTaxRow(index: number, patch: Partial<PaymentEntryTaxDto>): void {
+    const rows = [...this.taxRows()];
+    const row = { ...rows[index], ...patch };
+    if (row.chargeType === PaymentTaxChargeType.OnPaidAmount) {
+      row.taxAmount = (this.form.get('amount')?.value ?? 0) * (row.rate ?? 0) / 100;
+    }
+    rows[index] = row;
+    this.taxRows.set(rows);
+  }
+
+  cancel(): void {
+    this.router.navigate(['/accounting/payments']);
+  }
+
+  save(): void {
+    if (this.form.invalid) {
+      this.form.markAllAsTouched();
+      return;
+    }
+
+    const raw = this.form.getRawValue();
+    if (raw.paymentType === 'InternalTransfer' && raw.paidFromAccount && raw.paidFromAccount === raw.paidToAccount) {
+      this.toaster.error(this.localization.instant('::MyERP:02091'));
+      return;
+    }
+
+    const dto: any = {
+      ...raw,
+      postingDate: raw.paymentDate,
+      paidAmount: raw.amount,
+      paymentCurrency: raw.currency || 'MYR',
+      paidFromAccountId: raw.paidFromAccount,
+      paidToAccountId: raw.paidToAccount,
+      paidFromBankAccountId: this.paidFromBankAccount()?.id ?? null,
+      paidToBankAccountId: this.paidToBankAccount()?.id ?? null,
+      paidFromAccountCurrency: this.paidFromAccountCurrency(),
+      paidToAccountCurrency: this.paidToAccountCurrency(),
+      referenceNumber: raw.reference,
+      referenceDate: raw.referenceDate || null,
+    };
+
+    // Multi-invoice or split-charge allocation (e.g. Dunning fee/interest alongside single invoice): include references array
+    const allocs = Array.from(this.allocations().entries());
+    const hasDunningCharges = this.taxRows().some(t => !!t.dunningId);
+    if (allocs.length > 1 || (allocs.length === 1 && (hasDunningCharges || Math.abs(allocs[0][1] - (raw.amount ?? 0)) > 0.009))) {
+      dto.references = allocs.map(([invoiceId, amount]) => ({
+        referenceType: raw.partyType === 'Customer' ? 'SalesInvoice' : 'PurchaseInvoice',
+        referenceId: invoiceId,
+        allocatedAmount: amount,
+        exchangeRate: raw.exchangeRate ?? 1,
+      }));
+      dto.againstInvoiceId = null; // Clear single-invoice field
+    } else if (allocs.length === 1) {
+      dto.againstInvoiceId = allocs[0][0];
+      dto.againstInvoiceType = raw.partyType === 'Customer' ? 'SalesInvoice' : 'PurchaseInvoice';
+    }
+
+    dto.taxes = this.taxRows().filter(t => t.accountId);
+
+    if (this.isEditMode) {
+      this.paymentService.update(this.entityId!, dto).subscribe({
+        next: () => {
+          this.form.markAsPristine();
+          this.toaster.success(this.localization.instant('::SuccessfullyUpdated'));
+          this.router.navigate(['/accounting/payments', this.entityId]);
+        },
+        error: (err: any) => {
+          this.toaster.error(err?.error?.error?.message ?? this.localization.instant('::FailedToCreate'));
+        },
+      });
+    } else {
+      this.paymentService.create(dto).subscribe({
+        next: () => {
+          this.form.markAsPristine();
+          this.toaster.success(this.localization.instant('::SuccessfullyCreated'));
+          this.router.navigate(['/accounting/payments']);
+        },
+        error: (err: any) => {
+          this.toaster.error(err?.error?.error?.message ?? this.localization.instant('::FailedToCreate'));
+        },
+      });
+    }
+  }
+
+  hasUnsavedChanges(): boolean { return this.form.dirty; }
+}

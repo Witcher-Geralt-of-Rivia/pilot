@@ -1,0 +1,24 @@
+using System;
+using System.Threading.Tasks;
+using MyERP.Shared;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+
+namespace MyERP.Inventory;
+
+public interface IStockEntryAppService : IApplicationService
+{
+    Task<StockEntryDto> GetAsync(Guid id);
+    Task<PagedResultDto<StockEntryDto>> GetListAsync(CompanyFilteredPagedRequestDto input);
+    Task<StockEntryDto> CreateAsync(CreateStockEntryDto input);
+    Task<StockEntryDto> UpdateAsync(Guid id, CreateStockEntryDto input);
+    Task DeleteAsync(Guid id);
+    Task<StockEntryDto> SubmitAsync(Guid id);
+    Task<StockEntryDto> PostAsync(Guid id);
+    Task<StockEntryDto> CancelAsync(Guid id);
+    Task<StockEntryDto> AutoPickBatchesAsync(Guid id);
+    Task<MaterialRequestItemsForSeDto> GetItemsFromMaterialRequestAsync(Guid materialRequestId);
+    Task<StockEntryFgMappingDto> GetFinishedGoodMappingAsync(Guid stockEntryId);
+    Task<ManufactureItemsDto> GetManufactureItemsAsync(Guid workOrderId, decimal produceQty);
+    Task<StockEntryFgMappingDto> MapRawMaterialsToFinishedGoodsAsync(Guid stockEntryId, MapRawMaterialsToFinishedGoodsInput input);
+}

@@ -1,0 +1,1995 @@
+import type { EInvoiceDocumentType } from '../sales/einvoice-document-type.enum';
+import type { ScorecardPeriodType } from './scorecard-period-type.enum';
+import type { SupplierHoldType } from './supplier-hold-type.enum';
+import type { AuditedEntityDto, EntityDto, FullAuditedEntityDto, PagedAndSortedResultRequestDto } from '@abp/ng.core';
+import type { SubcontractingOrderStatus } from './subcontracting-order-status.enum';
+import type { AnalyticsGroupBy } from '../sales/analytics-group-by.enum';
+import type { AnalyticsPeriodType } from '../sales/analytics-period-type.enum';
+import type { SubcontractingInwardOrderStatus } from './subcontracting-inward-order-status.enum';
+import type { SubcontractingReceiptStatus } from './subcontracting-receipt-status.enum';
+import type { SecondaryItemValuationType } from '../manufacturing/secondary-item-valuation-type.enum';
+
+export interface ComparisonItemDto {
+  itemId?: string;
+  itemDescription?: string;
+  supplierPrices?: ComparisonPriceDto[];
+  lowestRate?: number;
+}
+
+export interface ComparisonPriceDto {
+  supplierId?: string;
+  quotationId?: string;
+  rate?: number;
+  quantity?: number;
+  amount?: number;
+  leadTimeDays?: number | null;
+  isQuoted?: boolean;
+  isLowestPrice?: boolean;
+}
+
+export interface ComparisonSupplierDto {
+  supplierId?: string;
+  supplierName?: string;
+  quotationId?: string;
+  quotationNumber?: string | null;
+  currency?: string | null;
+  validTill?: string | null;
+  grandTotal?: number;
+  orderStatus?: string;
+  status?: number;
+}
+
+export interface CreateCriterionDto {
+  name?: string;
+  weight?: number;
+  maxScore?: number;
+  formula?: string | null;
+}
+
+export interface CreatePurchaseInvoiceDto {
+  companyId: string;
+  supplierId: string;
+  supplierTin?: string | null;
+  issueDate: string;
+  dueDate?: string | null;
+  fromDate?: string | null;
+  toDate?: string | null;
+  paymentTermsTemplateId?: string | null;
+  supplierInvoiceNumber?: string | null;
+  currencyCode?: string;
+  exchangeRate?: number;
+  useTransactionDateExchangeRate?: boolean;
+  priceListId?: string | null;
+  termsAndConditionsId?: string | null;
+  terms?: string | null;
+  notes?: string | null;
+  costCenterId?: string | null;
+  projectId?: string | null;
+  isOpening?: boolean;
+  isReturn?: boolean;
+  isDebitNote?: boolean;
+  isReturnRefund?: boolean;
+  isSubcontracted?: boolean;
+  returnAgainstId?: string | null;
+  updateBilledAmountInPurchaseOrder?: boolean;
+  eInvoiceDocType?: EInvoiceDocumentType | null;
+  updateStock?: boolean;
+  warehouseId?: string | null;
+  rejectedWarehouseId?: string | null;
+  items: CreatePurchaseInvoiceItemDto[];
+}
+
+export interface CreatePurchaseInvoiceItemDto {
+  itemId: string;
+  description: string;
+  quantity: number;
+  receivedQty?: number;
+  rejectedQty?: number;
+  rejectedWarehouseId?: string | null;
+  unitPrice: number;
+  taxAmount?: number;
+  uom?: string;
+  conversionFactor?: number | null;
+  enableDeferredExpense?: boolean;
+  deferredExpenseAccountId?: string | null;
+  serviceStartDate?: string | null;
+  serviceEndDate?: string | null;
+  serviceStopDate?: string | null;
+  purchaseOrderItemId?: string | null;
+  purchaseReceiptItemId?: string | null;
+  materialRequestItemId?: string | null;
+  fromWarehouseId?: string | null;
+  deliveredBySupplier?: boolean;
+  warehouseId?: string | null;
+}
+
+export interface CreatePurchaseOrderDto {
+  companyId: string;
+  supplierId: string;
+  orderDate: string;
+  expectedDeliveryDate?: string | null;
+  costCenterId?: string | null;
+  projectId?: string | null;
+  priceListId?: string | null;
+  termsAndConditionsId?: string | null;
+  terms?: string | null;
+  notes?: string | null;
+  remarks?: string | null;
+  shippingAddressId?: string | null;
+  customerId?: string | null;
+  items: CreatePurchaseOrderItemDto[];
+}
+
+export interface CreatePurchaseOrderItemDto {
+  itemId: string;
+  description: string;
+  quantity: number;
+  unitPrice: number;
+  taxAmount?: number;
+  uom?: string;
+  warehouseId?: string | null;
+  expenseAccountId?: string | null;
+  expectedDeliveryDate?: string | null;
+  deliveredBySupplier?: boolean;
+  blanketOrderId?: string | null;
+  materialRequestItemId?: string | null;
+  supplierQuotationItemId?: string | null;
+}
+
+export interface CreatePurchaseOrdersFromMrDto {
+  materialRequestId: string;
+  items: SupplierSelectionItemDto[];
+}
+
+export interface CreatePurchaseReceiptDto {
+  companyId: string;
+  supplierId: string;
+  warehouseId: string;
+  postingDate: string;
+  purchaseOrderId?: string | null;
+  supplierDeliveryNote?: string | null;
+  isReturn?: boolean;
+  returnAgainstId?: string | null;
+  notes?: string | null;
+  currencyCode?: string;
+  exchangeRate?: number;
+  useTransactionDateExchangeRate?: boolean;
+  items: CreatePurchaseReceiptItemDto[];
+}
+
+export interface CreatePurchaseReceiptItemDto {
+  itemId: string;
+  description: string;
+  quantity: number;
+  unitPrice: number;
+  taxAmount?: number;
+  uom?: string;
+  conversionFactor?: number | null;
+  purchaseOrderItemId?: string | null;
+  materialRequestItemId?: string | null;
+  warehouseId?: string | null;
+  fromWarehouseId?: string | null;
+  receivedQty?: number;
+  rejectedQty?: number;
+  rejectedWarehouseId?: string | null;
+}
+
+export interface CreateRfqDto {
+  companyId?: string;
+  transactionDate?: string;
+  currencyCode?: string | null;
+  messageForSupplier?: string | null;
+  items?: CreateRfqItemDto[];
+  suppliers?: CreateRfqSupplierDto[];
+}
+
+export interface CreateRfqItemDto {
+  itemId?: string;
+  description?: string;
+  qty?: number;
+  uom?: string;
+}
+
+export interface CreateRfqSupplierDto {
+  supplierId?: string;
+  email?: string | null;
+}
+
+export interface CreateSQItemDto {
+  itemId?: string;
+  itemName?: string | null;
+  qty?: number;
+  rate?: number;
+}
+
+export interface CreateScioItemDto {
+  itemId: string;
+  bomId?: string | null;
+  quantity?: number;
+  rate?: number;
+  warehouseId?: string | null;
+  serviceCostPerQty?: number;
+}
+
+export interface CreateScoItemDto {
+  itemId: string;
+  itemName: string;
+  qty?: number;
+  rate?: number;
+  serviceCostPerQty?: number;
+  bomId?: string | null;
+  warehouseId?: string | null;
+}
+
+export interface CreateScorecardDto {
+  supplierId?: string;
+  companyId?: string;
+  periodType?: ScorecardPeriodType;
+  weightingFunction?: string | null;
+  standings?: CreateStandingDto[];
+  criteria?: CreateCriterionDto[];
+}
+
+export interface CreateScorecardPeriodDto {
+  startDate?: string;
+  endDate?: string;
+  score?: number;
+}
+
+export interface CreateScrItemDto {
+  itemId: string;
+  itemName: string;
+  qty?: number;
+  rate?: number;
+  warehouseId?: string | null;
+  expenseAccountId?: string | null;
+  serviceExpenseAccountId?: string | null;
+  costCenterId?: string | null;
+  secondaryItemType?: string | null;
+  valuationType?: SecondaryItemValuationType | null;
+  costAllocationPercentage?: number;
+  bomSecondaryItemId?: string | null;
+}
+
+export interface CreateScrReturnItemDto {
+  itemId: string;
+  itemName: string;
+  qty?: number;
+  rate?: number;
+  warehouseId?: string | null;
+}
+
+export interface CreateStandingDto {
+  name?: string;
+  minScore?: number;
+  maxScore?: number;
+  preventPos?: boolean;
+  preventRfqs?: boolean;
+  warnPos?: boolean;
+  warnRfqs?: boolean;
+}
+
+export interface CreateSubcontractingInwardOrderDto {
+  companyId: string;
+  supplierId: string;
+  orderDate: string;
+  salesOrderId?: string | null;
+  subcontractingOrderId?: string | null;
+  currencyCode?: string;
+  items?: CreateScioItemDto[];
+}
+
+export interface CreateSubcontractingOrderDto {
+  companyId: string;
+  supplierId: string;
+  orderDate: string;
+  purchaseOrderId?: string | null;
+  currencyCode?: string;
+  exchangeRate?: number;
+  notes?: string | null;
+  items?: CreateScoItemDto[];
+}
+
+export interface CreateSubcontractingReceiptDto {
+  companyId: string;
+  supplierId: string;
+  subcontractingOrderId: string;
+  postingDate: string;
+  warehouseId?: string | null;
+  items?: CreateScrItemDto[];
+}
+
+export interface CreateSubcontractingReceiptReturnDto {
+  returnAgainstReceiptId: string;
+  postingDate: string;
+  items?: CreateScrReturnItemDto[];
+}
+
+export interface CreateSupplierQuotationDto {
+  companyId?: string;
+  supplierId?: string;
+  supplierName?: string | null;
+  transactionDate?: string;
+  validTill?: string | null;
+  currency?: string;
+  requestForQuotationId?: string | null;
+  items?: CreateSQItemDto[];
+}
+
+export interface CreateUpdateIncotermDto {
+  code: string;
+  title: string;
+  description?: string | null;
+  isActive?: boolean;
+}
+
+export interface CreateUpdateSubcontractingBomDto {
+  isActive?: boolean;
+  finishedGoodId?: string;
+  finishedGoodQty?: number;
+  finishedGoodBomId?: string;
+  serviceItemId?: string;
+  serviceItemQty?: number;
+}
+
+export interface CreateUpdateSupplierDto {
+  companyId: string;
+  name: string;
+  supplierCode?: string | null;
+  tin?: string | null;
+  registrationNumber?: string | null;
+  sstRegistrationNumber?: string | null;
+  idType?: string | null;
+  idValue?: string | null;
+  contactPerson?: string | null;
+  phone?: string | null;
+  email?: string | null;
+  website?: string | null;
+  address?: string | null;
+  city?: string | null;
+  state?: string | null;
+  postalCode?: string | null;
+  country?: string | null;
+  defaultPayableAccountId?: string | null;
+  isActive?: boolean;
+  holdType?: SupplierHoldType;
+  preventPurchaseOrders?: boolean;
+  preventRfqs?: boolean;
+  isFrozen?: boolean;
+  allowPurchaseInvoiceWithoutPurchaseOrder?: boolean;
+  allowPurchaseInvoiceWithoutPurchaseReceipt?: boolean;
+  representsCompanyId?: string | null;
+  supplierGroupId?: string | null;
+  taxWithholdingCategory?: string | null;
+  defaultPaymentTermsTemplateId?: string | null;
+  defaultPriceListId?: string | null;
+  restrictToCompanies?: boolean;
+}
+
+export interface CreateUpdateSupplierScorecardVariableDto {
+  variableLabel: string;
+  paramName: string;
+  path: string;
+  isCustom?: boolean;
+  description?: string | null;
+}
+
+export interface CreatedPurchaseOrderInfo {
+  purchaseOrderId?: string;
+  orderNumber?: string | null;
+  supplierName?: string | null;
+  itemCount?: number;
+  totalAmount?: number;
+}
+
+export interface DeliveryPerformanceReportDto {
+  suppliers?: SupplierDeliveryPerformanceDto[];
+  totalOrders?: number;
+  totalOnTime?: number;
+  totalLate?: number;
+  totalPending?: number;
+  overallOnTimeRate?: number;
+  overallAvgDelayDays?: number;
+}
+
+export interface DropShipDeliveryItemDto {
+  purchaseOrderItemId: string;
+  qtyChange: number;
+}
+
+export interface DuplicateInvoiceCheckResultDto {
+  isDuplicate?: boolean;
+  existingInvoiceId?: string | null;
+  existingInvoiceNumber?: string | null;
+  existingInvoiceDate?: string | null;
+  existingInvoiceAmount?: number | null;
+}
+
+export interface GetScoListDto extends PagedAndSortedResultRequestDto {
+  status?: SubcontractingOrderStatus | null;
+  companyId?: string | null;
+}
+
+export interface GetSupplierListDto extends PagedAndSortedResultRequestDto {
+  filter?: string | null;
+}
+
+export interface GetSupplierScorecardVariableListDto extends PagedAndSortedResultRequestDto {
+  filter?: string | null;
+}
+
+export interface IncotermDto extends FullAuditedEntityDto<string> {
+  code?: string;
+  title?: string;
+  description?: string | null;
+  isActive?: boolean;
+}
+
+export interface InvoicePaymentDto {
+  id?: string;
+  paymentNumber?: string;
+  postingDate?: string;
+  amount?: number;
+  status?: string;
+}
+
+export interface MapSubcontractingInwardOrderFromSalesOrderDto {
+  salesOrderId: string;
+  supplierId: string;
+}
+
+export interface PendingMaterialRequestItemDto {
+  materialRequestId?: string;
+  materialRequestNumber?: string;
+  requestDate?: string;
+  requiredByDate?: string | null;
+  materialRequestItemId?: string;
+  itemId?: string;
+  itemName?: string;
+  pendingQty?: number;
+  uom?: string;
+  warehouseId?: string | null;
+}
+
+export interface PurchaseAnalyticsReportDto {
+  periodLabels?: string[];
+  rows?: PurchaseAnalyticsRowDto[];
+  grandTotal?: number;
+  periodTotals?: number[];
+}
+
+export interface PurchaseAnalyticsRequestDto {
+  companyId?: string;
+  fromDate?: string;
+  toDate?: string;
+  groupBy?: AnalyticsGroupBy;
+  periodType?: AnalyticsPeriodType;
+  valueField?: string | null;
+  entityIds?: string[] | null;
+  periodBasedOn?: string | null;
+}
+
+export interface PurchaseAnalyticsRowDto {
+  entityId?: string;
+  entityName?: string;
+  periodValues?: number[];
+  total?: number;
+  growth?: number;
+}
+
+export interface PurchaseInvoiceDto extends EntityDto<string> {
+  companyId?: string;
+  invoiceNumber?: string;
+  supplierInvoiceNumber?: string | null;
+  issueDate?: string;
+  dueDate?: string | null;
+  fromDate?: string | null;
+  toDate?: string | null;
+  supplierId?: string;
+  supplierName?: string | null;
+  supplierTin?: string | null;
+  currencyCode?: string;
+  exchangeRate?: number;
+  useTransactionDateExchangeRate?: boolean;
+  priceListId?: string | null;
+  netTotal?: number;
+  taxAmount?: number;
+  grandTotal?: number;
+  amountPaid?: number;
+  outstandingAmount?: number;
+  baseNetTotal?: number;
+  baseTaxAmount?: number;
+  baseGrandTotal?: number;
+  baseOutstandingAmount?: number;
+  status?: string;
+  eInvoiceDocType?: EInvoiceDocumentType | null;
+  eInvoiceStatus?: string;
+  lhdnUuid?: string | null;
+  isReturn?: boolean;
+  isDebitNote?: boolean;
+  isReturnRefund?: boolean;
+  isSubcontracted?: boolean;
+  returnAgainstId?: string | null;
+  amendedFromId?: string | null;
+  amendmentIndex?: number;
+  creditToAccountId?: string;
+  daysOverdue?: number;
+  isOverdue?: boolean;
+  matchingStatus?: string | null;
+  holdComment?: string | null;
+  releaseDate?: string | null;
+  isBlocked?: boolean;
+  isReadyForPayment?: boolean;
+  onHold?: boolean;
+  interCompanyInvoiceId?: string | null;
+  interCompanyInvoiceNumber?: string | null;
+  interCompanyCompanyName?: string | null;
+  updateStock?: boolean;
+  warehouseId?: string | null;
+  rejectedWarehouseId?: string | null;
+  billsRejectedQuantity?: boolean;
+  updateBilledAmountInPurchaseOrder?: boolean;
+  items?: PurchaseInvoiceItemDto[];
+}
+
+export interface PurchaseInvoiceItemDto {
+  id?: string;
+  itemId?: string;
+  description?: string;
+  uom?: string;
+  quantity?: number;
+  receivedQty?: number;
+  rejectedQty?: number;
+  rejectedWarehouseId?: string | null;
+  billsRejectedQuantity?: boolean;
+  billedQuantity?: number;
+  unitPrice?: number;
+  taxAmount?: number;
+  lineTotal?: number;
+  purchaseOrderItemId?: string | null;
+  purchaseReceiptItemId?: string | null;
+  materialRequestItemId?: string | null;
+  fromWarehouseId?: string | null;
+  warehouseId?: string | null;
+  deliveredBySupplier?: boolean;
+  enableDeferredExpense?: boolean;
+  deferredExpenseAccountId?: string | null;
+  serviceStartDate?: string | null;
+  serviceEndDate?: string | null;
+  serviceStopDate?: string | null;
+}
+
+export interface PurchaseInvoiceListSummaryDto {
+  totalPayable?: number;
+  overdueCount?: number;
+  overdueAmount?: number;
+  monthlySpend?: number;
+  monthlyInvoiceCount?: number;
+  postedInvoiceCount?: number;
+}
+
+export interface PurchaseOrderDto extends EntityDto<string> {
+  companyId?: string;
+  orderNumber?: string;
+  orderDate?: string;
+  expectedDeliveryDate?: string | null;
+  supplierId?: string;
+  supplierName?: string | null;
+  priceListId?: string | null;
+  netTotal?: number;
+  taxAmount?: number;
+  grandTotal?: number;
+  status?: string;
+  perReceived?: number;
+  perBilled?: number;
+  advancePaid?: number;
+  perAdvancePaid?: number;
+  advancePaymentStatus?: string;
+  notes?: string | null;
+  remarks?: string | null;
+  shippingAddressId?: string | null;
+  customerId?: string | null;
+  isDropShip?: boolean;
+  supplierConfirmationNumber?: string | null;
+  supplierConfirmationDate?: string | null;
+  supplierPromisedDate?: string | null;
+  isSupplierConfirmed?: boolean;
+  items?: PurchaseOrderItemDto[];
+}
+
+export interface PurchaseOrderItemDto {
+  id?: string;
+  itemId?: string;
+  description?: string;
+  uom?: string;
+  quantity?: number;
+  unitPrice?: number;
+  taxAmount?: number;
+  lineTotal?: number;
+  receivedQty?: number;
+  billedQty?: number;
+  warehouseId?: string | null;
+  expenseAccountId?: string | null;
+  expectedDeliveryDate?: string | null;
+  isClosed?: boolean;
+  deliveredBySupplier?: boolean;
+  conversionFactor?: number;
+  stockQty?: number;
+  stockUom?: string | null;
+  materialRequestItemId?: string | null;
+  supplierQuotationItemId?: string | null;
+  blanketOrderId?: string | null;
+}
+
+export interface PurchaseOrderTrackingBoardDto {
+  ordered?: TrackingBoardCardDto[];
+  partiallyReceived?: TrackingBoardCardDto[];
+  fullyReceived?: TrackingBoardCardDto[];
+  completed?: TrackingBoardCardDto[];
+  totalOrders?: number;
+  overdueCount?: number;
+  totalValue?: number;
+}
+
+export interface PurchaseReceiptDto extends EntityDto<string> {
+  companyId?: string;
+  receiptNumber?: string;
+  postingDate?: string;
+  supplierId?: string;
+  supplierName?: string | null;
+  purchaseOrderId?: string | null;
+  warehouseId?: string;
+  warehouseName?: string | null;
+  supplierDeliveryNote?: string | null;
+  currencyCode?: string;
+  exchangeRate?: number;
+  useTransactionDateExchangeRate?: boolean;
+  netTotal?: number;
+  taxAmount?: number;
+  grandTotal?: number;
+  isReturn?: boolean;
+  returnAgainstId?: string | null;
+  status?: string;
+  perBilled?: number;
+  billingStatus?: string | null;
+  items?: PurchaseReceiptItemDto[];
+}
+
+export interface PurchaseReceiptItemDto {
+  id?: string;
+  itemId?: string;
+  itemName?: string | null;
+  description?: string;
+  uom?: string;
+  quantity?: number;
+  receivedQty?: number;
+  rejectedQty?: number;
+  rejectedWarehouseId?: string | null;
+  rejectedWarehouseName?: string | null;
+  stockQty?: number;
+  stockUom?: string | null;
+  conversionFactor?: number;
+  pendingBillingQty?: number;
+  unitPrice?: number;
+  taxAmount?: number;
+  lineTotal?: number;
+  billedQty?: number;
+  amountDifferenceWithPurchaseInvoice?: number;
+  isClosed?: boolean;
+  purchaseOrderItemId?: string | null;
+  materialRequestItemId?: string | null;
+  warehouseId?: string | null;
+  fromWarehouseId?: string | null;
+  fromWarehouseName?: string | null;
+}
+
+export interface PurchaseRegisterLineDto {
+  voucherType?: string;
+  invoiceId?: string;
+  paymentEntryId?: string;
+  journalEntryId?: string;
+  invoiceNumber?: string;
+  postingDate?: string;
+  supplierId?: string;
+  supplierName?: string | null;
+  supplierGroupId?: string | null;
+  supplierGroupName?: string | null;
+  netTotal?: number;
+  taxAmount?: number;
+  grandTotal?: number;
+  amountPaid?: number;
+  outstanding?: number;
+  isReturn?: boolean;
+  debit?: number;
+  credit?: number;
+  balance?: number;
+}
+
+export interface ItemWiseRegisterFilterDto {
+  companyId?: string;
+  fromDate?: string;
+  toDate?: string;
+  supplierId?: string | null;
+  supplierGroupId?: string | null;
+  itemId?: string | null;
+  itemCode?: string | null;
+  itemGroupId?: string | null;
+}
+
+export interface ItemWisePurchaseRegisterLineDto {
+  invoiceId?: string;
+  invoiceNumber?: string;
+  postingDate?: string;
+  supplierId?: string;
+  supplierName?: string;
+  supplierGroupId?: string | null;
+  supplierGroupName?: string | null;
+  itemId?: string;
+  itemCode?: string;
+  itemName?: string;
+  itemGroup?: string;
+  description?: string;
+  stockQty?: number;
+  stockUom?: string;
+  rate?: number;
+  amount?: number;
+  totalTax?: number;
+  totalOtherCharges?: number;
+  total?: number;
+  purchaseOrderNumber?: string | null;
+  purchaseReceiptNumber?: string | null;
+  currency?: string;
+}
+
+export interface PutawayAllocationResultDto {
+  itemId?: string;
+  warehouseId?: string;
+  qty?: number;
+  rejectedQty?: number;
+  receivedQty?: number;
+  isUnallocated?: boolean;
+}
+
+export interface PutawayItemInput {
+  itemId?: string;
+  qty?: number;
+  rejectedQty?: number;
+}
+
+export interface RecordSupplierConfirmationDto {
+  confirmationNumber?: string | null;
+  confirmationDate?: string | null;
+  promisedDeliveryDate?: string | null;
+}
+
+export interface RfqDto extends EntityDto<string> {
+  companyId?: string;
+  rfqNumber?: string;
+  transactionDate?: string;
+  currencyCode?: string;
+  messageForSupplier?: string | null;
+  status?: string;
+  items?: RfqItemDto[];
+  suppliers?: RfqSupplierDto[];
+}
+
+export interface RfqItemDto extends EntityDto<string> {
+  itemId?: string;
+  description?: string;
+  qty?: number;
+  uom?: string;
+}
+
+export interface RfqSupplierDto extends EntityDto<string> {
+  supplierId?: string;
+  supplierName?: string;
+  email?: string | null;
+  emailSent?: boolean;
+  quoteStatus?: string;
+}
+
+export interface RmTransferResultDto {
+  stockEntryId?: string;
+  entryNumber?: string;
+  itemCount?: number;
+  totalQty?: number;
+}
+
+export interface ScioReceiveItemDto {
+  itemId: string;
+  qty?: number;
+  subcontractingInwardOrderItemId?: string | null;
+}
+
+export interface ScioReceiveItemsDto {
+  postingDate: string;
+  items?: ScioReceiveItemDto[];
+}
+
+export interface ScoItemDto extends EntityDto<string> {
+  itemId?: string;
+  itemName?: string;
+  qty?: number;
+  rate?: number;
+  serviceCostPerQty?: number;
+  receivedQty?: number;
+  bomId?: string;
+}
+
+export interface ScorecardCriterionDto extends EntityDto<string> {
+  name?: string;
+  weight?: number;
+  maxScore?: number;
+  formula?: string | null;
+}
+
+export interface ScorecardDto extends EntityDto<string> {
+  supplierId?: string;
+  companyId?: string;
+  periodType?: string;
+  score?: number;
+  currentStanding?: string | null;
+  weightingFunction?: string | null;
+  standings?: ScorecardStandingDto[];
+  criteria?: ScorecardCriterionDto[];
+}
+
+export interface ScorecardStandingDto extends EntityDto<string> {
+  name?: string;
+  minScore?: number;
+  maxScore?: number;
+  preventPos?: boolean;
+  preventRfqs?: boolean;
+  warnPos?: boolean;
+  warnRfqs?: boolean;
+}
+
+export interface SubcontractingBomDto extends EntityDto<string> {
+  isActive?: boolean;
+  finishedGoodId?: string;
+  finishedGoodName?: string | null;
+  finishedGoodQty?: number;
+  finishedGoodBomId?: string;
+  finishedGoodUom?: string | null;
+  serviceItemId?: string;
+  serviceItemName?: string | null;
+  serviceItemQty?: number;
+  serviceItemUom?: string | null;
+  conversionFactor?: number;
+}
+
+export interface SubcontractingInwardOrderActionSummaryDto {
+  orderId?: string;
+  status?: SubcontractingInwardOrderStatus;
+  perReceived?: number;
+  perBilled?: number;
+  canReopen?: boolean;
+  canClose?: boolean;
+  canCancel?: boolean;
+  pendingItemCount?: number;
+}
+
+export interface SubcontractingInwardOrderDto extends EntityDto<string> {
+  companyId?: string;
+  orderNumber?: string;
+  orderDate?: string;
+  supplierId?: string;
+  salesOrderId?: string | null;
+  subcontractingOrderId?: string | null;
+  currencyCode?: string;
+  netTotal?: number;
+  grandTotal?: number;
+  status?: SubcontractingInwardOrderStatus;
+  perReceived?: number;
+  perBilled?: number;
+  items?: SubcontractingInwardOrderItemDto[];
+}
+
+export interface SubcontractingInwardOrderItemDto extends EntityDto<string> {
+  itemId?: string;
+  bomId?: string | null;
+  quantity?: number;
+  rate?: number;
+  amount?: number;
+  receivedQty?: number;
+  billedQty?: number;
+  pendingReceiptQty?: number;
+  warehouseId?: string | null;
+  serviceCostPerQty?: number;
+}
+
+export interface SubcontractingOrderDto extends AuditedEntityDto<string> {
+  orderNumber?: string;
+  orderDate?: string;
+  supplierId?: string;
+  supplierName?: string | null;
+  companyId?: string;
+  currencyCode?: string;
+  exchangeRate?: number;
+  netTotal?: number;
+  grandTotal?: number;
+  status?: SubcontractingOrderStatus;
+  perReceived?: number;
+  supplierWarehouseId?: string | null;
+  items?: ScoItemDto[];
+}
+
+export interface SubcontractingOrderSummaryDto {
+  id?: string;
+  orderNumber?: string;
+  status?: number;
+  netTotal?: number;
+  perReceived?: number;
+  totalItemsCount?: number;
+  totalSuppliedItemsCount?: number;
+  totalOrderedQty?: number;
+  totalReceivedQty?: number;
+  canReopen?: boolean;
+  canClose?: boolean;
+  canCancel?: boolean;
+}
+
+export interface SubcontractingReceiptDto extends AuditedEntityDto<string> {
+  receiptNumber?: string;
+  postingDate?: string;
+  supplierId?: string;
+  subcontractingOrderId?: string;
+  netTotal?: number;
+  status?: SubcontractingReceiptStatus;
+  isReturn?: boolean;
+  returnAgainstReceiptId?: string | null;
+  items?: SubcontractingReceiptItemDto[];
+}
+
+export interface SubcontractingReceiptItemDto extends EntityDto<string> {
+  itemId?: string;
+  itemName?: string;
+  qty?: number;
+  rate?: number;
+  amount?: number;
+  warehouseId?: string | null;
+  expenseAccountId?: string | null;
+  serviceExpenseAccountId?: string | null;
+  costCenterId?: string | null;
+  secondaryItemType?: string | null;
+  valuationType?: SecondaryItemValuationType | null;
+  costAllocationPercentage?: number;
+  bomSecondaryItemId?: string | null;
+}
+
+export interface SubcontractingReceiptSummaryDto {
+  id?: string;
+  receiptNumber?: string;
+  status?: number;
+  netTotal?: number;
+  totalReceivedQty?: number;
+  totalItemsCount?: number;
+  isReturn?: boolean;
+  returnAgainstReceiptId?: string | null;
+  returnAgainstReceiptNumber?: string | null;
+}
+
+export interface SupplierDeliveryPerformanceDto {
+  supplierId?: string;
+  supplierName?: string;
+  totalOrders?: number;
+  onTimeDeliveries?: number;
+  lateDeliveries?: number;
+  pendingDeliveries?: number;
+  onTimeRate?: number;
+  avgDelayDays?: number;
+  totalOrderValue?: number;
+}
+
+export interface SupplierDto extends FullAuditedEntityDto<string> {
+  companyId?: string;
+  name?: string;
+  supplierCode?: string | null;
+  tin?: string | null;
+  registrationNumber?: string | null;
+  sstRegistrationNumber?: string | null;
+  idType?: string | null;
+  idValue?: string | null;
+  contactPerson?: string | null;
+  phone?: string | null;
+  email?: string | null;
+  website?: string | null;
+  address?: string | null;
+  city?: string | null;
+  state?: string | null;
+  postalCode?: string | null;
+  country?: string | null;
+  defaultPayableAccountId?: string | null;
+  isActive?: boolean;
+  holdType?: SupplierHoldType;
+  preventPurchaseOrders?: boolean;
+  preventRfqs?: boolean;
+  isFrozen?: boolean;
+  allowPurchaseInvoiceWithoutPurchaseOrder?: boolean;
+  allowPurchaseInvoiceWithoutPurchaseReceipt?: boolean;
+  representsCompanyId?: string | null;
+  supplierGroupId?: string | null;
+  taxWithholdingCategory?: string | null;
+  defaultPaymentTermsTemplateId?: string | null;
+  defaultPriceListId?: string | null;
+  restrictToCompanies?: boolean;
+}
+
+export interface SupplierPaymentLineDto {
+  supplierId?: string;
+  supplierName?: string;
+  invoiceCount?: number;
+  totalInvoiced?: number;
+  totalPaid?: number;
+  totalOutstanding?: number;
+  overdueCount?: number;
+  overdueAmount?: number;
+  paymentTimeliness?: number;
+}
+
+export interface SupplierPaymentSummaryReportDto {
+  items?: SupplierPaymentLineDto[];
+  totalInvoiced?: number;
+  totalPaid?: number;
+  totalOutstanding?: number;
+  totalOverdueAmount?: number;
+  supplierCount?: number;
+}
+
+export interface SupplierQuotationComparisonDto {
+  rfqId?: string | null;
+  suppliers?: ComparisonSupplierDto[];
+  items?: ComparisonItemDto[];
+  lowestTotalAmount?: number;
+}
+
+export interface SupplierQuotationDto extends EntityDto<string> {
+  companyId?: string;
+  supplierId?: string;
+  supplierName?: string | null;
+  quotationNumber?: string | null;
+  transactionDate?: string;
+  validTill?: string | null;
+  currency?: string;
+  netTotal?: number;
+  grandTotal?: number;
+  status?: number;
+  orderStatus?: string | null;
+  items?: SupplierQuotationItemDto[];
+}
+
+export interface SupplierQuotationItemDto extends EntityDto<string> {
+  itemId?: string;
+  itemName?: string | null;
+  qty?: number;
+  rate?: number;
+  amount?: number;
+  orderedQty?: number;
+  pendingOrderQty?: number;
+}
+
+export interface SupplierScorecardVariableDto extends FullAuditedEntityDto<string> {
+  variableLabel?: string;
+  paramName?: string;
+  path?: string;
+  isCustom?: boolean;
+  description?: string | null;
+}
+
+export interface SupplierSelectionItemDto {
+  materialRequestItemId: string;
+  supplierId: string;
+  quantity?: number;
+}
+
+export interface SupplierSelectionResultDto {
+  purchaseOrders?: CreatedPurchaseOrderInfo[];
+  totalItemsOrdered?: number;
+}
+
+export interface TaxWithholdingEntryDto {
+  id?: string;
+  taxCategory?: string | null;
+  withholdingRate?: number;
+  taxableAmount?: number;
+  withheldAmount?: number;
+  postingDate?: string;
+  hasLDC?: boolean;
+  ldcRate?: number | null;
+  certificateNumber?: string | null;
+  status?: string | null;
+}
+
+export interface ThreeWayMatchingItemDto {
+  piItemId?: string;
+  itemDescription?: string;
+  billedQty?: number;
+  billedRate?: number;
+  orderedQty?: number | null;
+  orderedRate?: number | null;
+  receivedQty?: number | null;
+  qtyVariance?: number | null;
+  rateVariance?: number | null;
+  matchLevel?: string;
+  hasQtyDiscrepancy?: boolean;
+  hasRateDiscrepancy?: boolean;
+}
+
+export interface TrackingBoardCardDto {
+  orderId?: string;
+  orderNumber?: string;
+  supplierName?: string;
+  orderDate?: string;
+  expectedDate?: string | null;
+  grandTotal?: number;
+  perReceived?: number;
+  perBilled?: number;
+  stage?: string;
+  isOverdue?: boolean;
+  daysOverdue?: number;
+  itemCount?: number;
+}
+
+export interface UnbilledPurchaseOrderItemDto {
+  purchaseOrderId?: string;
+  orderNumber?: string | null;
+  orderDate?: string;
+  itemId?: string;
+  itemName?: string | null;
+  quantity?: number;
+  rate?: number;
+  uom?: string | null;
+  purchaseOrderItemId?: string;
+}
+
+export interface UnbilledPurchaseReceiptItemDto {
+  purchaseReceiptId?: string;
+  receiptNumber?: string | null;
+  receiptDate?: string;
+  itemId?: string;
+  itemName?: string | null;
+  quantity?: number;
+  rate?: number;
+  uom?: string | null;
+  purchaseReceiptItemId?: string;
+  purchaseOrderItemId?: string | null;
+  warehouseId?: string | null;
+}
+
+export interface UnbilledReceiptItemDto {
+  purchaseReceiptId?: string;
+  receiptNumber?: string | null;
+  receiptDate?: string;
+  itemId?: string;
+  itemName?: string | null;
+  quantity?: number;
+  rate?: number;
+  uom?: string | null;
+  purchaseReceiptItemId?: string;
+  purchaseOrderItemId?: string | null;
+}
+
+export interface UpdateDropShipDeliveredQtyDto {
+  items: DropShipDeliveryItemDto[];
+}
+
+export interface UpdateOrderItemDto {
+  itemId: string;
+  quantity: number;
+  unitPrice: number;
+  deliveryDate?: string | null;
+  warehouseId?: string | null;
+  conversionFactor?: number | null;
+}
+
+export interface UpdateOrderItemsDto {
+  items?: UpdateOrderItemDto[];
+  removedItemIds?: string[];
+}
+
+export interface UpdateOrderItemsResultDto {
+  itemsUpdated?: number;
+  newGrandTotal?: number;
+  previousGrandTotal?: number;
+  warnings?: string[];
+}
+
+export interface RequestedItemsFilterDto {
+  companyId?: string;
+  fromDate?: string;
+  toDate?: string;
+  materialRequestId?: string | null;
+  itemId?: string | null;
+  warehouseId?: string | null;
+}
+
+export interface RequestedItemToOrderAndReceiveRowDto {
+  materialRequestId?: string;
+  materialRequestNumber?: string;
+  transactionDate?: string;
+  requiredDate?: string | null;
+  itemId?: string;
+  itemCode?: string;
+  itemName?: string;
+  description?: string | null;
+  qty?: number;
+  stockQty?: number;
+  orderedQty?: number;
+  receivedQty?: number;
+  qtyToOrder?: number;
+  qtyToReceive?: number;
+  uom?: string;
+  stockUom?: string;
+  warehouseId?: string | null;
+  warehouseName?: string | null;
+}
+
+export interface RequestedItemsToOrderAndReceiveReportDto {
+  rows?: RequestedItemToOrderAndReceiveRowDto[];
+  totalQty?: number;
+  totalOrderedQty?: number;
+  totalReceivedQty?: number;
+  totalQtyToOrder?: number;
+  totalQtyToReceive?: number;
+}
+
+export interface SubcontractingInwardReportFilterDto {
+  companyId?: string;
+  fromDate?: string;
+  toDate?: string;
+  subcontractingInwardOrderId?: string | null;
+  supplierId?: string | null;
+  itemId?: string | null;
+  status?: string | null;
+}
+
+export interface SubcontractedItemToBeDeliveredRowDto {
+  subcontractingInwardOrderId?: string;
+  orderNumber?: string;
+  orderDate?: string;
+  supplierId?: string;
+  partyName?: string;
+  itemId?: string;
+  itemCode?: string;
+  itemName?: string;
+  uom?: string;
+  orderQty?: number;
+  producedQty?: number;
+  deliveredQty?: number;
+  pendingQty?: number;
+}
+
+export interface SubcontractedItemsToBeDeliveredReportDto {
+  rows?: SubcontractedItemToBeDeliveredRowDto[];
+  totalOrderQty?: number;
+  totalProducedQty?: number;
+  totalDeliveredQty?: number;
+  totalPendingQty?: number;
+}
+
+export interface SubcontractingInwardOrderSummaryRowDto {
+  subcontractingInwardOrderId?: string;
+  orderNumber?: string;
+  orderDate?: string;
+  supplierId?: string;
+  partyName?: string;
+  status?: SubcontractingInwardOrderStatus;
+  itemId?: string;
+  itemCode?: string;
+  itemName?: string;
+  uom?: string;
+  orderQty?: number;
+  producedQty?: number;
+  deliveredQty?: number;
+  pendingQty?: number;
+  rate?: number;
+  amount?: number;
+}
+
+export interface SubcontractingInwardOrderSummaryReportDto {
+  rows?: SubcontractingInwardOrderSummaryRowDto[];
+  totalOrderQty?: number;
+  totalProducedQty?: number;
+  totalDeliveredQty?: number;
+  totalPendingQty?: number;
+  totalAmount?: number;
+}
+
+export interface SubcontractedRawMaterialToBeReceivedRowDto {
+  subcontractingInwardOrderId?: string;
+  orderNumber?: string;
+  orderDate?: string;
+  supplierId?: string;
+  partyName?: string;
+  finishedGoodItemId?: string;
+  finishedGoodItemCode?: string;
+  finishedGoodItemName?: string;
+  rawMaterialItemId?: string;
+  rawMaterialItemCode?: string;
+  rawMaterialItemName?: string;
+  stockUom?: string;
+  requiredQty?: number;
+  receivedQty?: number;
+  returnedQty?: number;
+  processLossQty?: number;
+  pendingQty?: number;
+}
+
+export interface SubcontractedRawMaterialsToBeReceivedReportDto {
+  rows?: SubcontractedRawMaterialToBeReceivedRowDto[];
+  totalRequiredQty?: number;
+  totalReceivedQty?: number;
+  totalReturnedQty?: number;
+  totalProcessLossQty?: number;
+  totalPendingQty?: number;
+}
+
+export interface GetSupplierOverviewInputDto {
+  supplierId: string;
+  companyId: string;
+  period?: string;
+}
+
+export interface SupplierOverviewDto {
+  supplierId?: string;
+  supplierName?: string;
+  companyId?: string;
+  currency?: string;
+  period?: string;
+  fromDate?: string;
+  toDate?: string;
+  asOfDate?: string;
+  position?: SupplierPositionDto;
+  trend?: SupplierTrendDto;
+  delivery?: SupplierOverviewDeliveryDto;
+  pipeline?: SupplierPipelineDto;
+  ageing?: SupplierAgeingDto;
+  unallocatedAdvances?: number;
+}
+
+export interface SupplierPositionDto {
+  netPurchases?: SupplierMetricDto;
+  outstanding?: SupplierOutstandingMetricDto;
+  overdue?: SupplierMetricDto;
+  advances?: SupplierMetricDto;
+}
+
+export interface SupplierMetricDto {
+  value?: number;
+  count?: number;
+  delta?: number | null;
+  deltaPositiveIsGood?: boolean;
+}
+
+export interface SupplierOutstandingMetricDto {
+  value?: number;
+  unpaidCount?: number;
+  daysToPay?: number | null;
+}
+
+export interface SupplierTrendDto {
+  points?: SupplierTrendPointDto[];
+  totalPurchased?: number;
+  totalPaid?: number;
+}
+
+export interface SupplierTrendPointDto {
+  label?: string;
+  title?: string;
+  purchased?: number;
+  paid?: number;
+}
+
+export interface SupplierOverviewDeliveryDto {
+  onTime?: number;
+  late?: number;
+  overdue?: number;
+  lines?: number;
+  orders?: number;
+  onTimeRate?: number | null;
+  hasScorecard?: boolean;
+}
+
+export interface SupplierPipelineDto {
+  quotations?: SupplierQuotationTileDto;
+  receipt?: SupplierPipelineTileDto;
+  billing?: SupplierPipelineTileDto;
+  late?: SupplierDeliveryTileDto;
+}
+
+export interface SupplierQuotationTileDto {
+  value?: number;
+  count?: number;
+  expiring?: number;
+}
+
+export interface SupplierPipelineTileDto {
+  value?: number;
+  count?: number;
+  nextDue?: string | null;
+  orders?: string[];
+}
+
+export interface SupplierDeliveryTileDto {
+  value?: number;
+  count?: number;
+  daysLate?: number | null;
+  orders?: string[];
+}
+
+export interface SupplierAgeingDto {
+  buckets?: SupplierAgeingBucketDto[];
+  total?: number;
+  overdue?: number;
+  overduePct?: number;
+}
+
+export interface SupplierAgeingBucketDto {
+  key?: string;
+  label?: string;
+  value?: number;
+  isOverdue?: boolean;
+}
+
+export interface GetSupplierTransactionsInputDto {
+  supplierId: string;
+  companyId: string;
+  docType?: string;
+  maxResultCount?: number;
+}
+
+export interface SupplierTransactionDto {
+  id?: string;
+  transactionNumber?: string;
+  docType?: string;
+  typeLabel?: string;
+  date?: string;
+  status?: string;
+  amount?: number;
+  outstandingAmount?: number | null;
+}
+
+export interface SubcontractedItemToBeReceivedFilterDto {
+  companyId?: string;
+  supplierId?: string | null;
+  fromDate?: string | null;
+  toDate?: string | null;
+}
+
+export interface SubcontractedItemToBeReceivedRowDto {
+  subcontractOrderId?: string;
+  subcontractOrderNumber?: string;
+  orderDate?: string;
+  supplierId?: string;
+  supplierName?: string;
+  fgItemId?: string;
+  fgItemCode?: string;
+  itemName?: string;
+  requiredQty?: number;
+  receivedQty?: number;
+  pendingQty?: number;
+}
+
+export interface SubcontractedItemToBeReceivedSummaryDto {
+  totalRequiredQty?: number;
+  totalReceivedQty?: number;
+  totalPendingQty?: number;
+  totalOrders?: number;
+}
+
+export interface SubcontractedItemToBeReceivedReportDto {
+  rows?: SubcontractedItemToBeReceivedRowDto[];
+  summary?: SubcontractedItemToBeReceivedSummaryDto;
+}
+
+export interface ProcurementTrackerFilterDto {
+  companyId?: string;
+  costCenterId?: string | null;
+  projectId?: string | null;
+  fromDate?: string | null;
+  toDate?: string | null;
+  showCompletedOrders?: boolean;
+}
+
+export interface ProcurementTrackerRowDto {
+  materialRequestDate?: string | null;
+  materialRequestNo?: string | null;
+  costCenter?: string | null;
+  project?: string | null;
+  requestingSite?: string | null;
+  requestor?: string | null;
+  itemCode?: string;
+  itemName?: string;
+  quantity?: number;
+  unitOfMeasurement?: string;
+  status?: string;
+  purchaseOrderDate?: string | null;
+  purchaseOrderNo?: string | null;
+  supplierName?: string | null;
+  estimatedCost?: number;
+  actualCost?: number;
+  purchaseOrderAmount?: number;
+  purchaseOrderAmountCompanyCurrency?: number;
+  expectedDeliveryDate?: string | null;
+  actualDeliveryDate?: string | null;
+}
+
+export interface ProcurementTrackerSummaryDto {
+  totalRequisitions?: number;
+  totalOrders?: number;
+  totalEstimatedCost?: number;
+  totalActualCost?: number;
+  totalPurchaseOrderAmount?: number;
+}
+
+export interface ProcurementTrackerReportDto {
+  rows?: ProcurementTrackerRowDto[];
+  summary?: ProcurementTrackerSummaryDto;
+}
+
+export interface GetPurchaseOrderAnalysisDto {
+  companyId: string;
+  fromDate?: string | null;
+  toDate?: string | null;
+  supplierId?: string | null;
+  purchaseOrderId?: string | null;
+  itemId?: string | null;
+  projectId?: string | null;
+  groupByPo?: boolean;
+  groupByItem?: boolean;
+}
+
+export interface PurchaseOrderAnalysisRowDto {
+  purchaseOrderNumber?: string | null;
+  purchaseOrderId?: string | null;
+  date?: string | null;
+  requiredDate?: string | null;
+  projectId?: string | null;
+  status?: string | null;
+  supplierId?: string | null;
+  supplierName?: string | null;
+  itemId?: string | null;
+  itemCode?: string | null;
+  description?: string | null;
+  uom?: string | null;
+  qty: number;
+  receivedQty: number;
+  pendingQty: number;
+  billedQty: number;
+  qtyToBill: number;
+  amount: number;
+  receivedQtyAmount: number;
+  billedAmount: number;
+  pendingAmount: number;
+  delayDays: number;
+  warehouseId?: string | null;
+  warehouseName?: string | null;
+  companyId: string;
+  companyName?: string | null;
+}
+
+export interface PurchaseOrderAnalysisReportDto {
+  rows: PurchaseOrderAnalysisRowDto[];
+  totalAmount: number;
+  totalBilledAmount: number;
+  totalAmountToBill: number;
+  totalQty: number;
+  totalReceivedQty: number;
+}
+
+export interface SubcontractedRawMaterialsToBeTransferredFilterDto {
+  companyId: string;
+  supplierId?: string | null;
+  subcontractOrderId?: string | null;
+  rawMaterialItemId?: string | null;
+  fromDate?: string | null;
+  toDate?: string | null;
+}
+
+export interface SubcontractedRawMaterialsToBeTransferredRowDto {
+  subcontractOrderId: string;
+  subcontractOrderNumber: string;
+  orderDate: string;
+  supplierId: string;
+  supplierName: string;
+  rmItemId: string;
+  rmItemCode: string;
+  rmItemName: string;
+  requiredQty: number;
+  transferredQty: number;
+  returnedQty: number;
+  pendingQty: number;
+  reserveWarehouseId?: string | null;
+  reserveWarehouseName?: string | null;
+}
+
+export interface SubcontractedRawMaterialsToBeTransferredSummaryDto {
+  totalRequiredQty: number;
+  totalTransferredQty: number;
+  totalReturnedQty: number;
+  totalPendingQty: number;
+  totalOrders: number;
+}
+
+export interface SubcontractedRawMaterialsToBeTransferredReportDto {
+  rows?: SubcontractedRawMaterialsToBeTransferredRowDto[];
+  summary?: SubcontractedRawMaterialsToBeTransferredSummaryDto;
+}
+
+export interface SubcontractOrderSummaryFilterDto {
+  companyId: string;
+  supplierId?: string | null;
+  subcontractOrderId?: string | null;
+  fromDate?: string | null;
+  toDate?: string | null;
+}
+
+export interface SubcontractOrderSummaryRowDto {
+  subcontractOrderId: string;
+  subcontractOrderNumber: string;
+  orderDate: string;
+  supplierId: string;
+  supplierName: string;
+  status: string;
+  fgItemId?: string | null;
+  fgItemCode?: string | null;
+  fgItemName?: string | null;
+  orderQty: number;
+  receivedQty: number;
+  pendingFgQty: number;
+  rmItemId?: string | null;
+  rmItemCode?: string | null;
+  rmItemName?: string | null;
+  requiredQty: number;
+  suppliedQty: number;
+  consumedQty: number;
+  returnedQty: number;
+  pendingRmQty: number;
+}
+
+export interface SubcontractOrderSummaryReportDto {
+  rows: SubcontractOrderSummaryRowDto[];
+  totalOrders: number;
+  totalOrderQty: number;
+  totalReceivedQty: number;
+  totalRequiredQty: number;
+  totalSuppliedQty: number;
+  totalConsumedQty: number;
+}
+
+export interface GetItemWisePurchaseHistoryDto {
+  companyId?: string;
+  fromDate?: string;
+  toDate?: string;
+  supplierId?: string;
+  itemId?: string;
+  itemCode?: string;
+  itemGroupId?: string;
+}
+
+export interface ItemWisePurchaseHistoryRowDto {
+  purchaseOrderId: string;
+  purchaseOrderNumber: string;
+  transactionDate: string;
+  supplierId: string;
+  supplierName: string;
+  supplierGroup?: string | null;
+  project?: string | null;
+  itemId: string;
+  itemCode: string;
+  itemName: string;
+  itemGroup?: string | null;
+  description?: string | null;
+  quantity: number;
+  uom: string;
+  rate: number;
+  amount: number;
+  receivedQuantity: number;
+  billedAmount: number;
+  companyId: string;
+  companyName: string;
+  currency: string;
+}
+
+export interface ItemWisePurchaseChartPointDto {
+  itemCode: string;
+  itemName: string;
+  amount: number;
+}
+
+export interface ItemWisePurchaseHistoryReportDto {
+  rows: ItemWisePurchaseHistoryRowDto[];
+  totalQuantity: number;
+  totalAmount: number;
+  totalReceivedQuantity: number;
+  totalBilledAmount: number;
+  totalOrders: number;
+  chartData: ItemWisePurchaseChartPointDto[];
+}
+
+export interface PurchaseOrderTrendsRequestDto {
+  companyId: string;
+  fiscalYearId?: string | null;
+  fromDate?: string | null;
+  toDate?: string | null;
+  period: string;
+  basedOn: string;
+  groupBy?: string | null;
+  supplierId?: string | null;
+  itemId?: string | null;
+  itemGroup?: string | null;
+  includeClosedOrders: boolean;
+}
+
+export interface PurchaseOrderTrendsPeriodColumnDto {
+  key: string;
+  label: string;
+  startDate: string;
+  endDate: string;
+}
+
+export interface PurchaseOrderTrendsRowDto {
+  entityId: string;
+  entityCode: string;
+  entityName: string;
+  secondaryInfo?: string | null;
+  groupByValue?: string | null;
+  periodQuantities: Record<string, number>;
+  periodAmounts: Record<string, number>;
+  totalQty: number;
+  totalAmount: number;
+}
+
+export interface PurchaseOrderTrendsChartDto {
+  labels: string[];
+  datapoints: number[];
+  currency: string;
+}
+
+export interface PurchaseOrderTrendsReportDto {
+  companyCurrency: string;
+  period: string;
+  basedOn: string;
+  groupBy?: string | null;
+  periodColumns: PurchaseOrderTrendsPeriodColumnDto[];
+  rows: PurchaseOrderTrendsRowDto[];
+  totalRow: PurchaseOrderTrendsRowDto;
+  chart: PurchaseOrderTrendsChartDto;
+}
+
+export interface PurchaseReceiptTrendsRequestDto {
+  companyId: string;
+  supplierId?: string | null;
+  fiscalYearId?: string | null;
+  fromDate?: string | null;
+  toDate?: string | null;
+  period?: string;
+  basedOn?: string;
+  groupBy?: string | null;
+  includeReturns?: boolean;
+}
+
+export interface PurchaseReceiptTrendsPeriodColumnDto {
+  key: string;
+  label: string;
+  startDate: string;
+  endDate: string;
+}
+
+export interface PurchaseReceiptTrendsRowDto {
+  entityId: string;
+  entityCode: string;
+  entityName: string;
+  secondaryInfo?: string | null;
+  groupByValue?: string | null;
+  periodQuantities: Record<string, number>;
+  periodAmounts: Record<string, number>;
+  totalQty: number;
+  totalAmount: number;
+}
+
+export interface PurchaseReceiptTrendsChartDto {
+  labels: string[];
+  datapoints: number[];
+  currency: string;
+}
+
+export interface PurchaseReceiptTrendsReportDto {
+  companyCurrency: string;
+  period: string;
+  basedOn: string;
+  groupBy?: string | null;
+  periodColumns: PurchaseReceiptTrendsPeriodColumnDto[];
+  rows: PurchaseReceiptTrendsRowDto[];
+  totalRow: PurchaseReceiptTrendsRowDto;
+  chart: PurchaseReceiptTrendsChartDto;
+}
+
+export interface MaterialRequestsWithoutSupplierQuotationsFilterDto {
+  companyId?: string | null;
+  fromDate?: string | null;
+  toDate?: string | null;
+  warehouseId?: string | null;
+  searchTerm?: string | null;
+}
+
+export interface MaterialRequestsWithoutSupplierQuotationsItemDto {
+  materialRequestId: string;
+  requestNumber: string;
+  requestDate: string;
+  requiredByDate?: string | null;
+  itemId: string;
+  itemCode: string;
+  itemName: string;
+  description?: string | null;
+  quantity: number;
+  uom: string;
+  warehouseId?: string | null;
+  warehouseName?: string | null;
+  companyId: string;
+  companyName: string;
+}
+
+export interface MaterialRequestsWithoutSupplierQuotationsReportDto {
+  companyId?: string | null;
+  totalPendingRequests: number;
+  totalPendingItems: number;
+  totalPendingQuantity: number;
+  items: MaterialRequestsWithoutSupplierQuotationsItemDto[];
+}
+
+export interface GetReceivedItemsToBeBilledInput {
+  companyId: string;
+  postingDate?: string | null;
+  purchaseReceiptId?: string | null;
+  supplierId?: string | null;
+  itemId?: string | null;
+}
+
+export interface ReceivedItemToBeBilledRowDto {
+  purchaseReceiptId: string;
+  receiptNumber: string;
+  postingDate: string;
+  supplierId: string;
+  supplierName: string;
+  itemId: string;
+  itemCode: string;
+  itemName: string;
+  description: string;
+  receivedQty: number;
+  billedQty: number;
+  returnedQty: number;
+  pendingQty: number;
+  rate: number;
+  amount: number;
+  billedAmount: number;
+  returnedAmount: number;
+  pendingAmount: number;
+  projectId?: string | null;
+  projectName?: string | null;
+  currency: string;
+}
+
+export interface ReceivedItemsToBeBilledReportDto {
+  rows: ReceivedItemToBeBilledRowDto[];
+  totalAmount: number;
+  totalBilledAmount: number;
+  totalReturnedAmount: number;
+  totalPendingAmount: number;
+  currency: string;
+}
+
+export interface PurchaseInvoiceTrendsRequestDto {
+  companyId: string;
+  fiscalYearId?: string;
+  fromDate?: string;
+  toDate?: string;
+  period?: string;
+  basedOn?: string;
+  groupBy?: string;
+  includeReturns?: boolean;
+}
+
+export interface PurchaseInvoiceTrendsPeriodColumnDto {
+  key: string;
+  label: string;
+  startDate: string;
+  endDate: string;
+}
+
+export interface PurchaseInvoiceTrendsRowDto {
+  entityId: string;
+  entityCode: string;
+  entityName: string;
+  secondaryInfo?: string;
+  groupByValue?: string;
+  periodQuantities: Record<string, number>;
+  periodAmounts: Record<string, number>;
+  totalQty: number;
+  totalAmount: number;
+}
+
+export interface PurchaseInvoiceTrendsChartDto {
+  labels: string[];
+  datapoints: number[];
+  currency: string;
+}
+
+export interface PurchaseInvoiceTrendsReportDto {
+  companyCurrency: string;
+  period: string;
+  basedOn: string;
+  groupBy?: string;
+  periodColumns: PurchaseInvoiceTrendsPeriodColumnDto[];
+  rows: PurchaseInvoiceTrendsRowDto[];
+  totalRow: PurchaseInvoiceTrendsRowDto;
+  chart: PurchaseInvoiceTrendsChartDto;
+}
+
+export interface SupplierLedgerSummaryRequestDto {
+  companyId: string;
+  fromDate?: string | null;
+  toDate?: string | null;
+  supplierId?: string | null;
+  supplierGroupId?: string | null;
+}
+
+export interface SupplierLedgerSummaryRowDto {
+  supplierId: string;
+  supplierCode: string;
+  supplierName: string;
+  supplierGroupName?: string | null;
+  openingBalance: number;
+  invoicedAmount: number;
+  paidAmount: number;
+  returnAmount: number;
+  adjustmentAmount: number;
+  closingBalance: number;
+  drOrCr: string;
+  currency: string;
+}
+
+export interface SupplierLedgerSummaryReportDto {
+  companyCurrency: string;
+  fromDate: string;
+  toDate: string;
+  rows: SupplierLedgerSummaryRowDto[];
+  totalRow: SupplierLedgerSummaryRowDto;
+}
+
+export interface GetBilledItemsToBeReceivedInput {
+  companyId: string;
+  postingDate?: string | null;
+  purchaseInvoiceId?: string | null;
+  supplierId?: string | null;
+  itemId?: string | null;
+}
+
+export interface BilledItemToBeReceivedRowDto {
+  purchaseInvoiceId: string;
+  invoiceNumber: string;
+  postingDate: string;
+  supplierId: string;
+  supplierName: string;
+  itemId: string;
+  itemCode: string;
+  itemName: string;
+  description: string;
+  uom: string;
+  invoicedQty: number;
+  receivedQty: number;
+  pendingQty: number;
+  rate: number;
+  amount: number;
+  receivedAmount: number;
+  pendingAmount: number;
+  currency: string;
+}
+
+export interface BilledItemsToBeReceivedReportDto {
+  rows: BilledItemToBeReceivedRowDto[];
+  totalAmount: number;
+  totalReceivedAmount: number;
+  totalPendingAmount: number;
+  currency: string;
+}

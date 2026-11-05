@@ -1,0 +1,116 @@
+using System;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authorization;
+using MyERP.Core.Entities;
+using MyERP.Permissions;
+using MyERP.Shared;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+
+namespace MyERP.Core;
+
+/// <summary>
+/// Manages Auto Repeat configurations — recurring document generation schedules.
+/// Documents are always created as Draft (never auto-submitted).
+/// </summary>
+[Authorize(MyERPPermissions.AutomationRules.Default)]
+public class AutoRepeatAppService : ApplicationService, IAutoRepeatAppService
+{
+    private readonly IRepository<AutoRepeat, Guid> _repository;
+
+    public AutoRepeatAppService(IRepository<AutoRepeat, Guid> repository)
+    {
+        _repository = repository;
+    }
+
+    public async Task<AutoRepeatDto> GetAsync(Guid id)
+    {
+        var entity = await _repository.GetAsync(id);
+        return ObjectMapper.Map<AutoRepeat, AutoRepeatDto>(entity);
+    }
+
+    public async Task<PagedResultDto<AutoRepeatDto>> GetListAsync(CompanyFilteredPagedRequestDto input)
+    {
+        var query = await _repository.GetQueryableAsync();
+
+        if (input.CompanyId.HasValue)
+            query = query.Where(x => x.CompanyId == input.CompanyId.Value);
+
+        if (!string.IsNullOrWhiteSpace(input.Filter))
+        {
+            var filter = input.Filter; query = query.Where(x => x.ReferenceDocumentType.Contains(filter));
+        }
+
+        var count = query.Count();
+        var list = query.OrderByDescending(x => x.NextScheduleDate)
+            .Skip(input.SkipCount).Take(input.MaxResultCount).ToList();
+
+        return new PagedResultDto<AutoRepeatDto>(count, list.Select(x => ObjectMapper.Map<AutoRepeat, AutoRepeatDto>(x)).ToList());
+    }
+
+    [Authorize(MyERPPermissions.AutomationRules.Create)]
+    public async Task<AutoRepeatDto> CreateAsync(CreateAutoRepeatDto input)
+    {
+        if (input.EndDate.HasValue && input.EndDate.Value < input.StartDate)
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.InvalidDateRange);
+        }
+
+        var entity = new AutoRepeat(
+            GuidGenerator.Create(),
+            input.CompanyId,
+            input.ReferenceDocumentType,
+            input.ReferenceDocumentId,
+            input.Frequency,
+            input.StartDate,
+            input.EndDate,
+            CurrentTenant.Id);
+
+        entity.DayOfWeek = input.DayOfWeek;
+        entity.DayOfMonth = input.DayOfMonth;
+        entity.NotifyByEmail = input.NotifyByEmail;
+        entity.NotifyRecipients = input.NotifyRecipients;
+        entity.ReferenceDocumentNumber = input.ReferenceDocumentNumber;
+
+        await _repository.InsertAsync(entity);
+        return ObjectMapper.Map<AutoRepeat, AutoRepeatDto>(entity);
+    }
+
+    [Authorize(MyERPPermissions.AutomationRules.Edit)]
+    public async Task EnableAsync(Guid id)
+    {
+        var entity = await _repository.GetAsync(id);
+        entity.Enable();
+        await _repository.UpdateAsync(entity);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new DocumentActivityLog(
+            GuidGenerator.Create(), "AutoRepeat", entity.Id,
+            "Enabled", entity.CompanyId,
+            entity.ReferenceDocumentType, "Disabled", "Enabled", CurrentUser.Id,
+            $"Auto Repeat schedule for {entity.ReferenceDocumentType} ({entity.ReferenceDocumentNumber}) enabled", CurrentTenant.Id));
+    }
+
+    [Authorize(MyERPPermissions.AutomationRules.Edit)]
+    public async Task DisableAsync(Guid id)
+    {
+        var entity = await _repository.GetAsync(id);
+        entity.Disable();
+        await _repository.UpdateAsync(entity);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new DocumentActivityLog(
+            GuidGenerator.Create(), "AutoRepeat", entity.Id,
+            "Disabled", entity.CompanyId,
+            entity.ReferenceDocumentType, "Enabled", "Disabled", CurrentUser.Id,
+            $"Auto Repeat schedule for {entity.ReferenceDocumentType} ({entity.ReferenceDocumentNumber}) disabled", CurrentTenant.Id));
+    }
+
+    [Authorize(MyERPPermissions.AutomationRules.Delete)]
+    public async Task DeleteAsync(Guid id)
+    {
+        await _repository.DeleteAsync(id);
+    }
+}

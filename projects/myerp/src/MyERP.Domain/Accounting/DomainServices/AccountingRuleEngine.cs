@@ -1,0 +1,524 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Accounting.Entities;
+using MyERP.Core.Entities;
+using Volo.Abp;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Domain.Services;
+
+namespace MyERP.Accounting.DomainServices;
+
+/// <summary>
+/// Interface for documents that can be posted to the general ledger.
+/// </summary>
+public interface IAccountableDocument
+{
+    Guid Id { get; }
+    Guid CompanyId { get; }
+    string DocumentType { get; }
+    decimal NetTotal { get; }
+    decimal GrandTotal { get; }
+    decimal TaxAmount { get; }
+
+    /// <summary>
+    /// Total purchase expense after deducting landed cost voucher amounts.
+    /// Used by AmountSource.PurchaseExpenseTotal for GL entries.
+    /// </summary>
+    decimal PurchaseExpenseTotal => NetTotal;
+
+    Guid? CustomerId { get; }
+    Guid? SupplierId { get; }
+    DateTime PostingDate { get; }
+
+    /// <summary>Transaction currency code (e.g., "USD"). May differ from company currency.</summary>
+    string CurrencyCode { get; }
+
+    /// <summary>Exchange rate: transaction_currency → company_currency. Default 1.0 for same-currency.</summary>
+    decimal ExchangeRate { get; }
+
+    /// <summary>
+    /// Total stock cost at valuation rate (for COGS posting on delivery documents).
+    /// = SUM(item.StockQty × item.ValuationRate). Default 0 for non-inventory documents.
+    /// Per ERPNext: DN GL uses stock_value_difference from SLEs, not selling price.
+    /// </summary>
+    decimal StockCostTotal => 0;
+
+    /// <summary>
+    /// Optional finance book for this document's GL entries.
+    /// Null = default book. Named book = entries tagged for multi-book reporting.
+    /// Per ERPNext: asset depreciation uses separate finance books (tax vs management).
+    /// </summary>
+    string? FinanceBook => null;
+
+    /// <summary>
+    /// Default cost center for this document's GL entries.
+    /// Null = no cost center assigned (caller may distribute later).
+    /// Per ERPNext: cost center is typically set from Company defaults or item-level settings.
+    /// </summary>
+    Guid? CostCenterId => null;
+}
+
+/// <summary>
+/// Accounting Rules Engine — generates journal entries from documents using configurable rules.
+/// This is the core of the ERP's accounting system. NEVER hardcode GL postings.
+/// </summary>
+public class AccountingRuleEngine : DomainService
+{
+    private readonly IRepository<AccountingRule, Guid> _ruleRepository;
+    private readonly IRepository<FiscalYear, Guid> _fiscalYearRepository;
+    private readonly IRepository<Company, Guid> _companyRepository;
+    private readonly CostCenterAllocationService _allocationService;
+
+    public AccountingRuleEngine(
+        IRepository<AccountingRule, Guid> ruleRepository,
+        IRepository<FiscalYear, Guid> fiscalYearRepository,
+        IRepository<Company, Guid> companyRepository,
+        CostCenterAllocationService allocationService)
+    {
+        _ruleRepository = ruleRepository;
+        _fiscalYearRepository = fiscalYearRepository;
+        _companyRepository = companyRepository;
+        _allocationService = allocationService;
+    }
+
+    /// <summary>
+    /// Generate a balanced journal entry from a source document using configured accounting rules.
+    /// Supports multi-currency: amounts are recorded in both company currency and account currency.
+    /// </summary>
+    public async Task<JournalEntry> PostDocumentAsync(IAccountableDocument document)
+    {
+        return await PostDocumentAsync(document, warehouseStockAccountOverride: null);
+    }
+
+    /// <summary>
+    /// Generate a balanced journal entry with a warehouse-specific stock account override.
+    /// When provided, any rule with AccountSource.WarehouseStock will use this ID instead of company default.
+    /// Per ERPNext BaseStockGLComposer: uses WarehouseAccountService to resolve per-warehouse GL.
+    /// </summary>
+    public async Task<JournalEntry> PostDocumentAsync(IAccountableDocument document, Guid? warehouseStockAccountOverride)
+    {
+        return await PostDocumentAsync(document, warehouseStockAccountOverride, warehouseStockSplit: null);
+    }
+
+    /// <summary>
+    /// Generate a balanced journal entry whose goods-cost debit leg is routed to the stock accounts
+    /// the goods actually landed in, in proportion to the value that went to each.
+    /// </summary>
+    /// <param name="warehouseStockSplit">
+    /// Value that reached the stock ledger, per stock account. It carves that much out of the
+    /// document's goods-cost debit leg (AccountSource.WarehouseStock or ItemExpense) and leaves any
+    /// balance on the rule's own account.
+    ///
+    /// A Purchase Receipt's stock leg is entirely goods, so the carve-out takes the whole amount and
+    /// the result is the old single line, just spread per warehouse — a receipt landing in one
+    /// warehouse posts byte-identical GL. A Purchase Invoice with update_stock is the case that
+    /// needs the balance: stock items belong in inventory, service items stay on expense.
+    /// </param>
+    public async Task<JournalEntry> PostDocumentAsync(
+        IAccountableDocument document,
+        Guid? warehouseStockAccountOverride,
+        IReadOnlyList<WarehouseStockSplitLine>? warehouseStockSplit)
+    {
+        var rules = await _ruleRepository.GetListAsync(r =>
+            r.CompanyId == document.CompanyId &&
+            r.DocumentType == document.DocumentType &&
+            r.IsActive);
+
+        if (!rules.Any())
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.UnbalancedJournalEntry)
+                .WithData("documentType", document.DocumentType);
+        }
+
+        var fiscalYear = await GetFiscalYearAsync(document.CompanyId, document.PostingDate);
+        var company = await _companyRepository.GetAsync(document.CompanyId);
+
+        var journal = new JournalEntry(
+            GuidGenerator.Create(),
+            document.CompanyId,
+            fiscalYear.Id,
+            document.PostingDate);
+
+        journal.ReferenceType = document.DocumentType;
+        journal.ReferenceId = document.Id;
+
+        var isMultiCurrency = document.ExchangeRate != 1m;
+
+        void AddLine(Guid accountId, decimal amountInTransactionCurrency, bool isDebit)
+        {
+            if (isMultiCurrency)
+            {
+                // Multi-currency: Amount in company currency, AmountInAccountCurrency in transaction currency
+                var amountInCompanyCurrency = Math.Round(amountInTransactionCurrency * document.ExchangeRate, 4);
+                journal.AddLine(accountId, amountInCompanyCurrency, isDebit);
+
+                // Set multi-currency fields on the last added line
+                var lastLine = journal.Lines[^1];
+                lastLine.AccountCurrency = document.CurrencyCode;
+                lastLine.AmountInAccountCurrency = amountInTransactionCurrency;
+                lastLine.ExchangeRate = document.ExchangeRate;
+                lastLine.FinanceBook = document.FinanceBook;
+            }
+            else
+            {
+                // Same currency: Amount = AmountInAccountCurrency, ExchangeRate = 1
+                journal.AddLine(accountId, amountInTransactionCurrency, isDebit);
+
+                // Tag with finance book if specified
+                if (document.FinanceBook != null)
+                    journal.Lines[^1].FinanceBook = document.FinanceBook;
+            }
+        }
+
+        var splitAccounts = NormalizeWarehouseStockSplit(warehouseStockSplit);
+
+        foreach (var rule in rules.OrderBy(r => r.SortOrder))
+        {
+            var rawAmount = ResolveAmount(rule.AmountSource, document);
+            if (rawAmount == 0) continue;
+
+            var (amountInTransactionCurrency, isDebit) = ResolveDirectionAndAmount(rawAmount, rule.IsDebit);
+
+            if (splitAccounts != null
+                && rule.AccountSource is AccountSource.WarehouseStock or AccountSource.ItemExpense)
+            {
+                var stockLines = splitAccounts;
+                // Route the goods-cost portion of this leg to the accounts the stock actually
+                // landed in, and leave whatever is left on the rule's own account.
+                //
+                // A Purchase Receipt's stock leg is entirely goods, so the carve-out consumes the
+                // whole amount and nothing remains — exactly the single-line behaviour from before
+                // splitting existed, just spread per warehouse. A Purchase Invoice with
+                // update_stock is the case that needs the remainder: its expense leg covers both
+                // stock items (which belong in inventory, per ERPNext's PI gl_composer, which
+                // debits the warehouse's inventory account for stock items) and service items
+                // (which stay expensed).
+                var stockPortion = Math.Min(amountInTransactionCurrency, stockLines.Sum(x => x.Value));
+                var remainder = amountInTransactionCurrency - stockPortion;
+
+                // A sub-cent remainder is rounding noise, not a real service-item cost: fold it
+                // into the stock portion rather than emitting a junk line.
+                if (remainder < 0.005m)
+                {
+                    stockPortion = amountInTransactionCurrency;
+                    remainder = 0m;
+                }
+
+                var totalValue = stockLines.Sum(x => x.Value);
+                var allocated = 0m;
+                for (var i = 0; i < stockLines.Count; i++)
+                {
+                    // Last account absorbs the rounding remainder so the split always re-sums to
+                    // stockPortion exactly and the entry stays balanced.
+                    var share = i == stockLines.Count - 1
+                        ? stockPortion - allocated
+                        : Math.Round(stockPortion * (stockLines[i].Value / totalValue), 4);
+                    allocated += share;
+                    if (share == 0) continue;
+                    AddLine(stockLines[i].AccountId, share, isDebit);
+                }
+
+                if (remainder > 0)
+                    AddLine(ResolveAccountId(rule, company, warehouseStockAccountOverride), remainder, isDebit);
+
+                continue;
+            }
+
+            AddLine(ResolveAccountId(rule, company, warehouseStockAccountOverride), amountInTransactionCurrency, isDebit);
+        }
+
+        // Apply cost center allocation BEFORE validation (distribution may expand lines)
+        // Per ERPNext gotcha #418: budget validates MAIN CC, GL posts to split CCs
+        // Per gotcha #550: distribution happens before journal posting
+        if (document.CostCenterId.HasValue)
+        {
+            await ApplyCostCenterAllocationAsync(journal, document.CostCenterId.Value, document.PostingDate, company.CurrencyCode);
+        }
+
+        // Auto round-off small imbalances from independently-rounded tax/item lines, rather than
+        // hard-erroring on a sub-cent difference. Added AFTER cost center allocation so the
+        // round-off line is never split across dimensions — per ERPNext's own round-off exception.
+        ApplyRoundOff(journal, company);
+
+        // Double-entry validation — will throw if unbalanced
+        journal.Validate();
+        journal.Post();
+
+        return journal;
+    }
+
+
+    /// <summary>
+    /// Collapses a per-warehouse split down to per-account totals, and returns null when there is
+    /// nothing to route — no split supplied, or no account with positive value — so the caller
+    /// falls back to the plain single-account path.
+    /// </summary>
+    /// <remarks>
+    /// A single account is kept, not discarded: a Purchase Invoice with update_stock needs the
+    /// carve-out even when everything lands in one warehouse, because the point there is splitting
+    /// stock cost away from service cost, not splitting across warehouses. Purchase Receipt callers
+    /// pass null below two warehouses of their own accord, so this does not change their GL.
+    /// </remarks>
+    private static List<WarehouseStockSplitLine>? NormalizeWarehouseStockSplit(
+        IReadOnlyList<WarehouseStockSplitLine>? split)
+    {
+        if (split == null || split.Count == 0) return null;
+
+        var byAccount = split
+            .GroupBy(x => x.AccountId)
+            .Select(g => new WarehouseStockSplitLine(g.Key, g.Sum(x => x.Value)))
+            .Where(x => x.Value > 0)
+            .ToList();
+
+        if (byAccount.Count == 0) return null;
+        return byAccount;
+    }
+
+    /// <summary>
+    /// Per ERPNext general_ledger.py get_debit_credit_allowance()/make_round_off_gle(): system-
+    /// generated vouchers (everything AccountingRuleEngine builds — SI/PI/DN/PR/SE, i.e. "all
+    /// other voucher types" in ERPNext's own two-tier tolerance table) get a looser 0.5 imbalance
+    /// allowance than manually-posted Journal Entries/Payment Entries (which stay at the JE
+    /// entity's own zero-tolerance Validate() — this method is never on their posting path).
+    /// A nonzero difference within that allowance gets a balancing line on
+    /// Company.RoundOffAccountId (or RoundOffForOpeningAccountId for opening entries) instead of
+    /// leaving the caller to hit UnbalancedJournalEntry for what's really rounding noise.
+    /// </summary>
+    internal static void ApplyRoundOff(JournalEntry journal, Company company)
+    {
+        var difference = journal.TotalDebit - journal.TotalCredit;
+        if (difference == 0m) return;
+
+        const decimal allowance = 0.5m;
+        if (Math.Abs(difference) > allowance) return; // let Validate() throw — a real imbalance, not rounding noise
+
+        var roundOffAccountId = journal.IsOpening
+            ? company.RoundOffForOpeningAccountId ?? company.RoundOffAccountId
+            : company.RoundOffAccountId;
+
+        if (!roundOffAccountId.HasValue)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.RoundOffAccountNotConfigured)
+                .WithData("companyId", company.Id)
+                .WithData("difference", difference);
+        }
+
+        // difference > 0 means debit-heavy → credit the round-off account to balance, and vice versa.
+        journal.AddLine(roundOffAccountId.Value, Math.Abs(difference), isDebit: difference < 0);
+    }
+
+    /// <summary>
+    /// Applies cost center allocation to journal lines.
+    /// If an active allocation exists, replaces each line with N distributed lines (one per child CC).
+    /// If no allocation exists, assigns the cost center directly to all lines.
+    /// Per ERPNext gotcha #418: distributes debit/credit amounts only. Round-off to FIRST sub-CC.
+    /// </summary>
+    private async Task ApplyCostCenterAllocationAsync(
+        JournalEntry journal,
+        Guid costCenterId,
+        DateTime postingDate,
+        string? companyDefaultCurrency = null)
+    {
+        var allocation = await _allocationService.GetActiveAllocationAsync(costCenterId, postingDate);
+        if (allocation == null || allocation.Entries.Count == 0)
+        {
+            foreach (var line in journal.Lines)
+            {
+                line.CostCenterId = costCenterId;
+            }
+            return;
+        }
+
+        var entries = allocation.Entries
+            .OrderBy(e => e.ChildCostCenterId)
+            .Select(e => (e.ChildCostCenterId, e.Percentage))
+            .ToList();
+
+        var defaultBasePrecision = CostCenterAllocationService.GetCurrencyPrecision(companyDefaultCurrency, 2);
+        var originalLines = journal.Lines.ToList();
+
+        foreach (var originalLine in originalLines)
+        {
+            var basePrecision = Math.Max(defaultBasePrecision, GetDecimalScale(originalLine.Amount));
+            var txnCurrency = string.IsNullOrWhiteSpace(originalLine.AccountCurrency)
+                ? companyDefaultCurrency
+                : originalLine.AccountCurrency;
+            var txnPrecision = Math.Max(
+                CostCenterAllocationService.GetCurrencyPrecision(txnCurrency, 2),
+                GetDecimalScale(originalLine.AmountInAccountCurrency));
+
+            var baseSlices = CostCenterAllocationService.DistributeAmountByPercentages(
+                originalLine.Amount, entries, basePrecision);
+            var txnSlices = CostCenterAllocationService.DistributeAmountByPercentages(
+                originalLine.AmountInAccountCurrency, entries, txnPrecision);
+
+            // Update first slice BEFORE adding child lines so RecalculateTotals() reflects exact totals
+            originalLine.CostCenterId = entries[0].ChildCostCenterId;
+            originalLine.Amount = baseSlices[0].Amount;
+            originalLine.AmountInAccountCurrency = txnSlices[0].Amount;
+
+            for (int i = 1; i < entries.Count; i++)
+            {
+                var baseAmt = baseSlices[i].Amount;
+                var txnAmt = txnSlices[i].Amount;
+                if (baseAmt == 0m && txnAmt == 0m)
+                    continue;
+
+                var newLine = new JournalEntryLine(
+                    Guid.NewGuid(),
+                    journal.Id,
+                    originalLine.AccountId,
+                    baseAmt,
+                    originalLine.IsDebit,
+                    originalLine.Description)
+                {
+                    CostCenterId = entries[i].ChildCostCenterId,
+                    AccountCurrency = originalLine.AccountCurrency,
+                    AmountInAccountCurrency = txnAmt,
+                    ExchangeRate = originalLine.ExchangeRate,
+                    FinanceBook = originalLine.FinanceBook,
+                    PartyId = originalLine.PartyId,
+                    PartyType = originalLine.PartyType,
+                    ProjectId = originalLine.ProjectId,
+                    AgainstVoucherType = originalLine.AgainstVoucherType,
+                    AgainstVoucherId = originalLine.AgainstVoucherId,
+                    IsAdvance = originalLine.IsAdvance,
+                };
+                journal.AddLine(newLine);
+            }
+        }
+    }
+
+    private static int GetDecimalScale(decimal value)
+    {
+        var bits = decimal.GetBits(value / 1.0000000000000000000000000000m);
+        return (bits[3] >> 16) & 0x7F;
+    }
+
+    /// <summary>
+    /// Per ERPNext: return documents (Credit/Debit Notes) carry negative qty/amounts and reuse
+    /// the SAME GL rules as the original document — the sign alone reverses the ledger impact
+    /// there because ERPNext allows a negative amount in the debit/credit column.
+    /// JournalEntryLine.Amount here is documented as always-positive with direction from IsDebit,
+    /// so a negative resolved amount must instead flip IsDebit and post the magnitude —
+    /// otherwise every rule line for a return is silently skipped (old check was amount &lt;= 0)
+    /// and the whole return fails to post (JournalEntry.Validate() throws UnbalancedJournalEntry
+    /// on a zero-line journal).
+    /// </summary>
+    internal static (decimal Amount, bool IsDebit) ResolveDirectionAndAmount(decimal rawAmount, bool ruleIsDebit)
+    {
+        return rawAmount < 0
+            ? (-rawAmount, !ruleIsDebit)
+            : (rawAmount, ruleIsDebit);
+    }
+
+    private decimal ResolveAmount(AmountSource source, IAccountableDocument document)
+    {
+        return source switch
+        {
+            AmountSource.NetTotal => document.NetTotal,
+            AmountSource.GrandTotal => document.GrandTotal,
+            AmountSource.TaxAmount => document.TaxAmount,
+            AmountSource.StockCostTotal => document.StockCostTotal,
+            AmountSource.PurchaseExpenseTotal => document.PurchaseExpenseTotal,
+            _ => throw new NotImplementedException($"AmountSource {source} not supported for document level rules.")
+        };
+    }
+
+    private Guid ResolveAccountId(AccountingRule rule, Company company, Guid? warehouseStockAccountOverride = null)
+    {
+        switch (rule.AccountSource)
+        {
+            case AccountSource.FixedAccount:
+                if (rule.FixedAccountId == null)
+                    throw new BusinessException(MyERPDomainErrorCodes.AccountIsGroup)
+                        .WithData("ruleName", rule.Name);
+                return rule.FixedAccountId.Value;
+
+            case AccountSource.CustomerReceivable:
+                return company.DefaultReceivableAccountId
+                    ?? rule.FixedAccountId
+                    ?? throw new BusinessException(MyERPDomainErrorCodes.AccountIsGroup)
+                        .WithData("ruleName", rule.Name + " (no receivable account configured)");
+
+            case AccountSource.SupplierPayable:
+                return company.DefaultPayableAccountId
+                    ?? rule.FixedAccountId
+                    ?? throw new BusinessException(MyERPDomainErrorCodes.AccountIsGroup)
+                        .WithData("ruleName", rule.Name + " (no payable account configured)");
+
+            case AccountSource.ItemIncome:
+                return company.DefaultIncomeAccountId
+                    ?? rule.FixedAccountId
+                    ?? throw new BusinessException(MyERPDomainErrorCodes.AccountIsGroup)
+                        .WithData("ruleName", rule.Name + " (no income account configured)");
+
+            case AccountSource.ItemExpense:
+                return company.DefaultExpenseAccountId
+                    ?? rule.FixedAccountId
+                    ?? throw new BusinessException(MyERPDomainErrorCodes.AccountIsGroup)
+                        .WithData("ruleName", rule.Name + " (no expense account configured)");
+
+            case AccountSource.TaxPayable:
+                return rule.FixedAccountId
+                    ?? throw new BusinessException(MyERPDomainErrorCodes.AccountIsGroup)
+                        .WithData("ruleName", rule.Name + " (no tax account configured)");
+
+            case AccountSource.WarehouseStock:
+                // Per ERPNext: full resolution uses WarehouseAccountService with 5-level chain.
+                // When warehouseStockAccountOverride is provided (from AppService via WarehouseAccountService),
+                // use the resolved per-warehouse account. Otherwise fall back to company default.
+                return warehouseStockAccountOverride
+                    ?? company.DefaultInventoryAccountId
+                    ?? rule.FixedAccountId
+                    ?? throw new BusinessException(MyERPDomainErrorCodes.AccountIsGroup)
+                        .WithData("ruleName", rule.Name + " (no inventory account configured)");
+
+            default:
+                return rule.FixedAccountId
+                    ?? throw new BusinessException(MyERPDomainErrorCodes.AccountIsGroup)
+                        .WithData("ruleName", rule.Name);
+        }
+    }
+
+    /// <summary>
+    /// Checks if a cost center has an active allocation and returns the distribution.
+    /// Called by AppServices before GL posting to expand lines.
+    /// Per ERPNext gotcha #418: validates MAIN cost center budget BEFORE allocation splits.
+    /// Returns null if no allocation exists (post directly to original CC).
+    /// </summary>
+    public async Task<List<(Guid CostCenterId, decimal Debit, decimal Credit)>?> GetCostCenterDistributionAsync(
+        Guid costCenterId,
+        decimal debit,
+        decimal credit,
+        DateTime postingDate)
+    {
+        return await _allocationService.DistributeGlAmountsAsync(costCenterId, debit, credit, postingDate);
+    }
+
+    private async Task<FiscalYear> GetFiscalYearAsync(Guid companyId, DateTime date)
+    {
+        var fiscalYear = await _fiscalYearRepository.FindAsync(fy =>
+            fy.CompanyId == companyId &&
+            !fy.IsClosed &&
+            fy.StartDate <= date &&
+            fy.EndDate >= date);
+
+        if (fiscalYear == null)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.FiscalYearClosed)
+                .WithData("date", date);
+        }
+
+        return fiscalYear;
+    }
+}
+
+/// <summary>
+/// One slice of a document's stock leg: the value that moved against a given stock account.
+/// Several warehouses can resolve to the same account, so callers may pass one entry per
+/// warehouse and let the engine aggregate.
+/// </summary>
+public sealed record WarehouseStockSplitLine(Guid AccountId, decimal Value);

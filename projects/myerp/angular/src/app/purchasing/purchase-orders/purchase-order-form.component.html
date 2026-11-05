@@ -1,0 +1,246 @@
+<abp-page [title]="isEditMode ? ('::EditPurchaseOrder' | abpLocalization) : ('::NewPurchaseOrder' | abpLocalization)">
+  <form [formGroup]="form" (ngSubmit)="save()" (appSaveShortcut)="save()">
+    <!-- Header -->
+    <div class="card mb-4">
+      <div class="card-header">
+        <h5 class="card-title mb-0"><i class="fa fa-file-invoice me-2"></i>{{ '::PurchaseOrder' | abpLocalization }}</h5>
+      </div>
+      <div class="card-body">
+        <div class="row">
+          <div class="col-12 col-md-6 col-lg-4 mb-3">
+            <label class="form-label">{{ '::Company' | abpLocalization }}</label>
+            <select class="form-select" formControlName="companyId" [class.is-invalid]="form.get('companyId')?.invalid && form.get('companyId')?.touched">
+              @for (c of companies(); track c.id) {
+                <option [value]="c.id">{{ c.name }}</option>
+              }
+            </select>
+          </div>
+          <div class="col-12 col-md-6 col-lg-4 mb-3">
+            <label class="form-label">{{ '::Supplier' | abpLocalization }}</label>
+            <app-link-picker
+              formControlName="supplierId"
+              [searchFn]="supplierSearchFn"
+              [getByIdFn]="supplierGetByIdFn"
+              [displayFn]="supplierDisplayFn"
+              [placeholder]="'::Placeholder:SearchSupplier' | abpLocalization"
+              [invalid]="!!(form.get('supplierId')?.invalid && form.get('supplierId')?.touched)"
+              (linkSelected)="onSupplierChanged()">
+            </app-link-picker>
+            @if (supplierScorecardWarning()) {
+              <div class="alert alert-{{ supplierBlocked() ? 'danger' : 'warning' }} mt-2 mb-0 py-1 px-2 small">
+                <i class="fa fa-{{ supplierBlocked() ? 'ban' : 'triangle-exclamation' }} me-1"></i>
+                {{ supplierScorecardWarning() }}
+              </div>
+            }
+          </div>
+          <div class="col-12 col-md-6 col-lg-4 mb-3">
+            <label class="form-label">{{ '::OrderDate' | abpLocalization }}</label>
+            <input type="date" class="form-control" formControlName="orderDate" [class.is-invalid]="form.get('orderDate')?.invalid && form.get('orderDate')?.touched" />
+          </div>
+          <div class="col-12 col-md-6 col-lg-4 mb-3">
+            <label class="form-label">{{ '::ExpectedDelivery' | abpLocalization }}</label>
+            <input type="date" class="form-control" formControlName="expectedDeliveryDate" [class.is-invalid]="form.get('expectedDeliveryDate')?.invalid && form.get('expectedDeliveryDate')?.touched" />
+          </div>
+          <div class="col-12 col-md-3 col-lg-2 mb-3">
+            <label class="form-label">{{ '::Currency' | abpLocalization }}</label>
+            <select class="form-select" formControlName="currencyCode" (change)="onCurrencyChanged()">
+              <option value="MYR">MYR</option>
+              <option value="USD">USD</option>
+              <option value="SGD">SGD</option>
+              <option value="EUR">EUR</option>
+              <option value="GBP">GBP</option>
+              <option value="AUD">AUD</option>
+              <option value="JPY">JPY</option>
+              <option value="CNY">CNY</option>
+              <option value="THB">THB</option>
+              <option value="IDR">IDR</option>
+            </select>
+          </div>
+          @if (isMultiCurrency()) {
+            <div class="col-12 col-md-3 col-lg-2 mb-3">
+              <label class="form-label">{{ '::ExchangeRate' | abpLocalization }} <small class="text-muted">({{ form.get('currencyCode')?.value }} → MYR)</small></label>
+              <input type="number" class="form-control" formControlName="exchangeRate" step="0.000001" min="0.000001" />
+              <small class="form-text text-muted">{{ '::ExchangeRateHelpText' | abpLocalization }}</small>
+            </div>
+          }
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label">{{ 'PriceList' | abpLocalization }}</label>
+            <select class="form-select" formControlName="priceListId">
+              <option value="">— {{ '::Default' | abpLocalization }} —</option>
+              @for (pl of priceLists(); track pl.id) {
+                <option [value]="pl.id">{{ pl.name }}</option>
+              }
+            </select>
+          </div>
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label">{{ '::Notes' | abpLocalization }}</label>
+            <textarea class="form-control" formControlName="notes" [class.is-invalid]="form.get('notes')?.invalid && form.get('notes')?.touched" rows="2"></textarea>
+          </div>
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label">{{ '::Remarks' | abpLocalization }}</label>
+            <textarea class="form-control" formControlName="remarks" rows="2"></textarea>
+          </div>
+          <div class="col-12 col-md-4 mb-3">
+            <label class="form-label">{{ 'Warehouse' | abpLocalization }}</label>
+            <select class="form-select" formControlName="warehouseId">
+              <option value="">— {{ 'SelectWarehouse' | abpLocalization }} —</option>
+              @for (w of warehouses(); track w.id) {
+                <option [value]="w.id">{{ w.name }}</option>
+              }
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Supplier Address & TIN (auto-filled on supplier selection) -->
+    @if (supplierAddress() || supplierTin()) {
+      <div class="card mb-4 border-start border-4 border-info">
+        <div class="card-body py-2">
+          <div class="row">
+            @if (supplierAddress()) {
+              <div class="col-12 col-md-8">
+                <small class="text-muted"><i class="fa fa-map-marker-alt me-1"></i>{{ '::SupplierAddress' | abpLocalization }}</small>
+                <div class="fw-medium">{{ supplierAddress() }}</div>
+              </div>
+            }
+            @if (supplierTin()) {
+              <div class="col-12 col-md-4">
+                <small class="text-muted"><i class="fa fa-id-card me-1"></i>TIN</small>
+                <div class="fw-medium font-monospace">{{ supplierTin() }}</div>
+              </div>
+            }
+          </div>
+        </div>
+      </div>
+    }
+
+    <!-- Line Items -->
+    <div class="card mb-4">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="card-title mb-0"><i class="fa fa-list me-2"></i>{{ '::Items' | abpLocalization }}</h5>
+        <div class="btn-group btn-group-sm">
+          <!-- Get Items from Supplier Quotation -->
+          @if (supplierQuotations().length > 0) {
+            <select class="form-select form-select-sm" style="max-width: 200px"
+              (change)="loadItemsFromSupplierQuotation($any($event.target).value); $any($event.target).value = ''">
+              <option value="">{{ '::GetItemsFromSQ' | abpLocalization }}</option>
+              @for (sq of supplierQuotations(); track sq.id) {
+                <option [value]="sq.id">{{ sq.quotationNumber || sq.id?.slice(0,8) }}</option>
+              }
+            </select>
+          }
+          <!-- Get Items from Material Request -->
+          <button type="button" class="btn btn-sm btn-outline-info" (click)="loadItemsFromMaterialRequest()" [disabled]="isLoadingMrItems()">
+            @if (isLoadingMrItems()) {
+              <span class="spinner-border spinner-border-sm me-1"></span>
+            } @else {
+              <i class="fa fa-file-import me-1"></i>
+            }
+            {{ '::GetItemsFromMR' | abpLocalization }}
+          </button>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="table-responsive">
+          <table class="table table-sm w-100">
+            <thead>
+              <tr>
+                <th style="min-width: 180px">{{ '::Item' | abpLocalization }}</th>
+                <th>{{ '::Description' | abpLocalization }}</th>
+                <th style="width: 100px">{{ '::Quantity' | abpLocalization }}</th>
+                <th style="width: 90px">{{ '::UOM' | abpLocalization }}</th>
+                <th style="width: 120px">{{ '::UnitPrice' | abpLocalization }}</th>
+                <th style="width: 100px">{{ '::Tax' | abpLocalization }}</th>
+                <th style="width: 120px">{{ '::LineTotal' | abpLocalization }}</th>
+                <th style="width: 50px"></th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (row of items.controls; track $index; let i = $index) {
+                <tr [formGroup]="$any(row)">
+                  <td>
+                    <app-item-picker formControlName="itemId" (itemSelected)="onItemSelected(i, $event)" />
+                  </td>
+                  <td><input type="text" class="form-control form-control-sm" formControlName="description" [placeholder]="'::Placeholder:ItemDescription' | abpLocalization" /></td>
+                  <td><input type="number" class="form-control form-control-sm" formControlName="quantity" /></td>
+                  <td><input type="text" class="form-control form-control-sm" formControlName="uom" /></td>
+                  <td><input type="number" class="form-control form-control-sm" formControlName="unitPrice" /></td>
+                  <td><input type="number" class="form-control form-control-sm" formControlName="taxAmount" /></td>
+                  <td class="font-monospace text-end align-middle">{{ getLineTotal($any(row)) | number:'1.2-2' }}</td>
+                  <td>
+                    <button type="button" class="btn btn-sm btn-outline-danger" (click)="removeItemRow(i)">
+                      <i class="fa fa-trash"></i>
+                    </button>
+                  </td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        </div>
+        <button type="button" class="btn btn-outline-secondary btn-sm mt-2" (click)="addItemRow()">
+          <i class="fa fa-plus me-1"></i> {{ '::AddRow' | abpLocalization }}
+        </button>
+      </div>
+    </div>
+
+    <!-- Tax Template Section -->
+    <div class="card mb-4">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h6 class="mb-0"><i class="fa fa-percent me-2"></i>{{ '::TaxTemplate' | abpLocalization }}</h6>
+        @if (selectedTaxRules().length > 0) {
+          <span class="badge bg-info">{{ calcResult.totalTax | number:'1.2-2' }}</span>
+        }
+      </div>
+      <div class="card-body">
+        <div class="row">
+          <div class="col-md-6">
+            <label class="form-label">{{ '::TaxCategory' | abpLocalization }}</label>
+            <select class="form-select" [ngModel]="selectedTaxCategoryId()" (ngModelChange)="onTaxCategoryChanged($event)" [ngModelOptions]="{standalone: true}">
+              <option value="">— {{ '::NoTax' | abpLocalization }} —</option>
+              @for (tc of taxCategories(); track tc.id) {
+                <option [value]="tc.id">{{ tc.name }}</option>
+              }
+            </select>
+          </div>
+        </div>
+        @if (selectedTaxRules().length > 0) {
+          <table class="table table-sm mt-3 mb-0">
+            <thead>
+              <tr>
+                <th>{{ '::Description' | abpLocalization }}</th>
+                <th class="text-end">{{ '::Rate' | abpLocalization }} (%)</th>
+                <th class="text-end">{{ '::Amount' | abpLocalization }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (line of calcResult.taxLines; track $index) {
+                <tr>
+                  <td>{{ line.taxName || selectedTaxRules()[$index]?.name }}</td>
+                  <td class="text-end font-monospace">{{ line.rate | number:'1.2-2' }}</td>
+                  <td class="text-end font-monospace">{{ line.taxAmount | number:'1.2-2' }}</td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        }
+      </div>
+    </div>
+
+    <!-- Totals -->
+    <div class="card mb-4" style="max-width: 380px; margin-left: auto">
+      <div class="card-body text-end">
+        <p>{{ '::NetTotal' | abpLocalization }}: <strong class="font-monospace">{{ netTotal | number:'1.2-2' }}</strong></p>
+        <p>{{ '::Tax' | abpLocalization }}: <strong class="font-monospace">{{ taxTotal | number:'1.2-2' }}</strong></p>
+        <hr />
+        <p class="fs-5">{{ '::GrandTotal' | abpLocalization }}: <strong class="font-monospace">{{ grandTotal | number:'1.2-2' }}</strong></p>
+      </div>
+    </div>
+
+    <!-- Actions -->
+    <div class="d-flex justify-content-end gap-2">
+      <button type="button" class="btn btn-outline-secondary" (click)="cancel()"><i class="fa fa-times me-1"></i>{{ '::Cancel' | abpLocalization }}</button>
+      <button type="submit" class="btn btn-primary"><i class="fa fa-save me-1"></i>{{ '::Save' | abpLocalization }}</button>
+    </div>
+  </form>
+</abp-page>

@@ -1,0 +1,59 @@
+using System;
+using Volo.Abp.Domain.Entities;
+
+namespace MyERP.Manufacturing.Entities;
+
+/// <summary>
+/// Planned finished good item in a Production Plan (from SO/MR demand).
+/// </summary>
+public class ProductionPlanItem : Entity<Guid>
+{
+    public Guid ProductionPlanId { get; set; }
+
+    public Guid ItemId { get; set; }
+    public string ItemName { get; set; } = null!;
+    public Guid BomId { get; set; }
+
+    public decimal PlannedQty { get; set; }
+    /// <summary>Total quantity ordered into Work Orders against this planned item (PR #58799 & #58847).</summary>
+    public decimal OrderedQty { get; set; }
+    public decimal ProducedQty { get; set; }
+    /// <summary>Total process loss quantity recorded across Work Orders for this planned item (PR #61773).</summary>
+    public decimal ProcessLossQty { get; set; }
+
+    /// <summary>Remaining quantity to order into Work Orders.</summary>
+    public decimal PendingQty => Math.Max(0, Math.Round(PlannedQty - OrderedQty, 4));
+
+    /// <summary>Remaining quantity to produce, deducting both ProducedQty and ProcessLossQty (PR #61773).</summary>
+    public decimal PendingProductionQty => Math.Max(0, Math.Round(PlannedQty - ProducedQty - ProcessLossQty, 4));
+
+    public Guid? WarehouseId { get; set; }
+    public DateTime? PlannedStartDate { get; set; }
+
+    /// <summary>Source Sales Order, if demand originated from SO.</summary>
+    public Guid? SalesOrderId { get; set; }
+
+    /// <summary>Source Sales Order line item ID (for SO line-level planning tracking, PR #60271).</summary>
+    public Guid? SalesOrderItemId { get; set; }
+
+    /// <summary>Whether this item is a component of a Product Bundle in the Sales Order.</summary>
+    public bool IsProductBundleItem { get; set; }
+
+    /// <summary>Source Material Request, if demand originated from MR.</summary>
+    public Guid? MaterialRequestId { get; set; }
+
+    /// <summary>Generated Work Order ID (populated after WO generation).</summary>
+    public Guid? WorkOrderId { get; set; }
+
+    protected ProductionPlanItem() { }
+
+    public ProductionPlanItem(Guid id, Guid productionPlanId, Guid itemId, string itemName, Guid bomId, decimal plannedQty)
+        : base(id)
+    {
+        ProductionPlanId = productionPlanId;
+        ItemId = itemId;
+        ItemName = itemName;
+        BomId = bomId;
+        PlannedQty = plannedQty;
+    }
+}

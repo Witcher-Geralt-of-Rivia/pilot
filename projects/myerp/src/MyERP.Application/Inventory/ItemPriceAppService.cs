@@ -1,0 +1,382 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+using MyERP.Inventory.DomainServices;
+using MyERP.Inventory.Entities;
+using MyERP.Permissions;
+using MyERP.Sales.Entities;
+using MyERP.Purchasing.Entities;
+
+namespace MyERP.Inventory;
+
+[Authorize(MyERPPermissions.Items.Default)]
+public class ItemPriceAppService : ApplicationService, IItemPriceAppService
+{
+    private readonly IRepository<ItemPrice, Guid> _itemPriceRepo;
+    private readonly IRepository<Item, Guid> _itemRepo;
+    private readonly IRepository<PriceList, Guid> _priceListRepo;
+    private readonly IRepository<Customer, Guid> _customerRepo;
+    private readonly IRepository<Supplier, Guid> _supplierRepo;
+
+    public ItemPriceAppService(
+        IRepository<ItemPrice, Guid> itemPriceRepo,
+        IRepository<Item, Guid> itemRepo,
+        IRepository<PriceList, Guid> priceListRepo,
+        IRepository<Customer, Guid> customerRepo,
+        IRepository<Supplier, Guid> supplierRepo)
+    {
+        _itemPriceRepo = itemPriceRepo;
+        _itemRepo = itemRepo;
+        _priceListRepo = priceListRepo;
+        _customerRepo = customerRepo;
+        _supplierRepo = supplierRepo;
+    }
+
+    public async Task<PagedResultDto<ItemPriceDto>> GetListAsync(GetItemPriceListDto input)
+    {
+        var queryable = await _itemPriceRepo.GetQueryableAsync();
+
+        if (input.ItemId.HasValue)
+            queryable = queryable.Where(p => p.ItemId == input.ItemId.Value);
+
+        if (input.PriceListId.HasValue)
+            queryable = queryable.Where(p => p.PriceListId == input.PriceListId.Value);
+
+        if (input.CustomerId.HasValue)
+            queryable = queryable.Where(p => p.CustomerId == input.CustomerId.Value);
+
+        if (input.SupplierId.HasValue)
+            queryable = queryable.Where(p => p.SupplierId == input.SupplierId.Value);
+
+        // Per ERPNext PR #58948 / commit 4671d1a665: Item Price inherits company restriction from Item
+        if (input.CompanyId.HasValue)
+        {
+            var targetCompanyId = input.CompanyId.Value;
+            var itemsQ = await _itemRepo.GetQueryableAsync();
+            var candidateItems = itemsQ
+                .Select(i => new { i.Id, i.CompanyId, i.RestrictToCompanies })
+                .ToList();
+
+            var unrestrictedIds = candidateItems
+                .Where(i => i.CompanyId == targetCompanyId && !i.RestrictToCompanies)
+                .Select(i => i.Id)
+                .ToList();
+
+            var restrictedCandidateIds = candidateItems
+                .Where(i => i.RestrictToCompanies)
+                .Select(i => i.Id)
+                .ToList();
+
+            var restrictionRepo = LazyServiceProvider?.LazyGetService<IRepository<Core.Entities.CompanyRestrictionEntry, Guid>>();
+            var allowedRestrictedIds = new List<Guid>();
+            if (restrictionRepo != null && restrictedCandidateIds.Count > 0)
+            {
+                var reQ = await restrictionRepo.GetQueryableAsync();
+                allowedRestrictedIds = reQ
+                    .Where(r => r.ParentType == "Item" && r.CompanyId == targetCompanyId && restrictedCandidateIds.Contains(r.ParentId))
+                    .Select(r => r.ParentId)
+                    .ToList();
+            }
+
+            var allowedItemIds = unrestrictedIds.Concat(allowedRestrictedIds).Distinct().ToHashSet();
+            queryable = queryable.Where(p => allowedItemIds.Contains(p.ItemId));
+        }
+
+        if (!string.IsNullOrWhiteSpace(input.Filter))
+        {
+            var filter = input.Filter.Trim();
+            var items = await _itemRepo.GetQueryableAsync();
+            var matchingItemIds = items
+                .Where(i => i.ItemCode.Contains(filter) || i.ItemName.Contains(filter))
+                .Select(i => i.Id)
+                .ToList();
+            if (matchingItemIds.Any())
+                queryable = queryable.Where(p => matchingItemIds.Contains(p.ItemId));
+            else
+                queryable = queryable.Where(p => false);
+        }
+
+        var totalCount = queryable.Count();
+        var prices = queryable
+            .OrderByDescending(p => p.CreationTime)
+            .Skip(input.SkipCount)
+            .Take(input.MaxResultCount)
+            .ToList();
+
+        // Batch-resolve names
+        var itemIds = prices.Select(p => p.ItemId).Distinct().ToList();
+        var plIds = prices.Select(p => p.PriceListId).Distinct().ToList();
+        var customerIds = prices.Where(p => p.CustomerId.HasValue).Select(p => p.CustomerId!.Value).Distinct().ToList();
+        var supplierIds = prices.Where(p => p.SupplierId.HasValue).Select(p => p.SupplierId!.Value).Distinct().ToList();
+
+        var itemQ = await _itemRepo.GetQueryableAsync();
+        var itemMap = itemQ.Where(i => itemIds.Contains(i.Id))
+            .Select(i => new { i.Id, i.ItemCode, i.ItemName }).ToList()
+            .ToDictionary(i => i.Id);
+
+        var plQ = await _priceListRepo.GetQueryableAsync();
+        var plMap = plQ.Where(pl => plIds.Contains(pl.Id))
+            .Select(pl => new { pl.Id, pl.Name }).ToList()
+            .ToDictionary(pl => pl.Id);
+
+        Dictionary<Guid, string> customerMap = new();
+        if (customerIds.Any())
+        {
+            var cQ = await _customerRepo.GetQueryableAsync();
+            customerMap = cQ.Where(c => customerIds.Contains(c.Id))
+                .Select(c => new { c.Id, c.Name }).ToList()
+                .ToDictionary(c => c.Id, c => c.Name);
+        }
+
+        Dictionary<Guid, string> supplierMap = new();
+        if (supplierIds.Any())
+        {
+            var sQ = await _supplierRepo.GetQueryableAsync();
+            supplierMap = sQ.Where(s => supplierIds.Contains(s.Id))
+                .Select(s => new { s.Id, s.Name }).ToList()
+                .ToDictionary(s => s.Id, s => s.Name);
+        }
+
+        var dtos = prices.Select(p =>
+        {
+            var dto = new ItemPriceDto
+            {
+                Id = p.Id,
+                ItemId = p.ItemId,
+                PriceListId = p.PriceListId,
+                PriceListRate = p.PriceListRate,
+                Uom = p.Uom,
+                CurrencyCode = p.CurrencyCode,
+                MinQty = p.MinQty,
+                ValidFrom = p.ValidFrom,
+                ValidUpto = p.ValidUpto,
+                CustomerId = p.CustomerId,
+                SupplierId = p.SupplierId,
+                BatchNo = p.BatchNo,
+                IsAutoInserted = p.IsAutoInserted,
+            };
+            if (itemMap.TryGetValue(p.ItemId, out var item))
+            {
+                dto.ItemCode = item.ItemCode;
+                dto.ItemName = item.ItemName;
+            }
+            if (plMap.TryGetValue(p.PriceListId, out var pl))
+                dto.PriceListName = pl.Name;
+            if (p.CustomerId.HasValue && customerMap.TryGetValue(p.CustomerId.Value, out var cn))
+                dto.CustomerName = cn;
+            if (p.SupplierId.HasValue && supplierMap.TryGetValue(p.SupplierId.Value, out var sn))
+                dto.SupplierName = sn;
+            return dto;
+        }).ToList();
+
+        return new PagedResultDto<ItemPriceDto>(totalCount, dtos);
+    }
+
+    public async Task<ItemPriceDto> GetAsync(Guid id)
+    {
+        var p = await _itemPriceRepo.GetAsync(id);
+        var dto = new ItemPriceDto
+        {
+            Id = p.Id,
+            ItemId = p.ItemId,
+            PriceListId = p.PriceListId,
+            PriceListRate = p.PriceListRate,
+            Uom = p.Uom,
+            CurrencyCode = p.CurrencyCode,
+            MinQty = p.MinQty,
+            ValidFrom = p.ValidFrom,
+            ValidUpto = p.ValidUpto,
+            CustomerId = p.CustomerId,
+            SupplierId = p.SupplierId,
+            BatchNo = p.BatchNo,
+            IsAutoInserted = p.IsAutoInserted,
+        };
+        var item = await _itemRepo.FindAsync(p.ItemId);
+        if (item != null) { dto.ItemCode = item.ItemCode; dto.ItemName = item.ItemName; }
+        var pl = await _priceListRepo.FindAsync(p.PriceListId);
+        if (pl != null) dto.PriceListName = pl.Name;
+        return dto;
+    }
+
+    [Authorize(MyERPPermissions.Items.Create)]
+    public async Task<ItemPriceDto> CreateAsync(CreateUpdateItemPriceDto input)
+    {
+        if (input.PriceListRate < 0)
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.AmountMustBePositive)
+                .WithData("field", "PriceListRate");
+        }
+
+        if (input.MinQty < 0)
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.AmountMustBePositive)
+                .WithData("field", "MinQty");
+        }
+
+        if (input.ValidUpto.HasValue && input.ValidFrom.HasValue && input.ValidUpto.Value < input.ValidFrom.Value)
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.InvalidDateRange);
+        }
+
+        var itemValidation = LazyServiceProvider?.LazyGetService<ItemTransactionValidationService>();
+        if (itemValidation != null)
+        {
+            await itemValidation.ValidateItemAsync(input.ItemId);
+        }
+
+        var pl = await _priceListRepo.FindAsync(input.PriceListId);
+        if (pl?.CompanyId != null)
+        {
+            var companyRestriction = LazyServiceProvider?.LazyGetService<Core.DomainServices.CompanyRestrictionValidationService>();
+            if (companyRestriction != null)
+            {
+                await companyRestriction.ValidateTransactionCompanyAsync(
+                    "ItemPrice",
+                    pl.CompanyId.Value,
+                    itemIds: new[] { input.ItemId },
+                    customerIds: input.CustomerId.HasValue ? new[] { input.CustomerId.Value } : null,
+                    supplierIds: input.SupplierId.HasValue ? new[] { input.SupplierId.Value } : null);
+            }
+        }
+
+        var price = new ItemPrice(
+            GuidGenerator.Create(),
+            input.ItemId,
+            input.PriceListId,
+            input.PriceListRate,
+            input.Uom,
+            input.CurrencyCode,
+            CurrentTenant.Id)
+        {
+            MinQty = input.MinQty,
+            ValidFrom = input.ValidFrom,
+            ValidUpto = input.ValidUpto,
+            CustomerId = input.CustomerId,
+            SupplierId = input.SupplierId,
+            BatchNo = input.BatchNo,
+        };
+
+        await _itemPriceRepo.InsertAsync(price);
+
+        var activityLogRepo = LazyServiceProvider?.LazyGetService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        if (activityLogRepo != null)
+        {
+            await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+                GuidGenerator.Create(), "ItemPrice", price.Id,
+                "Created", Guid.Empty,
+                price.PriceListRate.ToString("F2"), "Draft", "Active", CurrentUser.Id,
+                $"Item price for item {input.ItemId.ToString()[..8]} created with rate {price.PriceListRate}", CurrentTenant.Id));
+        }
+
+        return await GetAsync(price.Id);
+    }
+
+    [Authorize(MyERPPermissions.Items.Edit)]
+    public async Task<ItemPriceDto> UpdateAsync(Guid id, CreateUpdateItemPriceDto input)
+    {
+        if (input.PriceListRate < 0)
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.AmountMustBePositive)
+                .WithData("field", "PriceListRate");
+        }
+
+        if (input.MinQty < 0)
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.AmountMustBePositive)
+                .WithData("field", "MinQty");
+        }
+
+        if (input.ValidUpto.HasValue && input.ValidFrom.HasValue && input.ValidUpto.Value < input.ValidFrom.Value)
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.InvalidDateRange);
+        }
+
+        var price = await _itemPriceRepo.GetAsync(id);
+
+        var pl = await _priceListRepo.FindAsync(input.PriceListId);
+        if (pl?.CompanyId != null)
+        {
+            var companyRestriction = LazyServiceProvider?.LazyGetService<Core.DomainServices.CompanyRestrictionValidationService>();
+            if (companyRestriction != null)
+            {
+                await companyRestriction.ValidateTransactionCompanyAsync(
+                    "ItemPrice",
+                    pl.CompanyId.Value,
+                    itemIds: new[] { input.ItemId },
+                    customerIds: input.CustomerId.HasValue ? new[] { input.CustomerId.Value } : null,
+                    supplierIds: input.SupplierId.HasValue ? new[] { input.SupplierId.Value } : null);
+            }
+        }
+        price.PriceListRate = input.PriceListRate;
+        price.MinQty = input.MinQty;
+        price.ValidFrom = input.ValidFrom;
+        price.ValidUpto = input.ValidUpto;
+        price.CustomerId = input.CustomerId;
+        price.SupplierId = input.SupplierId;
+        price.BatchNo = input.BatchNo;
+        await _itemPriceRepo.UpdateAsync(price);
+
+        var activityLogRepo = LazyServiceProvider?.LazyGetService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        if (activityLogRepo != null)
+        {
+            await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+                GuidGenerator.Create(), "ItemPrice", price.Id,
+                "Updated", Guid.Empty,
+                price.PriceListRate.ToString("F2"), "Active", "Active", CurrentUser.Id,
+                $"Item price for item {price.ItemId.ToString()[..8]} updated with rate {price.PriceListRate}", CurrentTenant.Id));
+        }
+
+        return await GetAsync(price.Id);
+    }
+
+    [Authorize(MyERPPermissions.Items.Delete)]
+    public async Task DeleteAsync(Guid id)
+    {
+        await _itemPriceRepo.DeleteAsync(id);
+    }
+
+    /// <summary>
+    /// Bulk percentage update on all prices in a price list.
+    /// Per ERPNext: enables "increase all prices by X%" workflows.
+    /// </summary>
+    [Authorize(MyERPPermissions.Items.Edit)]
+    public async Task<BulkPriceUpdateResultDto> BulkUpdateAsync(BulkPriceUpdateDto input)
+    {
+        var queryable = await _itemPriceRepo.GetQueryableAsync();
+        var prices = queryable.Where(p => p.PriceListId == input.PriceListId).ToList();
+
+        if (input.ItemGroupId.HasValue)
+        {
+            var itemQ = await _itemRepo.GetQueryableAsync();
+            var itemIdsInGroup = itemQ.Where(i => i.ItemGroupId == input.ItemGroupId.Value)
+                .Select(i => i.Id).ToList();
+            prices = prices.Where(p => itemIdsInGroup.Contains(p.ItemId)).ToList();
+        }
+
+        var multiplier = 1 + (input.PercentageChange / 100m);
+        foreach (var p in prices)
+        {
+            p.PriceListRate = Math.Round(p.PriceListRate * multiplier, 4);
+        }
+
+        await _itemPriceRepo.UpdateManyAsync(prices);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "PriceList", input.PriceListId,
+            "BulkUpdated", Guid.Empty,
+            input.PriceListId.ToString()[..8], "Active", "Active", CurrentUser.Id,
+            $"Bulk updated {prices.Count} item prices in price list by {input.PercentageChange}%", CurrentTenant.Id));
+
+        return new BulkPriceUpdateResultDto
+        {
+            UpdatedCount = prices.Count,
+            PercentageApplied = input.PercentageChange,
+        };
+    }
+}

@@ -1,0 +1,1015 @@
+using System;
+using System.ComponentModel.DataAnnotations;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Accounting.Entities;
+using MyERP.Core.DomainServices;
+using MyERP.Inventory.DomainServices;
+using MyERP.Inventory.Entities;
+using MyERP.Permissions;
+using MyERP.Purchasing.Entities;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+using MyERP.Settings;
+
+namespace MyERP.Purchasing;
+
+[Authorize(MyERPPermissions.PurchaseOrders.Default)]
+public class SubcontractingAppService : ApplicationService, ISubcontractingAppService
+{
+    private readonly IRepository<SubcontractingOrder, Guid> _scoRepository;
+    private readonly IRepository<SubcontractingReceipt, Guid> _scrRepository;
+    private readonly IDocumentNumberGenerator _numberGenerator;
+    private readonly StockValuationService _stockValuationService;
+    private readonly BinService _binService;
+
+    public SubcontractingAppService(
+        IRepository<SubcontractingOrder, Guid> scoRepository,
+        IRepository<SubcontractingReceipt, Guid> scrRepository,
+        IDocumentNumberGenerator numberGenerator,
+        StockValuationService stockValuationService,
+        BinService binService)
+    {
+        _scoRepository = scoRepository;
+        _scrRepository = scrRepository;
+        _numberGenerator = numberGenerator;
+        _stockValuationService = stockValuationService;
+        _binService = binService;
+    }
+
+    // === Subcontracting Order ===
+
+    public async Task<SubcontractingOrderDto> GetOrderAsync(Guid id)
+    {
+        var sco = await _scoRepository.GetAsync(id, includeDetails: true);
+        return ObjectMapper.Map<SubcontractingOrder, SubcontractingOrderDto>(sco);
+    }
+
+    public async Task<PagedResultDto<SubcontractingOrderDto>> GetOrderListAsync(GetScoListDto input)
+    {
+        var query = await _scoRepository.GetQueryableAsync();
+        if (input.Status.HasValue)
+            query = query.Where(s => s.Status == input.Status.Value);
+        if (input.CompanyId.HasValue)
+            query = query.Where(s => s.CompanyId == input.CompanyId.Value);
+
+        var totalCount = query.Count();
+        var items = query.OrderByDescending(s => s.OrderDate)
+            .Skip(input.SkipCount).Take(input.MaxResultCount).ToList();
+
+        return new PagedResultDto<SubcontractingOrderDto>(totalCount, items.Select(ObjectMapper.Map<SubcontractingOrder, SubcontractingOrderDto>).ToList());
+    }
+
+    [Authorize(MyERPPermissions.PurchaseOrders.Create)]
+    public async Task<SubcontractingOrderDto> CreateOrderAsync(CreateSubcontractingOrderDto input)
+    {
+        if (input.Items == null || !input.Items.Any())
+            throw new BusinessException(MyERPDomainErrorCodes.DocumentMustHaveItems);
+
+        var poManager = LazyServiceProvider.LazyGetRequiredService<Purchasing.DomainServices.PurchaseOrderManager>();
+        await poManager.ValidateSupplierEligibilityAsync(input.SupplierId);
+
+        var supplierRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Supplier, Guid>>();
+        var supplier = await supplierRepo.GetAsync(input.SupplierId);
+        if (supplier.RepresentsCompanyId.HasValue && supplier.RepresentsCompanyId.Value == input.CompanyId)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.PartyCannotRepresentOwnCompany);
+        }
+
+        PurchaseOrder? po = null;
+        if (input.PurchaseOrderId.HasValue)
+        {
+            var poRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseOrder, Guid>>();
+            po = await poRepo.FindAsync(input.PurchaseOrderId.Value, includeDetails: true);
+            if (po != null)
+            {
+                if (po.CompanyId != input.CompanyId)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                        .WithData("purchaseOrderCompany", po.CompanyId)
+                        .WithData("orderCompany", input.CompanyId);
+                }
+
+                // Per ERPNext PR #59832: validate PO status, PerReceived, and closed PO item rows
+                var scoManager = LazyServiceProvider.LazyGetRequiredService<DomainServices.SubcontractingManager>();
+                scoManager.ValidateOrderAgainstPurchaseOrder(po, input.Items.Select(i => i.ItemId));
+            }
+        }
+
+        // Per ERPNext PR #58965: Project is carried over from Purchase Order and cannot differ
+        var projectId = input.ProjectId ?? po?.ProjectId;
+        if (po != null && po.ProjectId.HasValue && input.ProjectId.HasValue && input.ProjectId.Value != po.ProjectId.Value)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Subcontracting Order Project cannot differ from Purchase Order Project.");
+        }
+
+
+        var warehouseIds = input.Items.Where(i => i.WarehouseId.HasValue).Select(i => i.WarehouseId!.Value).Distinct().ToList();
+        if (warehouseIds.Count > 0)
+        {
+            var whRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Warehouse, Guid>>();
+            var whQuery = await whRepo.GetQueryableAsync();
+            var warehouses = whQuery.Where(w => warehouseIds.Contains(w.Id)).ToList();
+            foreach (var wh in warehouses)
+            {
+                if (wh.CompanyId != input.CompanyId)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                        .WithData("warehouseCompany", wh.CompanyId)
+                        .WithData("orderCompany", input.CompanyId);
+                }
+            }
+        }
+
+        var itemIds = input.Items.Select(i => i.ItemId).ToArray();
+        var itemValidation = LazyServiceProvider.LazyGetRequiredService<MyERP.Inventory.DomainServices.ItemTransactionValidationService>();
+        await itemValidation.ValidateItemsForTransactionAsync(itemIds);
+
+        var itemRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Item, Guid>>();
+        var itemEntities = (await itemRepo.GetQueryableAsync()).Where(i => itemIds.Contains(i.Id)).ToList();
+        var itemDict = itemEntities.ToDictionary(i => i.Id);
+
+        var templateItemIds = itemEntities
+            .Where(i => i.VariantOfId.HasValue)
+            .Select(i => i.VariantOfId!.Value)
+            .Distinct()
+            .ToList();
+        var templateDict = templateItemIds.Count > 0
+            ? (await itemRepo.GetQueryableAsync()).Where(i => templateItemIds.Contains(i.Id)).ToDictionary(i => i.Id)
+            : new Dictionary<Guid, Item>();
+
+        var bomRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Manufacturing.Entities.BillOfMaterials, Guid>>();
+        var bomQueryable = await bomRepo.GetQueryableAsync();
+
+        for (int i = 0; i < input.Items.Count; i++)
+        {
+            var item = input.Items[i];
+            var itemEntity = itemDict.GetValueOrDefault(item.ItemId);
+            Item? templateItem = itemEntity?.VariantOfId.HasValue == true
+                ? templateDict.GetValueOrDefault(itemEntity.VariantOfId.Value)
+                : null;
+
+            // PR #59373: Auto-resolve BOM; if finished good is a variant, fall back to template BOM
+            if (!item.BomId.HasValue)
+            {
+                if (itemEntity?.DefaultBomId.HasValue == true)
+                {
+                    item.BomId = itemEntity.DefaultBomId.Value;
+                }
+                else if (templateItem?.DefaultBomId.HasValue == true)
+                {
+                    item.BomId = templateItem.DefaultBomId.Value;
+                }
+                else
+                {
+                    var targetItemIds = templateItem != null
+                        ? new[] { item.ItemId, templateItem.Id }
+                        : new[] { item.ItemId };
+                    var defaultBom = bomQueryable
+                        .Where(b => targetItemIds.Contains(b.ItemId) && b.CompanyId == input.CompanyId && b.IsActive)
+                        .OrderByDescending(b => b.ItemId == item.ItemId)
+                        .ThenByDescending(b => b.IsDefault)
+                        .FirstOrDefault();
+                    if (defaultBom != null)
+                    {
+                        item.BomId = defaultBom.Id;
+                    }
+                }
+            }
+
+            if (item.BomId.HasValue)
+            {
+                var bom = await bomRepo.FindAsync(item.BomId.Value);
+                if (bom != null)
+                {
+                    if (bom.CompanyId != input.CompanyId)
+                    {
+                        throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                            .WithData("bomCompany", bom.CompanyId)
+                            .WithData("orderCompany", input.CompanyId);
+                    }
+
+                    // Per ERPNext PR #60689 / commit d95fac279f: Refuse draft or inactive BOMs on subcontracting rows
+                    if (!bom.IsActive)
+                    {
+                        throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                            .WithData("detail", $"Row {i + 1}: Please select an active BOM for Item {itemEntity?.ItemName ?? item.ItemName}.");
+                    }
+
+                    // PR #59373: BOM must belong to finished good or its template item (for variants)
+                    bool isApplicable = bom.ItemId == item.ItemId
+                        || (templateItem != null && bom.ItemId == templateItem.Id);
+                    if (!isApplicable)
+                    {
+                        throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                            .WithData("detail", $"BOM {bom.BomNumber} does not belong to Item {itemEntity?.ItemName ?? item.ItemName}.");
+                    }
+                }
+            }
+        }
+
+        var companyRestriction = LazyServiceProvider.LazyGetRequiredService<MyERP.Core.DomainServices.CompanyRestrictionValidationService>();
+        await companyRestriction.ValidateTransactionCompanyAsync(
+            "SubcontractingOrder", input.CompanyId,
+            itemIds: itemIds,
+            supplierIds: new[] { input.SupplierId },
+            warehouseIds: warehouseIds.Count > 0 ? warehouseIds.ToArray() : null);
+
+        var number = await _numberGenerator.GenerateAsync("SCO", input.CompanyId);
+        var sco = new SubcontractingOrder(GuidGenerator.Create(), input.CompanyId, number,
+            input.OrderDate, input.SupplierId, CurrentTenant.Id)
+        {
+            PurchaseOrderId = input.PurchaseOrderId,
+            ProjectId = projectId,
+            Notes = input.Notes,
+            CurrencyCode = !string.IsNullOrWhiteSpace(input.CurrencyCode) ? input.CurrencyCode : (po?.CurrencyCode ?? "MYR"),
+            ExchangeRate = input.ExchangeRate.HasValue && input.ExchangeRate.Value > 0 ? input.ExchangeRate.Value : (po?.ExchangeRate > 0 ? po.ExchangeRate : 1m),
+        };
+
+        foreach (var item in input.Items)
+        {
+            var poItem = po?.Items.FirstOrDefault(p => p.ItemId == item.ItemId);
+            var itemProjectId = item.ProjectId ?? poItem?.ProjectId ?? projectId;
+            if (poItem != null && poItem.ProjectId.HasValue && item.ProjectId.HasValue && item.ProjectId.Value != poItem.ProjectId.Value)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", "Subcontracting Order Item Project cannot differ from Purchase Order Item Project.");
+            }
+
+            // PR #59334: Convert service cost from PO currency to company currency
+            var serviceCost = item.ServiceCostPerQty;
+            if (serviceCost == 0 && poItem != null)
+            {
+                serviceCost = poItem.UnitPrice * sco.ExchangeRate;
+            }
+
+            var itemRate = item.Rate;
+            if (itemRate == 0 && serviceCost > 0)
+            {
+                itemRate = serviceCost;
+            }
+
+            sco.AddItem(new SubcontractingOrderItem(
+                GuidGenerator.Create(), sco.Id, item.ItemId, item.ItemName, item.Qty, itemRate, itemProjectId, serviceCost)
+            {
+                BomId = item.BomId,
+                WarehouseId = item.WarehouseId,
+                ServiceCostPerQty = serviceCost
+            });
+        }
+
+        await _scoRepository.InsertAsync(sco);
+        return ObjectMapper.Map<SubcontractingOrder, SubcontractingOrderDto>(sco);
+    }
+
+    [Authorize(MyERPPermissions.PurchaseOrders.Submit)]
+    public async Task<SubcontractingOrderDto> SubmitOrderAsync(Guid id)
+    {
+        var sco = await _scoRepository.GetAsync(id, includeDetails: true);
+
+        if (sco.PurchaseOrderId.HasValue)
+        {
+            var poRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseOrder, Guid>>();
+            var po = await poRepo.FindAsync(sco.PurchaseOrderId.Value, includeDetails: true);
+            if (po != null)
+            {
+                var scoManager = LazyServiceProvider.LazyGetRequiredService<DomainServices.SubcontractingManager>();
+                scoManager.ValidateOrderAgainstPurchaseOrder(po, sco.Items.Select(i => i.ItemId));
+            }
+        }
+
+        // Populate RM requirements (SuppliedItems) from BOM explosion on first submit.
+        // Without this, SuppliedItems stays empty forever: ValidateTransferQuantityAsync
+        // (called from StockEntryAppService.SubmitAsync for every "Send to Subcontractor"
+        // entry) sums an empty list to a required qty of 0, so ANY transfer qty > 0 exceeds
+        // "remaining" and hard-blocks with OverTransfer — every RM transfer against every
+        // SCO fails unconditionally. Also reserves the required qty in Bin so
+        // CloseOrderAsync's existing release-on-close logic has something real to release.
+        if (!sco.SuppliedItems.Any())
+        {
+            var rmService = LazyServiceProvider.LazyGetRequiredService<DomainServices.SubcontractingRmTransferService>();
+            var requirements = await rmService.CalculateRmRequirementsAsync(id);
+            foreach (var req in requirements)
+            {
+                var reserveWarehouseId = req.SourceWarehouseId ?? req.WarehouseId;
+                sco.AddSuppliedItem(new SubcontractingOrderSuppliedItem(
+                    GuidGenerator.Create(), sco.Id, req.ItemId, req.ItemName ?? string.Empty, req.RequiredQty)
+                { ReserveWarehouseId = reserveWarehouseId });
+
+                if (reserveWarehouseId.HasValue)
+                {
+                    await _binService.UpdateReservedQtyForSubContractAsync(
+                        req.ItemId, reserveWarehouseId.Value, req.RequiredQty);
+                }
+            }
+        }
+
+        sco.Submit();
+        await _scoRepository.UpdateAsync(sco);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "SubcontractingOrder", sco.Id,
+            "Submitted", sco.CompanyId,
+            sco.OrderNumber, "Draft", "Submitted", CurrentUser.Id,
+            $"Subcontracting Order {sco.OrderNumber} submitted", CurrentTenant.Id));
+
+        return ObjectMapper.Map<SubcontractingOrder, SubcontractingOrderDto>(sco);
+    }
+
+    [Authorize(MyERPPermissions.PurchaseOrders.Cancel)]
+    public async Task<SubcontractingOrderDto> CancelOrderAsync(Guid id)
+    {
+        var sco = await _scoRepository.GetAsync(id, includeDetails: true);
+        sco.Cancel();
+        await _scoRepository.UpdateAsync(sco);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "SubcontractingOrder", sco.Id,
+            "Cancelled", sco.CompanyId,
+            sco.OrderNumber, sco.Status.ToString(), "Cancelled", CurrentUser.Id,
+            $"Subcontracting Order {sco.OrderNumber} cancelled", CurrentTenant.Id));
+
+        return ObjectMapper.Map<SubcontractingOrder, SubcontractingOrderDto>(sco);
+    }
+
+    /// <summary>
+    /// Close an open/partially-received SCO, releasing RM reservation for unreceived supplied items.
+    /// Per upstream PR #57463: pending RM reservation must be released on close.
+    /// </summary>
+    [Authorize(MyERPPermissions.PurchaseOrders.Edit)]
+    public async Task<SubcontractingOrderDto> CloseOrderAsync(Guid id)
+    {
+        var sco = await _scoRepository.GetAsync(id, includeDetails: true);
+        sco.Close();
+
+        // Release RM reservation for unreceived supplied items
+        foreach (var item in sco.SuppliedItems)
+        {
+            var pendingQty = Math.Max(0, item.RequiredQty - item.ConsumedQty);
+            if (pendingQty > 0 && item.ReserveWarehouseId.HasValue)
+            {
+                await _binService.UpdateReservedQtyForSubContractAsync(
+                    item.ItemId, item.ReserveWarehouseId.Value, -pendingQty);
+            }
+        }
+
+        await _scoRepository.UpdateAsync(sco);
+        return ObjectMapper.Map<SubcontractingOrder, SubcontractingOrderDto>(sco);
+    }
+
+    /// <summary>
+    /// Reopens a closed Subcontracting Order and re-reserves RM in Bin for pending supplied items (Gotcha #5993).
+    /// </summary>
+    [Authorize(MyERPPermissions.PurchaseOrders.Edit)]
+    public async Task<SubcontractingOrderDto> ReopenOrderAsync(Guid id)
+    {
+        var sco = await _scoRepository.GetAsync(id, includeDetails: true);
+        sco.Reopen();
+
+        // Re-apply RM reservation for unconsumed supplied items
+        foreach (var item in sco.SuppliedItems)
+        {
+            var pendingQty = Math.Max(0, item.RequiredQty - item.ConsumedQty);
+            if (pendingQty > 0 && item.ReserveWarehouseId.HasValue)
+            {
+                await _binService.UpdateReservedQtyForSubContractAsync(
+                    item.ItemId, item.ReserveWarehouseId.Value, pendingQty);
+            }
+        }
+
+        await _scoRepository.UpdateAsync(sco);
+
+        var activityLogRepo = LazyServiceProvider?.LazyGetService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        if (activityLogRepo != null)
+        {
+            await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+                GuidGenerator?.Create() ?? Guid.NewGuid(), "SubcontractingOrder", sco.Id,
+                "Reopened", sco.CompanyId,
+                sco.OrderNumber, "Closed", sco.Status.ToString(), CurrentUser?.Id,
+                $"Subcontracting Order {sco.OrderNumber} reopened", CurrentTenant?.Id));
+        }
+
+        return new SubcontractingOrderDto
+        {
+            Id = sco.Id,
+            OrderNumber = sco.OrderNumber,
+            OrderDate = sco.OrderDate,
+            SupplierId = sco.SupplierId,
+            CompanyId = sco.CompanyId,
+            NetTotal = sco.NetTotal,
+            GrandTotal = sco.GrandTotal,
+            Status = sco.Status,
+            PerReceived = sco.PerReceived,
+            SupplierWarehouseId = sco.SupplierWarehouseId,
+            Items = sco.Items.Select(i => new ScoItemDto
+            {
+                Id = i.Id,
+                ItemId = i.ItemId,
+                ItemName = i.ItemName,
+                Qty = i.Qty,
+                Rate = i.Rate,
+                ReceivedQty = i.ReceivedQty
+            }).ToList()
+        };
+    }
+
+    /// <summary>
+    /// Computes summary metrics for a Subcontracting Order (Gotcha #5993).
+    /// </summary>
+    [Authorize(MyERPPermissions.PurchaseOrders.Default)]
+    public async Task<SubcontractingOrderSummaryDto> GetOrderSummaryAsync(Guid id)
+    {
+        var sco = await _scoRepository.GetAsync(id, includeDetails: true);
+        return new SubcontractingOrderSummaryDto
+        {
+            Id = sco.Id,
+            OrderNumber = sco.OrderNumber,
+            Status = (int)sco.Status,
+            NetTotal = sco.NetTotal,
+            PerReceived = sco.PerReceived,
+            TotalItemsCount = sco.Items.Count,
+            TotalSuppliedItemsCount = sco.SuppliedItems.Count,
+            TotalOrderedQty = sco.Items.Sum(i => i.Qty),
+            TotalReceivedQty = sco.Items.Sum(i => i.ReceivedQty),
+            CanReopen = sco.Status == SubcontractingOrderStatus.Closed,
+            CanClose = sco.Status is SubcontractingOrderStatus.Open or SubcontractingOrderStatus.PartiallyReceived,
+            CanCancel = sco.Status is not (SubcontractingOrderStatus.Cancelled or SubcontractingOrderStatus.Completed)
+        };
+    }
+
+    /// <summary>
+    /// Creates a Draft Stock Entry (SendToSubcontractor) with pending RM items from the SCO's BOM.
+    /// Per ERPNext make_rm_stock_entry: resolves RM requirements, caps at pending qty, creates SE.
+    /// </summary>
+    [Authorize(MyERPPermissions.StockEntries.Create)]
+    public async Task<RmTransferResultDto> CreateRmTransferStockEntryAsync(Guid scoId)
+    {
+        var sco = await _scoRepository.GetAsync(scoId, includeDetails: true);
+        if (sco.Status == SubcontractingOrderStatus.Draft || sco.Status == SubcontractingOrderStatus.Cancelled)
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("status", sco.Status.ToString());
+
+        var rmService = LazyServiceProvider.LazyGetRequiredService<DomainServices.SubcontractingRmTransferService>();
+        var requirements = await rmService.CalculateRmRequirementsAsync(scoId);
+
+        var pendingItems = requirements.Where(r => r.PendingQty > 0).ToList();
+        if (!pendingItems.Any())
+            throw new Volo.Abp.BusinessException("MyERP:10013");
+
+        var seRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<StockEntry, Guid>>();
+        var number = await _numberGenerator.GenerateAsync("SE", sco.CompanyId);
+        var se = new StockEntry(GuidGenerator.Create(), sco.CompanyId,
+            Inventory.StockEntryType.SendToSubcontractor, DateTime.UtcNow.Date, CurrentTenant.Id)
+        { EntryNumber = number, SubcontractingOrderId = sco.Id };
+
+        foreach (var rm in pendingItems)
+        {
+            se.AddItem(rm.ItemId, rm.PendingQty,
+                sourceWarehouseId: rm.SourceWarehouseId ?? rm.WarehouseId,
+                targetWarehouseId: sco.SupplierWarehouseId,
+                valuationRate: null);
+        }
+
+        await seRepo.InsertAsync(se);
+
+        return new RmTransferResultDto
+        {
+            StockEntryId = se.Id,
+            EntryNumber = number,
+            ItemCount = pendingItems.Count,
+            TotalQty = pendingItems.Sum(i => i.PendingQty),
+        };
+    }
+
+    // === Subcontracting Receipt ===
+
+    [Authorize(MyERPPermissions.PurchaseReceipts.Create)]
+    public async Task<SubcontractingReceiptDto> CreateReceiptAsync(CreateSubcontractingReceiptDto input)
+    {
+        if (input.Items == null || !input.Items.Any())
+            throw new BusinessException(MyERPDomainErrorCodes.DocumentMustHaveItems);
+
+        var supplierRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Supplier, Guid>>();
+        var supplier = await supplierRepo.GetAsync(input.SupplierId);
+        if (supplier.RepresentsCompanyId.HasValue && supplier.RepresentsCompanyId.Value == input.CompanyId)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.PartyCannotRepresentOwnCompany);
+        }
+
+        SubcontractingOrder? sco = null;
+        if (input.SubcontractingOrderId != Guid.Empty)
+        {
+            sco = await _scoRepository.FindAsync(input.SubcontractingOrderId, includeDetails: true);
+            if (sco != null && sco.CompanyId != input.CompanyId)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                    .WithData("subcontractingOrderCompany", sco.CompanyId)
+                    .WithData("receiptCompany", input.CompanyId);
+            }
+        }
+
+        // Per ERPNext PR #58965: Project is carried over from Subcontracting Order and cannot differ
+        var projectId = input.ProjectId ?? sco?.ProjectId;
+        if (sco != null && sco.ProjectId.HasValue && input.ProjectId.HasValue && input.ProjectId.Value != sco.ProjectId.Value)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Subcontracting Receipt Project cannot differ from Subcontracting Order Project.");
+        }
+
+        var receiptWarehouseIds = input.Items.Where(i => i.WarehouseId.HasValue).Select(i => i.WarehouseId!.Value)
+            .Concat(input.WarehouseId.HasValue ? new[] { input.WarehouseId.Value } : Array.Empty<Guid>())
+            .Distinct()
+            .ToList();
+        if (receiptWarehouseIds.Count > 0)
+        {
+            var whRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Warehouse, Guid>>();
+            var whQuery = await whRepo.GetQueryableAsync();
+            var warehouses = whQuery.Where(w => receiptWarehouseIds.Contains(w.Id)).ToList();
+            foreach (var wh in warehouses)
+            {
+                if (wh.CompanyId != input.CompanyId)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                        .WithData("warehouseCompany", wh.CompanyId)
+                        .WithData("receiptCompany", input.CompanyId);
+                }
+            }
+        }
+
+        var costCenterIds = input.Items.Where(i => i.CostCenterId.HasValue).Select(i => i.CostCenterId!.Value).Distinct().ToList();
+        if (costCenterIds.Count > 0)
+        {
+            var ccRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<CostCenter, Guid>>();
+            var ccQuery = await ccRepo.GetQueryableAsync();
+            var costCenters = ccQuery.Where(c => costCenterIds.Contains(c.Id)).ToList();
+            foreach (var cc in costCenters)
+            {
+                if (cc.CompanyId != input.CompanyId)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                        .WithData("costCenterCompany", cc.CompanyId)
+                        .WithData("receiptCompany", input.CompanyId);
+                }
+            }
+        }
+
+        var accountIds = input.Items.Where(i => i.ExpenseAccountId.HasValue).Select(i => i.ExpenseAccountId!.Value)
+            .Concat(input.Items.Where(i => i.ServiceExpenseAccountId.HasValue).Select(i => i.ServiceExpenseAccountId!.Value))
+            .Distinct()
+            .ToList();
+        if (accountIds.Count > 0)
+        {
+            var accRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Account, Guid>>();
+            var accQuery = await accRepo.GetQueryableAsync();
+            var accounts = accQuery.Where(a => accountIds.Contains(a.Id)).ToList();
+            foreach (var acc in accounts)
+            {
+                if (acc.CompanyId != input.CompanyId)
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.CompanyMismatch)
+                        .WithData("accountCompany", acc.CompanyId)
+                        .WithData("receiptCompany", input.CompanyId);
+                }
+            }
+        }
+
+        var receiptItemIds = input.Items.Select(i => i.ItemId).ToArray();
+        var itemValidation = LazyServiceProvider.LazyGetRequiredService<MyERP.Inventory.DomainServices.ItemTransactionValidationService>();
+        await itemValidation.ValidateItemsForTransactionAsync(receiptItemIds);
+
+        var companyRestriction = LazyServiceProvider.LazyGetRequiredService<MyERP.Core.DomainServices.CompanyRestrictionValidationService>();
+        await companyRestriction.ValidateTransactionCompanyAsync(
+            "SubcontractingReceipt", input.CompanyId,
+            itemIds: receiptItemIds,
+            supplierIds: new[] { input.SupplierId },
+            warehouseIds: receiptWarehouseIds.Count > 0 ? receiptWarehouseIds.ToArray() : null);
+
+        var number = await _numberGenerator.GenerateAsync("SCR", input.CompanyId);
+        var scr = new SubcontractingReceipt(GuidGenerator.Create(), input.CompanyId, number,
+            input.PostingDate, input.SupplierId, input.SubcontractingOrderId, CurrentTenant.Id)
+        {
+            WarehouseId = input.WarehouseId,
+            ProjectId = projectId
+        };
+
+        PurchaseOrder? po = null;
+        if (sco?.PurchaseOrderId.HasValue == true)
+        {
+            var poRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<PurchaseOrder, Guid>>();
+            po = await poRepo.FindAsync(sco.PurchaseOrderId.Value, includeDetails: true);
+        }
+
+        foreach (var item in input.Items)
+        {
+            var scoItem = sco?.Items.FirstOrDefault(s => s.ItemId == item.ItemId);
+            var poItem = po?.Items.FirstOrDefault(p => p.ItemId == item.ItemId);
+            var itemProjectId = item.ProjectId ?? scoItem?.ProjectId ?? poItem?.ProjectId ?? projectId;
+            if (scoItem != null && scoItem.ProjectId.HasValue && item.ProjectId.HasValue && item.ProjectId.Value != scoItem.ProjectId.Value)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", "Subcontracting Receipt Item Project cannot differ from Subcontracting Order Item Project.");
+            }
+            if (poItem != null && poItem.ProjectId.HasValue && item.ProjectId.HasValue && item.ProjectId.Value != poItem.ProjectId.Value)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", "Subcontracting Receipt Item Project cannot differ from Purchase Order Item Project.");
+            }
+
+            scr.AddItem(new SubcontractingReceiptItem(
+                GuidGenerator.Create(), scr.Id, item.ItemId, item.ItemName, item.Qty, item.Rate, itemProjectId)
+            {
+                WarehouseId = item.WarehouseId,
+                CostCenterId = item.CostCenterId,
+                ExpenseAccountId = item.ExpenseAccountId,
+                ServiceExpenseAccountId = item.ServiceExpenseAccountId,
+                SecondaryItemType = item.SecondaryItemType,
+                ValuationType = item.ValuationType,
+                CostAllocationPercentage = item.CostAllocationPercentage,
+                BomSecondaryItemId = item.BomSecondaryItemId
+            });
+        }
+
+        await _scrRepository.InsertAsync(scr);
+        return ObjectMapper.Map<SubcontractingReceipt, SubcontractingReceiptDto>(scr);
+    }
+
+    [Authorize(MyERPPermissions.PurchaseReceipts.Submit)]
+    public async Task<SubcontractingReceiptDto> SubmitReceiptAsync(Guid id)
+    {
+        var scr = await _scrRepository.GetAsync(id, includeDetails: true);
+
+        // Validate receipt against SCO (qty caps, status guard) via domain service
+        var scManager = LazyServiceProvider.LazyGetRequiredService<MyERP.Purchasing.DomainServices.SubcontractingManager>();
+        await scManager.ValidateReceiptAgainstOrderAsync(scr);
+
+        scr.Submit();
+
+        // Stock-in for received finished goods
+        foreach (var item in scr.Items)
+        {
+            var warehouseId = item.WarehouseId ?? scr.WarehouseId
+                ?? throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.MissingWarehouse);
+
+            await _stockValuationService.CreateLedgerEntryAsync(
+                scr.CompanyId, item.ItemId, warehouseId, scr.PostingDate,
+                item.Qty, item.Rate, "SubcontractingReceipt", scr.Id, scr.TenantId);
+
+            await _binService.ApplyStockMovementAsync(item.ItemId, warehouseId, item.Qty, item.Qty * item.Rate);
+        }
+
+        // Update linked SCO fulfillment via domain service (replaces inline logic)
+        await scManager.UpdateOrderOnReceiptAsync(scr, reverse: false);
+
+        // RM consumption: calculate and track consumed quantities
+        // Per ERPNext subcontracting_controller: RM consumed proportional to received FG qty
+        // Per ERPNext PR #46892 / commit 7479e1ec32: backflush setting is ignored on returns
+        var totalReceivedFgQty = scr.Items.Sum(i => i.Qty);
+        var sco = await _scoRepository.GetAsync(scr.SubcontractingOrderId);
+        var backflushSetting = await SettingProvider.GetOrNullAsync(
+            MyERPSettings.Buying.BackflushSubcontractBasedOn) ?? "BOM";
+        var rmConsumptions = scManager.CalculateRmConsumption(sco, totalReceivedFgQty, backflushSetting, scr.IsReturn);
+
+        // Per ERPNext PR #61505: validate batches on Subcontracting Receipt items and supplied items.
+        // Supplied items only check for disabled/cancelled batches (expiry is not checked for raw material return/consumption).
+        var batchRepo = LazyServiceProvider.LazyGetService<IRepository<Batch, Guid>>();
+        if (batchRepo != null)
+        {
+            foreach (var item in scr.Items.Where(i => i.BatchId.HasValue))
+            {
+                var batch = await batchRepo.FindAsync(item.BatchId!.Value);
+                if (batch != null)
+                {
+                    if (batch.IsDisabled || batch.IsCancelled)
+                    {
+                        throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                            .WithData("detail", $"Batch {batch.BatchNo} is disabled and cannot be used.");
+                    }
+                    if (!scr.IsReturn && batch.IsExpired(scr.PostingDate))
+                    {
+                        throw new BusinessException(MyERPDomainErrorCodes.BatchExpired)
+                            .WithData("batchNo", batch.BatchNo);
+                    }
+                }
+            }
+
+            foreach (var rm in rmConsumptions.Where(r => r.BatchId.HasValue && r.ConsumedQty != 0))
+            {
+                var batch = await batchRepo.FindAsync(rm.BatchId!.Value);
+                if (batch != null && (batch.IsDisabled || batch.IsCancelled))
+                {
+                    throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                        .WithData("detail", $"Batch {batch.BatchNo} for supplied item is disabled and cannot be used.");
+                }
+            }
+        }
+
+        foreach (var rm in rmConsumptions)
+        {
+            if (rm.ConsumedQty == 0 || !rm.WarehouseId.HasValue) continue;
+
+            // Update SCO supplied item consumed qty
+            var suppliedItem = sco.SuppliedItems.FirstOrDefault(si => si.ItemId == rm.ItemId);
+            if (suppliedItem != null)
+            {
+                suppliedItem.ConsumedQty += rm.ConsumedQty;
+            }
+
+            // Create SLE for RM consumption (stock-out from supplier warehouse if positive, stock-in if negative)
+            await _stockValuationService.CreateLedgerEntryAsync(
+                scr.CompanyId, rm.ItemId, rm.WarehouseId.Value, scr.PostingDate,
+                -rm.ConsumedQty, 0, "SubcontractingReceipt", scr.Id, scr.TenantId);
+
+            await _binService.ApplyStockMovementAsync(rm.ItemId, rm.WarehouseId.Value, -rm.ConsumedQty, 0);
+        }
+
+        await _scoRepository.UpdateAsync(sco);
+
+        // GL posting: DR Stock, CR Stock Received But Not Billed (perpetual inventory)
+        var postingOrchestrator = LazyServiceProvider.LazyGetRequiredService<MyERP.Accounting.DomainServices.DocumentPostingOrchestrator>();
+        await postingOrchestrator.PostPurchaseReceiptAsync(scr);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "SubcontractingReceipt", scr.Id,
+            "Submitted", scr.CompanyId,
+            scr.ReceiptNumber, "Draft", "Submitted", CurrentUser.Id,
+            $"Subcontracting Receipt {scr.ReceiptNumber} submitted", CurrentTenant.Id));
+
+        await _scrRepository.UpdateAsync(scr);
+        return ObjectMapper.Map<SubcontractingReceipt, SubcontractingReceiptDto>(scr);
+    }
+
+    [Authorize(MyERPPermissions.PurchaseReceipts.Cancel)]
+    public async Task<SubcontractingReceiptDto> CancelReceiptAsync(Guid id)
+    {
+        var scr = await _scrRepository.GetAsync(id, includeDetails: true);
+        scr.Cancel();
+
+        // Reverse stock-in for FG items
+        foreach (var item in scr.Items)
+        {
+            var warehouseId = item.WarehouseId ?? scr.WarehouseId;
+            if (warehouseId.HasValue)
+            {
+                await _stockValuationService.CreateLedgerEntryAsync(
+                    scr.CompanyId, item.ItemId, warehouseId.Value, scr.PostingDate,
+                    -item.Qty, item.Rate, "SubcontractingReceipt", scr.Id, scr.TenantId);
+
+                await _binService.ApplyStockMovementAsync(item.ItemId, warehouseId.Value, -item.Qty, -(item.Qty * item.Rate));
+            }
+        }
+
+        // Reverse SCO fulfillment via domain service
+        var scManager = LazyServiceProvider.LazyGetRequiredService<MyERP.Purchasing.DomainServices.SubcontractingManager>();
+        await scManager.UpdateOrderOnReceiptAsync(scr, reverse: true);
+
+        // Reverse RM consumption
+        var totalReceivedFgQty = scr.Items.Sum(i => i.Qty);
+        var sco = await _scoRepository.GetAsync(scr.SubcontractingOrderId);
+        var backflushSetting = await SettingProvider.GetOrNullAsync(
+            MyERPSettings.Buying.BackflushSubcontractBasedOn) ?? "BOM";
+        var rmConsumptions = scManager.CalculateRmConsumption(sco, totalReceivedFgQty, backflushSetting, scr.IsReturn);
+
+        foreach (var rm in rmConsumptions)
+        {
+            if (rm.ConsumedQty == 0 || !rm.WarehouseId.HasValue) continue;
+
+            var suppliedItem = sco.SuppliedItems.FirstOrDefault(si => si.ItemId == rm.ItemId);
+            if (suppliedItem != null)
+            {
+                suppliedItem.ConsumedQty = Math.Max(0, suppliedItem.ConsumedQty - rm.ConsumedQty);
+            }
+
+            // Reverse SLE for RM consumption (stock back in / out)
+            await _stockValuationService.CreateLedgerEntryAsync(
+                scr.CompanyId, rm.ItemId, rm.WarehouseId.Value, scr.PostingDate,
+                rm.ConsumedQty, 0, "SubcontractingReceipt", scr.Id, scr.TenantId);
+
+            await _binService.ApplyStockMovementAsync(rm.ItemId, rm.WarehouseId.Value, rm.ConsumedQty, 0);
+        }
+
+        await _scoRepository.UpdateAsync(sco);
+
+        // Reverse GL entries for the receipt
+        var postingOrchestrator = LazyServiceProvider.LazyGetRequiredService<MyERP.Accounting.DomainServices.DocumentPostingOrchestrator>();
+        await postingOrchestrator.ReversePleForDocumentAsync("SubcontractingReceipt", scr.Id);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "SubcontractingReceipt", scr.Id,
+            "Cancelled", scr.CompanyId,
+            scr.ReceiptNumber, "Submitted", "Cancelled", CurrentUser.Id,
+            $"Subcontracting Receipt {scr.ReceiptNumber} cancelled", CurrentTenant.Id));
+
+        await _scrRepository.UpdateAsync(scr);
+        return ObjectMapper.Map<SubcontractingReceipt, SubcontractingReceiptDto>(scr);
+    }
+
+    /// <summary>
+    /// Creates a return Subcontracting Receipt against an original submitted receipt (Gotcha #5997).
+    /// </summary>
+    [Authorize(MyERPPermissions.PurchaseReceipts.Create)]
+    public async Task<SubcontractingReceiptDto> CreateReceiptReturnAsync(CreateSubcontractingReceiptReturnDto input)
+    {
+        var original = await _scrRepository.GetAsync(input.ReturnAgainstReceiptId, includeDetails: true);
+        if (original.Status != SubcontractingReceiptStatus.Submitted)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("detail", "Cannot create a return against a non-submitted Subcontracting Receipt.");
+        }
+
+        if (original.IsReturn)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition)
+                .WithData("detail", "Cannot create a return against another return Subcontracting Receipt.");
+        }
+
+        if (input.Items == null || !input.Items.Any())
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.DocumentMustHaveItems);
+        }
+
+        var allReceiptsQuery = await _scrRepository.GetQueryableAsync();
+        var priorReturns = allReceiptsQuery
+            .Where(r => r.ReturnAgainstReceiptId == original.Id && r.Status != SubcontractingReceiptStatus.Cancelled)
+            .ToList();
+
+        var priorReturnedByItem = priorReturns
+            .SelectMany(r => r.Items)
+            .GroupBy(i => i.ItemId)
+            .ToDictionary(g => g.Key, g => g.Sum(i => Math.Abs(i.Qty)));
+
+        var originalItemsByItem = original.Items.ToDictionary(i => i.ItemId);
+
+        foreach (var retItem in input.Items)
+        {
+            if (!originalItemsByItem.TryGetValue(retItem.ItemId, out var origItem))
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Item {retItem.ItemId} does not exist in original receipt.");
+            }
+
+            var priorReturned = priorReturnedByItem.GetValueOrDefault(retItem.ItemId, 0m);
+            var maxReturnable = origItem.Qty - priorReturned;
+
+            if (retItem.Qty > maxReturnable)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ReturnQtyExceedsOriginal)
+                    .WithData("itemId", retItem.ItemId)
+                    .WithData("returnQty", retItem.Qty)
+                    .WithData("maxReturnable", maxReturnable);
+            }
+        }
+
+        var number = await _numberGenerator.GenerateAsync("SCR-RET", original.CompanyId);
+        var returnReceipt = new SubcontractingReceipt(
+            Guid.NewGuid(),
+            original.CompanyId,
+            number,
+            input.PostingDate,
+            original.SupplierId,
+            original.SubcontractingOrderId,
+            original.TenantId)
+        {
+            IsReturn = true,
+            ReturnAgainstReceiptId = original.Id,
+            WarehouseId = original.WarehouseId,
+            ProjectId = original.ProjectId
+        };
+
+        foreach (var retItem in input.Items)
+        {
+            var origItem = originalItemsByItem[retItem.ItemId];
+            var negativeQty = -Math.Abs(retItem.Qty);
+            returnReceipt.AddItem(new SubcontractingReceiptItem(
+                Guid.NewGuid(),
+                returnReceipt.Id,
+                retItem.ItemId,
+                retItem.ItemName,
+                negativeQty,
+                // Per ERPNext PR #59597 / commit c7917bfc3e: value returns strictly at original receipt rate
+                origItem.Rate,
+                origItem.ProjectId)
+            {
+                WarehouseId = retItem.WarehouseId ?? origItem.WarehouseId ?? original.WarehouseId,
+                CostCenterId = origItem.CostCenterId,
+                ExpenseAccountId = origItem.ExpenseAccountId,
+                ServiceExpenseAccountId = origItem.ServiceExpenseAccountId,
+                SecondaryItemType = origItem.SecondaryItemType,
+                ValuationType = origItem.ValuationType,
+                CostAllocationPercentage = origItem.CostAllocationPercentage,
+                BomSecondaryItemId = origItem.BomSecondaryItemId
+            });
+        }
+
+        await _scrRepository.InsertAsync(returnReceipt, autoSave: true);
+        return new SubcontractingReceiptDto
+        {
+            Id = returnReceipt.Id,
+            ReceiptNumber = returnReceipt.ReceiptNumber,
+            PostingDate = returnReceipt.PostingDate,
+            SupplierId = returnReceipt.SupplierId,
+            SubcontractingOrderId = returnReceipt.SubcontractingOrderId,
+            NetTotal = returnReceipt.NetTotal,
+            Status = returnReceipt.Status,
+            IsReturn = returnReceipt.IsReturn,
+            ReturnAgainstReceiptId = returnReceipt.ReturnAgainstReceiptId,
+            Items = returnReceipt.Items.Select(i => new SubcontractingReceiptItemDto
+            {
+                Id = i.Id,
+                ItemId = i.ItemId,
+                ItemName = i.ItemName,
+                Qty = i.Qty,
+                Rate = i.Rate,
+                Amount = i.Amount,
+                WarehouseId = i.WarehouseId,
+                ExpenseAccountId = i.ExpenseAccountId,
+                ServiceExpenseAccountId = i.ServiceExpenseAccountId,
+                CostCenterId = i.CostCenterId,
+                SecondaryItemType = i.SecondaryItemType,
+                ValuationType = i.ValuationType,
+                CostAllocationPercentage = i.CostAllocationPercentage,
+                BomSecondaryItemId = i.BomSecondaryItemId,
+            }).ToList()
+        };
+    }
+
+    /// <summary>
+    /// Lists Subcontracting Receipts (including returns) created against a given Subcontracting Order,
+    /// newest first — needed by the UI to offer a return against a specific submitted receipt.
+    /// </summary>
+    [Authorize(MyERPPermissions.PurchaseReceipts.Default)]
+    public async Task<List<SubcontractingReceiptDto>> GetReceiptsForOrderAsync(Guid subcontractingOrderId)
+    {
+        var query = await _scrRepository.WithDetailsAsync(r => r.Items);
+        var receipts = query
+            .Where(r => r.SubcontractingOrderId == subcontractingOrderId)
+            .OrderByDescending(r => r.CreationTime)
+            .ToList();
+
+        return receipts.Select(scr => new SubcontractingReceiptDto
+        {
+            Id = scr.Id,
+            ReceiptNumber = scr.ReceiptNumber,
+            PostingDate = scr.PostingDate,
+            SupplierId = scr.SupplierId,
+            SubcontractingOrderId = scr.SubcontractingOrderId,
+            NetTotal = scr.NetTotal,
+            Status = scr.Status,
+            IsReturn = scr.IsReturn,
+            ReturnAgainstReceiptId = scr.ReturnAgainstReceiptId,
+            Items = scr.Items.Select(i => new SubcontractingReceiptItemDto
+            {
+                Id = i.Id,
+                ItemId = i.ItemId,
+                ItemName = i.ItemName,
+                Qty = i.Qty,
+                Rate = i.Rate,
+                Amount = i.Amount,
+                WarehouseId = i.WarehouseId,
+                ExpenseAccountId = i.ExpenseAccountId,
+                ServiceExpenseAccountId = i.ServiceExpenseAccountId,
+                CostCenterId = i.CostCenterId,
+                SecondaryItemType = i.SecondaryItemType,
+                ValuationType = i.ValuationType,
+                CostAllocationPercentage = i.CostAllocationPercentage,
+                BomSecondaryItemId = i.BomSecondaryItemId,
+            }).ToList()
+        }).ToList();
+    }
+
+    /// <summary>
+    /// Computes summary metrics for a Subcontracting Receipt (Gotcha #5997).
+    /// </summary>
+    [Authorize(MyERPPermissions.PurchaseReceipts.Default)]
+    public async Task<SubcontractingReceiptSummaryDto> GetReceiptSummaryAsync(Guid id)
+    {
+        var scr = await _scrRepository.GetAsync(id, includeDetails: true);
+        string? returnAgainstNumber = null;
+        if (scr.ReturnAgainstReceiptId.HasValue)
+        {
+            var orig = await _scrRepository.FindAsync(scr.ReturnAgainstReceiptId.Value);
+            returnAgainstNumber = orig?.ReceiptNumber;
+        }
+
+        return new SubcontractingReceiptSummaryDto
+        {
+            Id = scr.Id,
+            ReceiptNumber = scr.ReceiptNumber,
+            Status = (int)scr.Status,
+            NetTotal = scr.NetTotal,
+            TotalReceivedQty = scr.Items.Sum(i => i.Qty),
+            TotalItemsCount = scr.Items.Count,
+            IsReturn = scr.IsReturn,
+            ReturnAgainstReceiptId = scr.ReturnAgainstReceiptId,
+            ReturnAgainstReceiptNumber = returnAgainstNumber
+        };
+    }
+}

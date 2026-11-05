@@ -1,0 +1,819 @@
+using System;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.Extensions.DependencyInjection;
+using MyERP.Accounting;
+using MyERP.Accounting.Entities;
+using MyERP.Core;
+using MyERP.Core.Entities;
+using MyERP.HumanResources;
+using MyERP.HumanResources.Entities;
+using MyERP.Inventory;
+using MyERP.Inventory.Entities;
+using Volo.Abp.Data;
+using Volo.Abp.DependencyInjection;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Guids;
+
+namespace MyERP.Data;
+
+/// <summary>
+/// Seeds default master data required for the ERP to function.
+/// Runs after MalaysiaDataSeederContributor.
+/// Creates: Item Groups, Modes of Payment, Price Lists, Salary Components,
+/// Fiscal Year, Cost Center, Warehouses.
+/// </summary>
+public class DefaultDataSeeder : IDataSeedContributor, ITransientDependency
+{
+    private readonly IRepository<ItemGroup, Guid> _itemGroupRepository;
+    private readonly IRepository<ModeOfPayment, Guid> _mopRepository;
+    private readonly IRepository<PriceList, Guid> _priceListRepository;
+    private readonly IRepository<SalaryComponent, Guid> _salaryComponentRepository;
+    private readonly IRepository<FiscalYear, Guid> _fiscalYearRepository;
+    private readonly IRepository<CostCenter, Guid> _costCenterRepository;
+    private readonly IRepository<Warehouse, Guid> _warehouseRepository;
+    private readonly IRepository<Company, Guid> _companyRepository;
+    private readonly IRepository<PaymentTermsTemplate, Guid> _paymentTermsRepository;
+    private readonly IRepository<LeaveType, Guid> _leaveTypeRepository;
+    private readonly IRepository<HolidayList, Guid> _holidayListRepository;
+    private readonly IRepository<AccountingRule, Guid> _accountingRuleRepository;
+    private readonly IRepository<Account, Guid> _accountRepository;
+    private readonly IRepository<Manufacturing.Entities.ManufacturingSettings, Guid> _mfgSettingsRepository;
+    private readonly IRepository<Territory, Guid> _territoryRepository;
+    private readonly IRepository<CustomerGroup, Guid> _customerGroupRepository;
+    private readonly IRepository<SupplierGroup, Guid> _supplierGroupRepository;
+    private readonly IRepository<Uom, Guid> _uomRepository;
+    private readonly IRepository<UomConversion, Guid> _uomConversionRepository;
+    private readonly IRepository<CurrencyExchange, Guid> _currencyExchangeRepository;
+    private readonly IRepository<FinancialReportTemplate, Guid> _reportTemplateRepository;
+    private readonly IRepository<PartyType, Guid> _partyTypeRepository;
+    private readonly MalaysianCoaSeeder _coaSeeder;
+    private readonly IGuidGenerator _guidGenerator;
+    private readonly IServiceProvider _serviceProvider;
+
+    public DefaultDataSeeder(
+        IRepository<ItemGroup, Guid> itemGroupRepository,
+        IRepository<ModeOfPayment, Guid> mopRepository,
+        IRepository<PriceList, Guid> priceListRepository,
+        IRepository<SalaryComponent, Guid> salaryComponentRepository,
+        IRepository<FiscalYear, Guid> fiscalYearRepository,
+        IRepository<CostCenter, Guid> costCenterRepository,
+        IRepository<Warehouse, Guid> warehouseRepository,
+        IRepository<Company, Guid> companyRepository,
+        IRepository<PaymentTermsTemplate, Guid> paymentTermsRepository,
+        IRepository<LeaveType, Guid> leaveTypeRepository,
+        IRepository<HolidayList, Guid> holidayListRepository,
+        IRepository<AccountingRule, Guid> accountingRuleRepository,
+        IRepository<Account, Guid> accountRepository,
+        IRepository<Manufacturing.Entities.ManufacturingSettings, Guid> mfgSettingsRepository,
+        IRepository<Territory, Guid> territoryRepository,
+        IRepository<CustomerGroup, Guid> customerGroupRepository,
+        IRepository<SupplierGroup, Guid> supplierGroupRepository,
+        IRepository<Uom, Guid> uomRepository,
+        IRepository<UomConversion, Guid> uomConversionRepository,
+        IRepository<CurrencyExchange, Guid> currencyExchangeRepository,
+        IRepository<FinancialReportTemplate, Guid> reportTemplateRepository,
+        IRepository<PartyType, Guid> partyTypeRepository,
+        MalaysianCoaSeeder coaSeeder,
+        IGuidGenerator guidGenerator,
+        IServiceProvider serviceProvider)
+    {
+        _itemGroupRepository = itemGroupRepository;
+        _mopRepository = mopRepository;
+        _priceListRepository = priceListRepository;
+        _salaryComponentRepository = salaryComponentRepository;
+        _fiscalYearRepository = fiscalYearRepository;
+        _costCenterRepository = costCenterRepository;
+        _warehouseRepository = warehouseRepository;
+        _companyRepository = companyRepository;
+        _paymentTermsRepository = paymentTermsRepository;
+        _leaveTypeRepository = leaveTypeRepository;
+        _holidayListRepository = holidayListRepository;
+        _accountingRuleRepository = accountingRuleRepository;
+        _accountRepository = accountRepository;
+        _mfgSettingsRepository = mfgSettingsRepository;
+        _territoryRepository = territoryRepository;
+        _customerGroupRepository = customerGroupRepository;
+        _supplierGroupRepository = supplierGroupRepository;
+        _uomRepository = uomRepository;
+        _uomConversionRepository = uomConversionRepository;
+        _currencyExchangeRepository = currencyExchangeRepository;
+        _reportTemplateRepository = reportTemplateRepository;
+        _partyTypeRepository = partyTypeRepository;
+        _coaSeeder = coaSeeder;
+        _guidGenerator = guidGenerator;
+        _serviceProvider = serviceProvider;
+    }
+
+    public async Task SeedAsync(DataSeedContext context)
+    {
+        await SeedItemGroupsAsync();
+        await SeedModesOfPaymentAsync();
+        await SeedPriceListsAsync();
+        await SeedSalaryComponentsAsync();
+        await SeedPaymentTermsAsync();
+        await SeedLeaveTypesAsync();
+        await SeedDefaultCompanyDataAsync();
+        await SeedHolidaysAsync();
+        await SeedAccountingRulesAsync();
+        await SeedTerritoriesAsync();
+        await SeedCustomerGroupsAsync();
+        await SeedSupplierGroupsAsync();
+        await SeedUomDataAsync();
+        await SeedPeggedCurrenciesAsync();
+        await SeedFinancialReportTemplatesAsync();
+        await SeedPartyTypesAsync();
+        await SeedEmailTemplatesAsync();
+        await GrantAdminPosProfilePermissionsAsync();
+    }
+
+    /// <summary>
+    /// PosProfileAppService had no [Authorize] or PolicyName wiring at all until this fix — any
+    /// authenticated user could create/edit/enable/disable POS profiles (which control GL
+    /// accounts, tax templates, and payment methods for POS transactions). ABP does not
+    /// retroactively grant newly-added permissions to existing roles, so the admin role needs
+    /// this backfilled explicitly or POS Profile management becomes inaccessible to everyone,
+    /// including admin, the moment the new permission starts being enforced.
+    /// </summary>
+    private async Task GrantAdminPosProfilePermissionsAsync()
+    {
+        var permissionManager = _serviceProvider.GetRequiredService<Volo.Abp.PermissionManagement.IPermissionManager>();
+        // Domain can't reference MyERP.Application.Contracts (MyERPPermissions lives there) —
+        // these string literals must stay in sync with MyERPPermissions.PosProfiles.*.
+        var permissions = new[]
+        {
+            "MyERP.PosProfiles",
+            "MyERP.PosProfiles.Create",
+            "MyERP.PosProfiles.Edit",
+            "MyERP.PosProfiles.Delete",
+        };
+        foreach (var permission in permissions)
+        {
+            var grant = await permissionManager.GetAsync(permission, "R", "admin");
+            if (!grant.IsGranted)
+            {
+                await permissionManager.SetAsync(permission, "R", "admin", true);
+            }
+        }
+    }
+
+    private async Task SeedItemGroupsAsync()
+    {
+        if (await _itemGroupRepository.GetCountAsync() > 0) return;
+
+        var root = new ItemGroup(_guidGenerator.Create(), "All Item Groups", isGroup: true);
+        await _itemGroupRepository.InsertAsync(root, autoSave: true);
+
+        await _itemGroupRepository.InsertAsync(new ItemGroup(_guidGenerator.Create(), "Products", parentId: root.Id), autoSave: true);
+        await _itemGroupRepository.InsertAsync(new ItemGroup(_guidGenerator.Create(), "Raw Material", parentId: root.Id), autoSave: true);
+        await _itemGroupRepository.InsertAsync(new ItemGroup(_guidGenerator.Create(), "Services", parentId: root.Id), autoSave: true);
+        await _itemGroupRepository.InsertAsync(new ItemGroup(_guidGenerator.Create(), "Sub Assemblies", parentId: root.Id), autoSave: true);
+        await _itemGroupRepository.InsertAsync(new ItemGroup(_guidGenerator.Create(), "Consumable", parentId: root.Id), autoSave: true);
+    }
+
+    private async Task SeedModesOfPaymentAsync()
+    {
+        if (await _mopRepository.GetCountAsync() > 0) return;
+
+        await _mopRepository.InsertAsync(new ModeOfPayment(_guidGenerator.Create(), "Cash", "Cash"), autoSave: true);
+        await _mopRepository.InsertAsync(new ModeOfPayment(_guidGenerator.Create(), "Credit Card", "Bank"), autoSave: true);
+        await _mopRepository.InsertAsync(new ModeOfPayment(_guidGenerator.Create(), "Wire Transfer", "Bank"), autoSave: true);
+        await _mopRepository.InsertAsync(new ModeOfPayment(_guidGenerator.Create(), "Bank Draft", "Bank"), autoSave: true);
+        await _mopRepository.InsertAsync(new ModeOfPayment(_guidGenerator.Create(), "Cheque", "Bank"), autoSave: true);
+    }
+
+    private async Task SeedPriceListsAsync()
+    {
+        if (await _priceListRepository.GetCountAsync() > 0) return;
+
+        await _priceListRepository.InsertAsync(
+            new PriceList(_guidGenerator.Create(), "Standard Selling", "MYR", isSelling: true, isBuying: false) { IsDefault = true },
+            autoSave: true);
+        await _priceListRepository.InsertAsync(
+            new PriceList(_guidGenerator.Create(), "Standard Buying", "MYR", isSelling: false, isBuying: true) { IsDefault = true },
+            autoSave: true);
+    }
+
+    private async Task SeedSalaryComponentsAsync()
+    {
+        if (await _salaryComponentRepository.GetCountAsync() > 0) return;
+
+        // Earnings
+        await _salaryComponentRepository.InsertAsync(new SalaryComponent(
+            _guidGenerator.Create(), "Basic Salary", SalaryComponentType.Earning)
+            { Abbreviation = "B", IsTaxApplicable = true }, autoSave: true);
+        await _salaryComponentRepository.InsertAsync(new SalaryComponent(
+            _guidGenerator.Create(), "Housing Allowance", SalaryComponentType.Earning)
+            { Abbreviation = "HRA", IsTaxApplicable = true }, autoSave: true);
+        await _salaryComponentRepository.InsertAsync(new SalaryComponent(
+            _guidGenerator.Create(), "Transport Allowance", SalaryComponentType.Earning)
+            { Abbreviation = "TA", IsTaxApplicable = true }, autoSave: true);
+        await _salaryComponentRepository.InsertAsync(new SalaryComponent(
+            _guidGenerator.Create(), "Overtime", SalaryComponentType.Earning)
+            { Abbreviation = "OT", IsTaxApplicable = true, DependsOnPaymentDays = false }, autoSave: true);
+
+        // Statutory Deductions
+        await _salaryComponentRepository.InsertAsync(new SalaryComponent(
+            _guidGenerator.Create(), "EPF Employee", SalaryComponentType.Deduction)
+            { Abbreviation = "EPFE", IsStatutory = true }, autoSave: true);
+        await _salaryComponentRepository.InsertAsync(new SalaryComponent(
+            _guidGenerator.Create(), "EPF Employer", SalaryComponentType.Deduction)
+            { Abbreviation = "EPFR", IsStatutory = true }, autoSave: true);
+        await _salaryComponentRepository.InsertAsync(new SalaryComponent(
+            _guidGenerator.Create(), "SOCSO Employee", SalaryComponentType.Deduction)
+            { Abbreviation = "SOCE", IsStatutory = true }, autoSave: true);
+        await _salaryComponentRepository.InsertAsync(new SalaryComponent(
+            _guidGenerator.Create(), "SOCSO Employer", SalaryComponentType.Deduction)
+            { Abbreviation = "SOCR", IsStatutory = true }, autoSave: true);
+        await _salaryComponentRepository.InsertAsync(new SalaryComponent(
+            _guidGenerator.Create(), "EIS Employee", SalaryComponentType.Deduction)
+            { Abbreviation = "EISE", IsStatutory = true }, autoSave: true);
+        await _salaryComponentRepository.InsertAsync(new SalaryComponent(
+            _guidGenerator.Create(), "EIS Employer", SalaryComponentType.Deduction)
+            { Abbreviation = "EISR", IsStatutory = true }, autoSave: true);
+        await _salaryComponentRepository.InsertAsync(new SalaryComponent(
+            _guidGenerator.Create(), "PCB/MTD", SalaryComponentType.Deduction)
+            { Abbreviation = "PCB", IsStatutory = true }, autoSave: true);
+    }
+
+    private async Task SeedPaymentTermsAsync()
+    {
+        if (await _paymentTermsRepository.GetCountAsync() > 0) return;
+
+        // Due on Receipt
+        var dueOnReceipt = new PaymentTermsTemplate(_guidGenerator.Create(), "Due on Receipt");
+        dueOnReceipt.AddTerm(new PaymentTerm(_guidGenerator.Create(), dueOnReceipt.Id, 100m, 0, "Due on Receipt"));
+        await _paymentTermsRepository.InsertAsync(dueOnReceipt, autoSave: true);
+
+        // Net 30
+        var net30 = new PaymentTermsTemplate(_guidGenerator.Create(), "Net 30");
+        net30.AddTerm(new PaymentTerm(_guidGenerator.Create(), net30.Id, 100m, 30, "Net 30"));
+        await _paymentTermsRepository.InsertAsync(net30, autoSave: true);
+
+        // Net 60
+        var net60 = new PaymentTermsTemplate(_guidGenerator.Create(), "Net 60");
+        net60.AddTerm(new PaymentTerm(_guidGenerator.Create(), net60.Id, 100m, 60, "Net 60"));
+        await _paymentTermsRepository.InsertAsync(net60, autoSave: true);
+
+        // 50% Advance + 50% Net 30
+        var split = new PaymentTermsTemplate(_guidGenerator.Create(), "50% Advance, 50% Net 30");
+        split.AddTerm(new PaymentTerm(_guidGenerator.Create(), split.Id, 50m, 0, "Advance"));
+        split.AddTerm(new PaymentTerm(_guidGenerator.Create(), split.Id, 50m, 30, "Balance"));
+        await _paymentTermsRepository.InsertAsync(split, autoSave: true);
+    }
+
+    private async Task SeedDefaultCompanyDataAsync()
+    {
+        var companies = await _companyRepository.GetListAsync();
+        foreach (var company in companies)
+        {
+            // Seed Chart of Accounts
+            await _coaSeeder.SeedAsync(company.Id);
+
+            // Assign default accounts from seeded CoA
+            await AssignDefaultAccountsAsync(company);
+
+            // Seed Default Fiscal Year (if none exists for this company)
+            if (!await _fiscalYearRepository.AnyAsync(f => f.CompanyId == company.Id))
+            {
+                var currentYear = DateTime.UtcNow.Year;
+                var fy = new FiscalYear(
+                    _guidGenerator.Create(), company.Id,
+                    $"FY {currentYear}-{currentYear + 1}",
+                    new DateTime(currentYear, 1, 1),
+                    new DateTime(currentYear, 12, 31));
+                await _fiscalYearRepository.InsertAsync(fy, autoSave: true);
+            }
+
+            // Seed Default Cost Center
+            if (!await _costCenterRepository.AnyAsync(c => c.CompanyId == company.Id))
+            {
+                var root = new CostCenter(_guidGenerator.Create(), company.Id, company.Name, isGroup: true);
+                await _costCenterRepository.InsertAsync(root, autoSave: true);
+
+                var main = new CostCenter(_guidGenerator.Create(), company.Id, "Main", parentId: root.Id);
+                await _costCenterRepository.InsertAsync(main, autoSave: true);
+            }
+
+            // Seed Default Warehouses (hierarchy per ERPNext Company.create_default_warehouses)
+            if (!await _warehouseRepository.AnyAsync(w => w.CompanyId == company.Id))
+            {
+                // Root group warehouse (parent of all others)
+                var allWarehouses = new Warehouse(
+                    _guidGenerator.Create(), company.Id, "All Warehouses") { IsGroup = true, IsActive = true };
+                await _warehouseRepository.InsertAsync(allWarehouses, autoSave: true);
+
+                // Child warehouses under root
+                var stores = await _warehouseRepository.InsertAsync(new Warehouse(
+                    _guidGenerator.Create(), company.Id, "Stores")
+                    { ParentWarehouseId = allWarehouses.Id, IsActive = true }, autoSave: true);
+                var fgWarehouse = await _warehouseRepository.InsertAsync(new Warehouse(
+                    _guidGenerator.Create(), company.Id, "Finished Goods")
+                    { ParentWarehouseId = allWarehouses.Id, IsActive = true }, autoSave: true);
+                var wipWarehouse = await _warehouseRepository.InsertAsync(new Warehouse(
+                    _guidGenerator.Create(), company.Id, "Work In Progress")
+                    { ParentWarehouseId = allWarehouses.Id, IsActive = true }, autoSave: true);
+                await _warehouseRepository.InsertAsync(new Warehouse(
+                    _guidGenerator.Create(), company.Id, "Goods In Transit")
+                    { ParentWarehouseId = allWarehouses.Id, IsActive = true,
+                      WarehouseType = WarehouseType.Transit }, autoSave: true);
+
+                // Assign warehouse defaults to company (per PR #57571)
+                company.DefaultWarehouseId = stores.Id;
+                company.DefaultFgWarehouseId = fgWarehouse.Id;
+                company.DefaultWipWarehouseId = wipWarehouse.Id;
+            }
+
+            // Seed Manufacturing Settings (per-company singleton)
+            if (!await _mfgSettingsRepository.AnyAsync(s => s.CompanyId == company.Id))
+            {
+                await _mfgSettingsRepository.InsertAsync(
+                    new Manufacturing.Entities.ManufacturingSettings(
+                        _guidGenerator.Create(), company.Id), autoSave: true);
+            }
+        }
+    }
+
+    private async Task AssignDefaultAccountsAsync(Company company)
+    {
+        if (company.DefaultReceivableAccountId.HasValue) return; // Already assigned
+
+        var accounts = (await _accountRepository.GetQueryableAsync())
+            .Where(a => a.CompanyId == company.Id)
+            .ToList();
+
+        Account? FindByCode(string code) => accounts.FirstOrDefault(a => a.AccountCode == code);
+
+        company.DefaultReceivableAccountId = FindByCode("1130")?.Id;    // Accounts Receivable
+        company.DefaultPayableAccountId = FindByCode("2110")?.Id;       // Accounts Payable
+        company.DefaultIncomeAccountId = FindByCode("4100")?.Id;        // Sales Revenue
+        company.DefaultExpenseAccountId = FindByCode("5100")?.Id;       // Cost of Goods Sold
+        company.DefaultBankAccountId = FindByCode("1120")?.Id;          // Bank Accounts
+        company.DefaultInventoryAccountId = FindByCode("1140")?.Id;     // Inventory
+        company.DepreciationExpenseAccountId = FindByCode("5500")?.Id;  // Depreciation Expense
+        company.AccumulatedDepreciationAccountId = FindByCode("1220")?.Id; // Accumulated Depreciation
+        company.ExchangeGainLossAccountId = FindByCode("4900")?.Id          // Exchange Gain/Loss
+            ?? FindByCode("7100")?.Id;                                        // Fallback: Other Income
+        company.DefaultStockAdjustmentAccountId = FindByCode("3900")?.Id;   // Temporary Opening
+        company.DefaultWipAccountId = FindByCode("1145")?.Id;               // Work In Progress
+
+        await _companyRepository.UpdateAsync(company, autoSave: true);
+    }
+
+    private async Task SeedLeaveTypesAsync()
+    {
+        if (await _leaveTypeRepository.GetCountAsync() > 0) return;
+
+        // Malaysian standard leave types (Employment Act 1955)
+        await _leaveTypeRepository.InsertAsync(new LeaveType(
+            _guidGenerator.Create(), "Annual Leave", 12) { IsPaidLeave = true, AllowCarryForward = true, MaxCarryForwardDays = 5 }, autoSave: true);
+        await _leaveTypeRepository.InsertAsync(new LeaveType(
+            _guidGenerator.Create(), "Sick Leave", 14) { IsPaidLeave = true }, autoSave: true);
+        await _leaveTypeRepository.InsertAsync(new LeaveType(
+            _guidGenerator.Create(), "Hospitalization Leave", 60) { IsPaidLeave = true }, autoSave: true);
+        await _leaveTypeRepository.InsertAsync(new LeaveType(
+            _guidGenerator.Create(), "Maternity Leave", 98) { IsPaidLeave = true }, autoSave: true);
+        await _leaveTypeRepository.InsertAsync(new LeaveType(
+            _guidGenerator.Create(), "Paternity Leave", 7) { IsPaidLeave = true }, autoSave: true);
+        await _leaveTypeRepository.InsertAsync(new LeaveType(
+            _guidGenerator.Create(), "Unpaid Leave", 30) { IsPaidLeave = false, AllowNegativeBalance = true }, autoSave: true);
+        await _leaveTypeRepository.InsertAsync(new LeaveType(
+            _guidGenerator.Create(), "Compassionate Leave", 3) { IsPaidLeave = true }, autoSave: true);
+    }
+
+    private async Task SeedHolidaysAsync()
+    {
+        if (await _holidayListRepository.GetCountAsync() > 0) return;
+
+        var companies = await _companyRepository.GetListAsync();
+        var currentYear = DateTime.UtcNow.Year;
+
+        foreach (var company in companies)
+        {
+            var list = new HolidayList(
+                _guidGenerator.Create(), company.Id,
+                $"Malaysia Public Holidays {currentYear}", currentYear)
+            { IsDefault = true, WeeklyOff = "Saturday,Sunday" };
+
+            // Malaysian public holidays (gazetted)
+            list.AddHoliday(new Holiday(_guidGenerator.Create(), list.Id, new DateTime(currentYear, 1, 1), "New Year's Day"));
+            list.AddHoliday(new Holiday(_guidGenerator.Create(), list.Id, new DateTime(currentYear, 2, 1), "Federal Territory Day"));
+            list.AddHoliday(new Holiday(_guidGenerator.Create(), list.Id, new DateTime(currentYear, 2, 1), "Thaipusam"));
+            list.AddHoliday(new Holiday(_guidGenerator.Create(), list.Id, new DateTime(currentYear, 4, 10), "Hari Raya Aidilfitri"));
+            list.AddHoliday(new Holiday(_guidGenerator.Create(), list.Id, new DateTime(currentYear, 4, 11), "Hari Raya Aidilfitri (2nd Day)"));
+            list.AddHoliday(new Holiday(_guidGenerator.Create(), list.Id, new DateTime(currentYear, 5, 1), "Labour Day"));
+            list.AddHoliday(new Holiday(_guidGenerator.Create(), list.Id, new DateTime(currentYear, 5, 12), "Wesak Day"));
+            list.AddHoliday(new Holiday(_guidGenerator.Create(), list.Id, new DateTime(currentYear, 6, 3), "Yang di-Pertuan Agong Birthday"));
+            list.AddHoliday(new Holiday(_guidGenerator.Create(), list.Id, new DateTime(currentYear, 6, 17), "Hari Raya Haji"));
+            list.AddHoliday(new Holiday(_guidGenerator.Create(), list.Id, new DateTime(currentYear, 7, 7), "Awal Muharram"));
+            list.AddHoliday(new Holiday(_guidGenerator.Create(), list.Id, new DateTime(currentYear, 8, 31), "Merdeka Day"));
+            list.AddHoliday(new Holiday(_guidGenerator.Create(), list.Id, new DateTime(currentYear, 9, 16), "Malaysia Day"));
+            list.AddHoliday(new Holiday(_guidGenerator.Create(), list.Id, new DateTime(currentYear, 9, 15), "Mawlid Nabi"));
+            list.AddHoliday(new Holiday(_guidGenerator.Create(), list.Id, new DateTime(currentYear, 10, 31), "Deepavali"));
+            list.AddHoliday(new Holiday(_guidGenerator.Create(), list.Id, new DateTime(currentYear, 12, 25), "Christmas Day"));
+
+            await _holidayListRepository.InsertAsync(list, autoSave: true);
+        }
+    }
+
+    /// <summary>
+    /// Seeds default GL posting rules for core document types.
+    /// These rules drive the AccountingRuleEngine to create proper journal entries.
+    /// Rules follow standard double-entry accounting:
+    /// - Sales Invoice: DR Receivable, CR Revenue, CR Tax Payable
+    /// - Purchase Invoice: DR Expense/Stock, CR Payable, DR Tax Receivable
+    /// - Payment Entry: DR Bank/Cash, CR Receivable (receive) or DR Payable, CR Bank (pay)
+    /// - Delivery Note: DR COGS, CR Stock (perpetual inventory)
+    /// - Purchase Receipt: DR Stock, CR Stock Received But Not Billed
+    /// </summary>
+    private async Task SeedAccountingRulesAsync()
+    {
+        if (await _accountingRuleRepository.GetCountAsync() > 0) return;
+
+        var companies = await _companyRepository.GetListAsync();
+
+        foreach (var company in companies)
+        {
+            // Sales Invoice: DR Accounts Receivable (GrandTotal)
+            await _accountingRuleRepository.InsertAsync(new AccountingRule(
+                _guidGenerator.Create(), company.Id, "SI - Debit Receivable",
+                "SalesInvoice", true, AccountSource.CustomerReceivable, AmountSource.GrandTotal)
+            { SortOrder = 1, Description = "Debit customer receivable account" }, autoSave: true);
+
+            // Sales Invoice: CR Revenue (NetTotal)
+            await _accountingRuleRepository.InsertAsync(new AccountingRule(
+                _guidGenerator.Create(), company.Id, "SI - Credit Revenue",
+                "SalesInvoice", false, AccountSource.ItemIncome, AmountSource.NetTotal)
+            { SortOrder = 2, Description = "Credit revenue/income account" }, autoSave: true);
+
+            // Sales Invoice: CR Tax Payable (TaxAmount)
+            await _accountingRuleRepository.InsertAsync(new AccountingRule(
+                _guidGenerator.Create(), company.Id, "SI - Credit Tax Payable",
+                "SalesInvoice", false, AccountSource.TaxPayable, AmountSource.TaxAmount)
+            { SortOrder = 3, Description = "Credit SST/tax payable account" }, autoSave: true);
+
+            // Purchase Invoice: DR Expense/Stock (NetTotal)
+            await _accountingRuleRepository.InsertAsync(new AccountingRule(
+                _guidGenerator.Create(), company.Id, "PI - Debit Expense",
+                "PurchaseInvoice", true, AccountSource.ItemExpense, AmountSource.NetTotal)
+            { SortOrder = 1, Description = "Debit expense/stock account" }, autoSave: true);
+
+            // Purchase Invoice: CR Accounts Payable (GrandTotal)
+            await _accountingRuleRepository.InsertAsync(new AccountingRule(
+                _guidGenerator.Create(), company.Id, "PI - Credit Payable",
+                "PurchaseInvoice", false, AccountSource.SupplierPayable, AmountSource.GrandTotal)
+            { SortOrder = 2, Description = "Credit supplier payable account" }, autoSave: true);
+
+            // Payment Entry: DR Bank (GrandTotal) — for received payments
+            await _accountingRuleRepository.InsertAsync(new AccountingRule(
+                _guidGenerator.Create(), company.Id, "PE - Debit Bank",
+                "PaymentEntry", true, AccountSource.FixedAccount, AmountSource.GrandTotal)
+            { SortOrder = 1, Description = "Debit bank/cash account (payment received)" }, autoSave: true);
+
+            // Payment Entry: CR Receivable (GrandTotal)
+            await _accountingRuleRepository.InsertAsync(new AccountingRule(
+                _guidGenerator.Create(), company.Id, "PE - Credit Receivable",
+                "PaymentEntry", false, AccountSource.CustomerReceivable, AmountSource.GrandTotal)
+            { SortOrder = 2, Description = "Credit receivable (payment received)" }, autoSave: true);
+
+            // Delivery Note: DR COGS (StockCostTotal) — perpetual inventory
+            // Per ERPNext: COGS GL uses actual consumed stock cost, NOT selling price
+            await _accountingRuleRepository.InsertAsync(new AccountingRule(
+                _guidGenerator.Create(), company.Id, "DN - Debit COGS",
+                "DeliveryNote", true, AccountSource.ItemExpense, AmountSource.StockCostTotal)
+            { SortOrder = 1, Description = "Debit Cost of Goods Sold" }, autoSave: true);
+
+            // Delivery Note: CR Stock In Hand (StockCostTotal)
+            await _accountingRuleRepository.InsertAsync(new AccountingRule(
+                _guidGenerator.Create(), company.Id, "DN - Credit Stock",
+                "DeliveryNote", false, AccountSource.FixedAccount, AmountSource.StockCostTotal)
+            { SortOrder = 2, Description = "Credit Stock In Hand (perpetual inventory)" }, autoSave: true);
+
+            // Purchase Receipt: DR Stock In Hand (NetTotal - actually wait, PR uses NetTotal for stock? No, we should use NetTotal since we want to balance against SRBNB which we change to PurchaseExpenseTotal? Wait, SRBNB is Credit PurchaseExpenseTotal. So Debit Stock should also be PurchaseExpenseTotal to balance!)
+            await _accountingRuleRepository.InsertAsync(new AccountingRule(
+                _guidGenerator.Create(), company.Id, "PR - Debit Stock",
+                "PurchaseReceipt", true, AccountSource.WarehouseStock, AmountSource.PurchaseExpenseTotal)
+            { SortOrder = 1, Description = "Debit Stock In Hand" }, autoSave: true);
+
+            // Purchase Receipt: CR Stock Received But Not Billed (PurchaseExpenseTotal)
+            await _accountingRuleRepository.InsertAsync(new AccountingRule(
+                _guidGenerator.Create(), company.Id, "PR - Credit SRBNB",
+                "PurchaseReceipt", false, AccountSource.FixedAccount, AmountSource.PurchaseExpenseTotal)
+            { SortOrder = 2, Description = "Credit Stock Received But Not Billed" }, autoSave: true);
+        }
+    }
+
+    private async Task SeedTerritoriesAsync()
+    {
+        if (await _territoryRepository.GetCountAsync() > 0) return;
+
+        var root = new Territory(_guidGenerator.Create(), "All Territories", isGroup: true);
+        await _territoryRepository.InsertAsync(root, autoSave: true);
+
+        await _territoryRepository.InsertAsync(
+            new Territory(_guidGenerator.Create(), "Malaysia", parentId: root.Id), autoSave: true);
+        await _territoryRepository.InsertAsync(
+            new Territory(_guidGenerator.Create(), "Rest Of The World", parentId: root.Id), autoSave: true);
+    }
+
+    private async Task SeedCustomerGroupsAsync()
+    {
+        if (await _customerGroupRepository.GetCountAsync() > 0) return;
+
+        var root = new CustomerGroup(_guidGenerator.Create(), "All Customer Groups", isGroup: true);
+        await _customerGroupRepository.InsertAsync(root, autoSave: true);
+
+        await _customerGroupRepository.InsertAsync(
+            new CustomerGroup(_guidGenerator.Create(), "Individual", parentId: root.Id), autoSave: true);
+        await _customerGroupRepository.InsertAsync(
+            new CustomerGroup(_guidGenerator.Create(), "Commercial", parentId: root.Id), autoSave: true);
+        await _customerGroupRepository.InsertAsync(
+            new CustomerGroup(_guidGenerator.Create(), "Government", parentId: root.Id), autoSave: true);
+    }
+
+    private async Task SeedSupplierGroupsAsync()
+    {
+        if (await _supplierGroupRepository.GetCountAsync() > 0) return;
+
+        var root = new SupplierGroup(_guidGenerator.Create(), "All Supplier Groups", isGroup: true);
+        await _supplierGroupRepository.InsertAsync(root, autoSave: true);
+
+        await _supplierGroupRepository.InsertAsync(
+            new SupplierGroup(_guidGenerator.Create(), "Local", parentId: root.Id), autoSave: true);
+        await _supplierGroupRepository.InsertAsync(
+            new SupplierGroup(_guidGenerator.Create(), "Overseas", parentId: root.Id), autoSave: true);
+    }
+
+    /// <summary>
+    /// Seeds standard UOMs + common conversion factors.
+    /// Per ERPNext: loaded from uom_data.json + uom_conversion_data.json.
+    /// </summary>
+    private async Task SeedUomDataAsync()
+    {
+        if (await _uomRepository.GetCountAsync() > 0) return;
+
+        // Core UOMs (with MustBeWholeNumber where applicable)
+        var uoms = new (string Name, bool WholeNumber, string? Category)[]
+        {
+            ("Unit", true, "Unit"), ("Nos", true, "Unit"), ("Pair", true, "Unit"), ("Set", true, "Unit"),
+            ("Dozen", true, "Unit"), ("Box", true, "Unit"), ("Pallet", true, "Unit"), ("Pack", true, "Unit"),
+            ("Kg", false, "Mass"), ("Gram", false, "Mass"), ("Tonne", false, "Mass"), ("Pound", false, "Mass"), ("Ounce", false, "Mass"),
+            ("Metre", false, "Length"), ("Centimetre", false, "Length"), ("Millimetre", false, "Length"), ("Inch", false, "Length"), ("Foot", false, "Length"),
+            ("Litre", false, "Volume"), ("Millilitre", false, "Volume"), ("Gallon", false, "Volume"),
+            ("Square Metre", false, "Area"), ("Square Foot", false, "Area"),
+            ("Hour", false, "Time"), ("Minute", false, "Time"), ("Day", false, "Time"),
+            ("Roll", true, "Unit"), ("Sheet", true, "Unit"), ("Bag", true, "Unit"), ("Bottle", true, "Unit"),
+            ("Carton", true, "Unit"), ("Bundle", true, "Unit"), ("Drum", true, "Unit"),
+        };
+
+        foreach (var (name, wholeNumber, category) in uoms)
+        {
+            await _uomRepository.InsertAsync(
+                new Uom(_guidGenerator.Create(), name) { MustBeWholeNumber = wholeNumber, Category = category },
+                autoSave: true);
+        }
+
+        // Standard conversion factors
+        var conversions = new (string From, string To, decimal Factor)[]
+        {
+            ("Kg", "Gram", 1000m), ("Tonne", "Kg", 1000m), ("Pound", "Kg", 0.453592m), ("Ounce", "Gram", 28.3495m),
+            ("Metre", "Centimetre", 100m), ("Metre", "Millimetre", 1000m), ("Foot", "Inch", 12m), ("Metre", "Foot", 3.28084m),
+            ("Litre", "Millilitre", 1000m), ("Gallon", "Litre", 3.78541m),
+            ("Square Metre", "Square Foot", 10.7639m),
+            ("Hour", "Minute", 60m), ("Day", "Hour", 8m), // 8-hour working day
+            ("Dozen", "Unit", 12m),
+        };
+
+        foreach (var (from, to, factor) in conversions)
+        {
+            await _uomConversionRepository.InsertAsync(
+                new UomConversion(_guidGenerator.Create(), from, to, factor),
+                autoSave: true);
+        }
+    }
+
+    /// <summary>
+    /// Seeds pegged currency exchange rates (Gulf currencies fixed to USD).
+    /// Per ERPNext install.py: 6 Gulf→USD fixed rates created if both currencies exist.
+    /// </summary>
+    private async Task SeedPeggedCurrenciesAsync()
+    {
+        if (await _currencyExchangeRepository.GetCountAsync() > 0) return;
+
+        var peggedRates = new (string From, string To, decimal Rate)[]
+        {
+            ("AED", "USD", 3.6725m),
+            ("BHD", "USD", 0.376m),
+            ("JOD", "USD", 0.709m),
+            ("OMR", "USD", 0.3845m),
+            ("QAR", "USD", 3.64m),
+            ("SAR", "USD", 3.75m),
+        };
+
+        foreach (var (from, to, rate) in peggedRates)
+        {
+            await _currencyExchangeRepository.InsertAsync(
+                new CurrencyExchange(
+                    _guidGenerator.Create(), from, to, rate,
+                    new DateTime(2000, 1, 1)), // Pegged rates are effectively permanent
+                autoSave: true);
+        }
+    }
+
+    /// <summary>
+    /// Seeds standard financial report templates: Profit & Loss and Balance Sheet.
+    /// Per gotcha #159: Financial Report Template entity replaces hardcoded P&L/BS report builders.
+    /// Templates use Account Category references for GL data aggregation.
+    /// </summary>
+    private async Task SeedFinancialReportTemplatesAsync()
+    {
+        if (await _reportTemplateRepository.GetCountAsync() > 0) return;
+
+        // --- Standard Profit & Loss Statement ---
+        var pl = new FinancialReportTemplate(
+            _guidGenerator.Create(), "Standard Profit & Loss", FinancialReportType.ProfitAndLoss);
+        pl.IsStandard = true;
+        pl.Description = "Standard IFRS-compliant income statement";
+
+        var sortOrder = 0;
+        // Revenue section
+        var revRow = pl.AddRow("Revenue", FinancialReportDataSource.AccountData, ++sortOrder, "REV",
+            accountCategoryFilter: "Revenue from Operations", isBold: true);
+        pl.AddRow("Other Income", FinancialReportDataSource.AccountData, ++sortOrder, "OI",
+            accountCategoryFilter: "Other Income");
+        var totalIncomeRow = pl.AddRow("Total Income", FinancialReportDataSource.CalculatedAmount, ++sortOrder, "TI",
+            calculationFormula: "REV + OI", isBold: true);
+
+        // Expense section
+        pl.AddRow("", FinancialReportDataSource.BlankLine, ++sortOrder);
+        pl.AddRow("Cost of Goods Sold", FinancialReportDataSource.AccountData, ++sortOrder, "COGS",
+            accountCategoryFilter: "COGS");
+        pl.AddRow("Operating Expenses", FinancialReportDataSource.AccountData, ++sortOrder, "OPEX",
+            accountCategoryFilter: "Operating Expenses");
+        pl.AddRow("Depreciation", FinancialReportDataSource.AccountData, ++sortOrder, "DEP",
+            accountCategoryFilter: "Depreciation");
+        var totalExpenseRow = pl.AddRow("Total Expenses", FinancialReportDataSource.CalculatedAmount, ++sortOrder, "TE",
+            calculationFormula: "COGS + OPEX + DEP", isBold: true);
+
+        // Net result
+        pl.AddRow("", FinancialReportDataSource.BlankLine, ++sortOrder);
+        pl.AddRow("Net Profit / (Loss)", FinancialReportDataSource.CalculatedAmount, ++sortOrder, "NP",
+            calculationFormula: "TI - TE", isBold: true);
+
+        await _reportTemplateRepository.InsertAsync(pl, autoSave: true);
+
+        // --- Standard Balance Sheet ---
+        var bs = new FinancialReportTemplate(
+            _guidGenerator.Create(), "Standard Balance Sheet", FinancialReportType.BalanceSheet);
+        bs.IsStandard = true;
+        bs.Description = "Standard IFRS-compliant statement of financial position";
+
+        sortOrder = 0;
+        // Assets
+        bs.AddRow("ASSETS", FinancialReportDataSource.BlankLine, ++sortOrder, isBold: true);
+        bs.AddRow("Cash and Cash Equivalents", FinancialReportDataSource.AccountData, ++sortOrder, "CASH",
+            accountCategoryFilter: "Cash and Cash Equivalents");
+        bs.AddRow("Trade Receivables", FinancialReportDataSource.AccountData, ++sortOrder, "AR",
+            accountCategoryFilter: "Trade Receivables");
+        bs.AddRow("Inventory", FinancialReportDataSource.AccountData, ++sortOrder, "INV",
+            accountCategoryFilter: "Inventory");
+        bs.AddRow("Other Current Assets", FinancialReportDataSource.AccountData, ++sortOrder, "OCA",
+            accountCategoryFilter: "Other Current Assets");
+        var totalCA = bs.AddRow("Total Current Assets", FinancialReportDataSource.CalculatedAmount, ++sortOrder, "TCA",
+            calculationFormula: "CASH + AR + INV + OCA", isBold: true);
+
+        bs.AddRow("", FinancialReportDataSource.BlankLine, ++sortOrder);
+        bs.AddRow("Property, Plant & Equipment", FinancialReportDataSource.AccountData, ++sortOrder, "PPE",
+            accountCategoryFilter: "Property Plant and Equipment");
+        bs.AddRow("Intangible Assets", FinancialReportDataSource.AccountData, ++sortOrder, "INTG",
+            accountCategoryFilter: "Intangible Assets");
+        var totalNCA = bs.AddRow("Total Non-Current Assets", FinancialReportDataSource.CalculatedAmount, ++sortOrder, "TNCA",
+            calculationFormula: "PPE + INTG", isBold: true);
+
+        var totalAssets = bs.AddRow("TOTAL ASSETS", FinancialReportDataSource.CalculatedAmount, ++sortOrder, "TA",
+            calculationFormula: "TCA + TNCA", isBold: true);
+
+        // Liabilities
+        bs.AddRow("", FinancialReportDataSource.BlankLine, ++sortOrder);
+        bs.AddRow("LIABILITIES", FinancialReportDataSource.BlankLine, ++sortOrder, isBold: true);
+        bs.AddRow("Trade Payables", FinancialReportDataSource.AccountData, ++sortOrder, "AP",
+            accountCategoryFilter: "Trade Payables");
+        bs.AddRow("Other Current Liabilities", FinancialReportDataSource.AccountData, ++sortOrder, "OCL",
+            accountCategoryFilter: "Other Current Liabilities");
+        bs.AddRow("Tax Payable", FinancialReportDataSource.AccountData, ++sortOrder, "TAX",
+            accountCategoryFilter: "Tax Payable");
+        var totalCL = bs.AddRow("Total Current Liabilities", FinancialReportDataSource.CalculatedAmount, ++sortOrder, "TCL",
+            calculationFormula: "AP + OCL + TAX", isBold: true);
+
+        bs.AddRow("", FinancialReportDataSource.BlankLine, ++sortOrder);
+        bs.AddRow("Long-Term Borrowings", FinancialReportDataSource.AccountData, ++sortOrder, "LTD",
+            accountCategoryFilter: "Long-Term Borrowings");
+        var totalNCL = bs.AddRow("Total Non-Current Liabilities", FinancialReportDataSource.CalculatedAmount, ++sortOrder, "TNCL",
+            calculationFormula: "LTD", isBold: true);
+
+        var totalLiabilities = bs.AddRow("TOTAL LIABILITIES", FinancialReportDataSource.CalculatedAmount, ++sortOrder, "TL",
+            calculationFormula: "TCL + TNCL", isBold: true);
+
+        // Equity
+        bs.AddRow("", FinancialReportDataSource.BlankLine, ++sortOrder);
+        bs.AddRow("EQUITY", FinancialReportDataSource.BlankLine, ++sortOrder, isBold: true);
+        bs.AddRow("Share Capital", FinancialReportDataSource.AccountData, ++sortOrder, "SC",
+            accountCategoryFilter: "Share Capital");
+        bs.AddRow("Retained Earnings", FinancialReportDataSource.AccountData, ++sortOrder, "RE",
+            accountCategoryFilter: "Retained Earnings");
+        var totalEquity = bs.AddRow("TOTAL EQUITY", FinancialReportDataSource.CalculatedAmount, ++sortOrder, "TEQ",
+            calculationFormula: "SC + RE", isBold: true);
+
+        bs.AddRow("", FinancialReportDataSource.BlankLine, ++sortOrder);
+        bs.AddRow("TOTAL LIABILITIES & EQUITY", FinancialReportDataSource.CalculatedAmount, ++sortOrder, "TLE",
+            calculationFormula: "TL + TEQ", isBold: true);
+
+        await _reportTemplateRepository.InsertAsync(bs, autoSave: true);
+    }
+
+    private async Task SeedEmailTemplatesAsync()
+    {
+        var repo = _serviceProvider.GetRequiredService<IRepository<EmailTemplate, Guid>>();
+        if (await repo.GetCountAsync() > 0) return;
+
+        await repo.InsertAsync(new EmailTemplate(
+            _guidGenerator.Create(),
+            "Sales Invoice Email",
+            "{{ company_name }} - Invoice {{ invoice_number }}",
+            "<p>Dear {{ customer_name }},</p>" +
+            "<p>Please find attached Invoice <strong>{{ invoice_number }}</strong> dated {{ issue_date }} " +
+            "for the amount of <strong>{{ grand_total }}</strong>.</p>" +
+            "<p>Payment is due by {{ due_date }}.</p>" +
+            "<p>If you have already made the payment, please disregard this email.</p>" +
+            "<p>Best regards,<br/>{{ company_name }}</p>")
+        { DocumentType = "SalesInvoice" }, autoSave: true);
+
+        await repo.InsertAsync(new EmailTemplate(
+            _guidGenerator.Create(),
+            "Purchase Order Email",
+            "{{ company_name }} - Purchase Order {{ document_number }}",
+            "<p>Dear {{ party_name }},</p>" +
+            "<p>Please find attached Purchase Order <strong>{{ document_number }}</strong>.</p>" +
+            "<p>Kindly confirm receipt and expected delivery schedule.</p>" +
+            "<p>Best regards,<br/>{{ company_name }}</p>")
+        { DocumentType = "PurchaseOrder" }, autoSave: true);
+
+        await repo.InsertAsync(new EmailTemplate(
+            _guidGenerator.Create(),
+            "Quotation Email",
+            "{{ company_name }} - Quotation {{ document_number }}",
+            "<p>Dear {{ party_name }},</p>" +
+            "<p>Thank you for your enquiry. Please find attached our Quotation " +
+            "<strong>{{ document_number }}</strong> for your review.</p>" +
+            "<p>This quotation is valid until {{ valid_till }}.</p>" +
+            "<p>Please do not hesitate to contact us if you have any questions.</p>" +
+            "<p>Best regards,<br/>{{ company_name }}</p>")
+        { DocumentType = "Quotation" }, autoSave: true);
+
+        await repo.InsertAsync(new EmailTemplate(
+            _guidGenerator.Create(),
+            "Payment Reminder",
+            "Payment Reminder - Invoice {{ invoice_number }} Overdue",
+            "<p>Dear {{ customer_name }},</p>" +
+            "<p>This is a friendly reminder that Invoice <strong>{{ invoice_number }}</strong> " +
+            "for <strong>{{ grand_total }}</strong> was due on {{ due_date }}.</p>" +
+            "<p>If payment has already been made, please disregard this notice.</p>" +
+            "<p>Best regards,<br/>{{ company_name }}</p>")
+        { DocumentType = "PaymentReminder" }, autoSave: true);
+
+        await repo.InsertAsync(new EmailTemplate(
+            _guidGenerator.Create(),
+            "Delivery Note Email",
+            "{{ company_name }} - Delivery Note {{ document_number }}",
+            "<p>Dear {{ party_name }},</p>" +
+            "<p>Your order has been dispatched. Please find the delivery details attached.</p>" +
+            "<p>Delivery Note: <strong>{{ document_number }}</strong></p>" +
+            "<p>Best regards,<br/>{{ company_name }}</p>")
+        { DocumentType = "DeliveryNote" }, autoSave: true);
+    }
+
+    /// <summary>
+    /// Seeds standard Party Types mapped to their default account types.
+    /// Maps to ERPNext accounts/doctype/party_type.
+    /// </summary>
+    private async Task SeedPartyTypesAsync()
+    {
+        if (await _partyTypeRepository.GetCountAsync() > 0) return;
+
+        var defaults = new (string Name, PartyAccountType AccountType)[]
+        {
+            ("Customer", PartyAccountType.Receivable),
+            ("Supplier", PartyAccountType.Payable),
+            ("Employee", PartyAccountType.Payable),
+            ("Shareholder", PartyAccountType.Payable),
+            ("Member", PartyAccountType.Receivable),
+        };
+
+        foreach (var (name, accountType) in defaults)
+        {
+            await _partyTypeRepository.InsertAsync(
+                new PartyType(_guidGenerator.Create(), name, accountType),
+                autoSave: false);
+        }
+    }
+}

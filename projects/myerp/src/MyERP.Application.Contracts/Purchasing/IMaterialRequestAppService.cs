@@ -1,0 +1,22 @@
+using System;
+using System.Threading.Tasks;
+using MyERP.Purchasing.DTOs;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+
+namespace MyERP.Purchasing;
+
+public interface IMaterialRequestAppService : IApplicationService
+{
+    Task<MaterialRequestDto> GetAsync(Guid id);
+    Task<PagedResultDto<MaterialRequestDto>> GetListAsync(GetMaterialRequestListDto input);
+    Task<MaterialRequestDto> CreateAsync(CreateMaterialRequestDto input);
+    Task<MaterialRequestDto> UpdateAsync(Guid id, CreateMaterialRequestDto input);
+    Task DeleteAsync(Guid id);
+    Task<MaterialRequestDto> SubmitAsync(Guid id);
+    Task<MaterialRequestDto> CancelAsync(Guid id);
+    Task<MaterialRequestDto> StopAsync(Guid id);
+    Task<MaterialRequestDto> ReopenAsync(Guid id);
+    Task<MrFulfillmentStatusDto> GetFulfillmentStatusAsync(Guid id);
+    Task<MyERP.Manufacturing.BatchCreateWorkOrdersResultDto> RaiseWorkOrdersAsync(Guid id);
+}

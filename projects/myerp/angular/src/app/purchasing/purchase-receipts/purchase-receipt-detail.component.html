@@ -1,0 +1,142 @@
+<abp-page [title]="receipt?.receiptNumber ?? 'Purchase Receipt'">
+  @if (!receipt) {
+    <app-loading-overlay />
+  } @else {
+    <app-breadcrumb />
+    <app-document-workflow
+      [currentStatus]="receipt.status!"
+      [availableActions]="workflowActions"
+      (actionTriggered)="onWorkflowAction($event)" />
+
+    <div class="card mt-4">
+      <div class="card-body">
+        <div class="row">
+          <div class="col-12 col-md-4 mb-3">
+            <small class="text-muted d-block">{{ '::ReceiptNumber' | abpLocalization }}</small>
+            <span class="fw-semibold">{{ receipt.receiptNumber }}</span>
+          </div>
+          <div class="col-12 col-md-4 mb-3">
+            <small class="text-muted d-block">{{ '::PostingDate' | abpLocalization }}</small>
+            <span class="fw-semibold">{{ receipt.postingDate | date:'dd/MM/yyyy' }}</span>
+          </div>
+          <div class="col-12 col-md-4 mb-3">
+            <small class="text-muted d-block">{{ '::Warehouse' | abpLocalization }}</small>
+            <span class="fw-semibold">{{ receipt.warehouseName || '—' }}</span>
+          </div>
+          @if (receipt.currencyCode && receipt.currencyCode !== 'MYR') {
+            <div class="col-12 col-md-4 mb-3">
+              <small class="text-muted d-block">{{ '::Currency' | abpLocalization }}</small>
+              <span class="fw-semibold">{{ receipt.currencyCode }} @ {{ receipt.exchangeRate | number:'1.4-4' }}</span>
+            </div>
+          }
+        </div>
+      </div>
+    </div>
+
+    <div class="card mt-4">
+      <div class="card-header">
+        <h5 class="card-title mb-0"><i class="fa fa-list me-2"></i>{{ '::Items' | abpLocalization }}</h5>
+      </div>
+      <div class="card-body">
+        <div class="table-responsive">
+          <table class="table table-sm w-100">
+            <thead>
+              <tr>
+                <th>{{ '::Description' | abpLocalization }}</th>
+                <th>{{ '::Warehouse' | abpLocalization }}</th>
+                <th class="text-end">{{ '::ReceivedQty' | abpLocalization }}</th>
+                <th class="text-end">{{ '::AcceptedQty' | abpLocalization }}</th>
+                <th class="text-end">{{ '::RejectedQty' | abpLocalization }}</th>
+                <th>{{ '::RejectedWarehouse' | abpLocalization }}</th>
+                <th class="text-end">{{ '::UnitPrice' | abpLocalization }}</th>
+                <th class="text-end">{{ '::Tax' | abpLocalization }}</th>
+                <th class="text-end">{{ '::LineTotal' | abpLocalization }}</th>
+                @if (receipt.status !== 'Draft') {
+                  <th class="text-center">{{ '::QiStatus' | abpLocalization }}</th>
+                }
+              </tr>
+            </thead>
+            <tbody>
+              @for (row of receipt.items!; track $index) {
+                <tr>
+                  <td>{{ row.description }}</td>
+                  <!-- Blank override means the line went to the receipt's own warehouse. -->
+                  <td>{{ row.warehouseId ? warehouseName(row.warehouseId) : (receipt?.warehouseName ?? '-') }}</td>
+                  <td class="text-end">{{ row.receivedQty || row.quantity }}</td>
+                  <td class="text-end">{{ row.quantity }}</td>
+                  <td class="text-end">{{ row.rejectedQty || 0 }}</td>
+                  <td>{{ row.rejectedWarehouseName || (row.rejectedWarehouseId ? warehouseName(row.rejectedWarehouseId) : '—') }}</td>
+                  <td class="text-end font-monospace">{{ row.unitPrice | number:'1.2-2' }}</td>
+                  <td class="text-end font-monospace">{{ row.taxAmount | number:'1.2-2' }}</td>
+                  <td class="text-end font-monospace">{{ row.lineTotal | number:'1.2-2' }}</td>
+                  @if (receipt.status !== 'Draft') {
+                    <td class="text-center">
+                      @if (qiLoading()) {
+                        <span class="spinner-border spinner-border-sm text-muted"></span>
+                      } @else {
+                        @let qi = getQiStatusForItem(row.itemId!);
+                        @if (qi) {
+                          @if (qi.status === 'Accepted') {
+                            <span class="badge bg-success-subtle text-success"><i class="fa fa-check-circle me-1"></i>{{ '::InspectionPassed' | abpLocalization }}</span>
+                          } @else if (qi.status === 'Rejected') {
+                            <span class="badge bg-danger-subtle text-danger"><i class="fa fa-times-circle me-1"></i>{{ '::InspectionFailed' | abpLocalization }}</span>
+                          } @else {
+                            <span class="badge bg-warning-subtle text-warning"><i class="fa fa-clock me-1"></i>{{ '::InspectionPending' | abpLocalization }}</span>
+                          }
+                        } @else {
+                          <span class="text-muted">—</span>
+                        }
+                      }
+                    </td>
+                  }
+                </tr>
+              }
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mt-4" style="max-width: 380px; margin-left: auto">
+      <div class="card-body text-end">
+        <p>{{ '::NetTotal' | abpLocalization }}: <strong class="font-monospace">{{ receipt.netTotal | number:'1.2-2' }}</strong></p>
+        <p>{{ '::Tax' | abpLocalization }}: <strong class="font-monospace">{{ receipt.taxAmount | number:'1.2-2' }}</strong></p>
+        @if (receipt.currencyCode && receipt.currencyCode !== 'MYR') {
+          <p class="text-muted small mb-1">{{ '::Currency' | abpLocalization }}: {{ receipt.currencyCode }} @ {{ receipt.exchangeRate | number:'1.4-4' }}</p>
+        }
+        <hr />
+        <p class="fs-5">{{ '::GrandTotal' | abpLocalization }}: <strong class="font-monospace">{{ receipt.grandTotal | number:'1.2-2' }}</strong></p>
+      </div>
+    </div>
+
+    <!-- Print Button -->
+    <div class="mt-3 text-end">
+      <button class="btn btn-outline-secondary btn-sm" (click)="printDocument()">
+        <i class="fa fa-print me-1"></i>{{ '::Print' | abpLocalization }}
+      </button>
+    </div>
+
+    @if (receipt.status !== 'Draft') {
+      <app-document-connections [documentType]="'PurchaseReceipt'" [documentId]="receipt.id!" />
+    }
+
+    <app-activity-log [documentType]="'PurchaseReceipt'" [documentId]="receipt.id!"></app-activity-log>
+
+    <!-- Ledger Views (Stock + Accounting for submitted/posted documents) -->
+    @if (receipt.status !== 'Draft') {
+      <app-voucher-ledger
+        [voucherType]="'PurchaseReceipt'"
+        [voucherId]="receipt.id!" />
+    }
+
+    <!-- Print Layout (hidden on screen, shown on print) -->
+    <app-pr-print-layout
+      [receipt]="receipt"
+      [companyName]="companyData.name"
+      [companyTin]="companyData.tin"
+      [companySst]="companyData.sst"
+      [companyAddress]="companyData.address"
+      [supplierAddress]="receipt.supplierName || ''"
+      [poNumber]="receipt.purchaseOrderId || ''" />
+  }
+</abp-page>

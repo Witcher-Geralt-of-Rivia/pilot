@@ -1,0 +1,63 @@
+import { Component, inject, OnInit } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { RouterModule } from '@angular/router';
+import { PageModule } from '@abp/ng.components/page';
+import { LocalizationPipe } from '@abp/ng.core';
+import { ConfirmationService, Confirmation } from '@abp/ng.theme.shared';
+import { LeadStore } from '../store/lead.store';
+import { StatusBadgeComponent } from '../../shared/components/status-badge/status-badge.component';
+import { LoadingOverlayComponent } from '../../shared/components/loading-overlay/loading-overlay.component';
+
+import { PaginationComponent, type PageEvent } from '../../shared/components/pagination/pagination.component';
+
+@Component({
+  selector: 'app-lead-list',
+  standalone: true,
+  imports: [PaginationComponent, CommonModule, RouterModule, PageModule, LocalizationPipe, StatusBadgeComponent, LoadingOverlayComponent],
+  templateUrl: './lead-list.component.html',
+  styleUrls: ['./lead-list.component.scss'],
+})
+export class LeadListComponent implements OnInit {
+  readonly store = inject(LeadStore);
+  private confirmation = inject(ConfirmationService);
+
+  searchTerm = '';
+
+  currentPage = 0;
+  pageSize = 20;
+
+  ngOnInit(): void {
+    this.store.load({ skipCount: 0, maxResultCount: 20, sorting: '' });
+  }
+
+  onSearch(event: Event): void {
+    this.searchTerm = (event.target as HTMLInputElement).value;
+    this.store.setFilter({ filter: this.searchTerm });
+    this.store.load({ skipCount: 0, maxResultCount: 20, sorting: '' });
+  }
+
+  delete(id: string): void {
+    this.confirmation.warn('::DeleteConfirmationMessage', '::AreYouSure').subscribe((status) => {
+      if (status === Confirmation.Status.confirm) {
+        this.store.remove(id);
+      }
+    });
+  }
+
+  qualify(id: string): void {
+    this.store.qualify(id);
+  }
+
+  markLost(id: string): void {
+    this.confirmation.warn('::CRM:MarkLeadLostConfirmation', '::AreYouSure').subscribe((status) => {
+      if (status === Confirmation.Status.confirm) {
+        this.store.markLost(id);
+      }
+    });
+  }
+
+  onPageChange(event: PageEvent): void {
+    this.currentPage = event.pageIndex;
+    this.store.load({ skipCount: event.pageIndex * 20, maxResultCount: 20, sorting: '' });
+  }
+}

@@ -1,0 +1,140 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Inventory.DomainServices;
+using MyERP.Sales.Entities;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Domain.Services;
+
+namespace MyERP.Sales.DomainServices;
+
+/// <summary>
+/// Calculates gross profit metrics for sales documents.
+/// Per ERPNext: valuation_rate = weighted average cost at time of billing/delivery.
+/// Gross Profit = Selling Rate - Valuation Rate (per item × qty).
+/// </summary>
+public class GrossProfitService : DomainService
+{
+    private readonly StockValuationService _valuationService;
+
+    public GrossProfitService(StockValuationService valuationService)
+    {
+        _valuationService = valuationService;
+    }
+
+    /// <summary>
+    /// Populates ValuationRate on each invoice item from current stock valuation.
+    /// Called during SI creation or submit to capture cost at point of sale.
+    /// </summary>
+    public async Task PopulateValuationRatesAsync(SalesInvoice invoice, Guid warehouseId)
+    {
+        foreach (var item in invoice.Items)
+        {
+            var balance = await _valuationService.GetCurrentBalanceAsync(
+                item.ItemId, warehouseId);
+
+            item.ValuationRate = balance.ValuationRate;
+        }
+    }
+
+    /// <summary>
+    /// Calculates aggregate gross profit metrics for an invoice.
+    /// Supports drop-ship unit buying rates per ERPNext PR #58226 (commit d40679cffe)
+    /// and PR #59885 (commit 9f03f19f65) with SalesOrderItemId fallback to ItemId.
+    /// </summary>
+    public GrossProfitResult CalculateForInvoice(
+        SalesInvoice invoice,
+        IReadOnlyDictionary<Guid, decimal>? dropShipUnitBuyingRates = null)
+    {
+        var itemDetails = invoice.Items.Select(i =>
+        {
+            var costRate = i.ValuationRate;
+            if (dropShipUnitBuyingRates != null)
+            {
+                if (i.SalesOrderItemId.HasValue && dropShipUnitBuyingRates.TryGetValue(i.SalesOrderItemId.Value, out var soRate) && soRate > 0)
+                {
+                    costRate = soRate;
+                }
+                else if (dropShipUnitBuyingRates.TryGetValue(i.ItemId, out var itemRate) && itemRate > 0)
+                {
+                    costRate = itemRate;
+                }
+            }
+
+            var revenue = i.Quantity * i.UnitPrice;
+            var cost = i.Quantity * costRate;
+            var profit = revenue - cost;
+            var profitPercent = revenue > 0 ? (profit / revenue) * 100m : 0m;
+
+            return new GrossProfitItemDetail
+            {
+                ItemId = i.ItemId,
+                Description = i.Description,
+                Quantity = i.Quantity,
+                SellingRate = i.UnitPrice,
+                ValuationRate = costRate,
+                DeliveryNoteItemId = i.DeliveryNoteItemId,
+                SalesOrderItemId = i.SalesOrderItemId,
+                GrossProfit = profit,
+                GrossProfitPercentage = Math.Round(profitPercent, 2)
+            };
+        }).ToList();
+
+        var totalRevenue = itemDetails.Sum(i => i.Quantity * i.SellingRate);
+        var totalCost = itemDetails.Sum(i => i.Quantity * i.ValuationRate);
+        var grossProfit = totalRevenue - totalCost;
+        var grossProfitPercent = totalRevenue > 0 ? (grossProfit / totalRevenue) * 100m : 0m;
+
+        return new GrossProfitResult
+        {
+            TotalRevenue = totalRevenue,
+            TotalCost = totalCost,
+            GrossProfit = grossProfit,
+            GrossProfitPercentage = Math.Round(grossProfitPercent, 2),
+            ItemDetails = itemDetails
+        };
+    }
+
+    /// <summary>
+    /// Calculates the effective incoming rate from delivery note items for a sales order item.
+    /// Per ERPNext PR #59885 (commit 3aa0af6844): guards against division by zero when
+    /// deliveries have been fully returned (sum of stock qty is 0), falling back to valuation rate.
+    /// </summary>
+    public decimal CalculateDeliveryIncomingRate(
+        IEnumerable<DeliveryNoteItem> deliveryItems,
+        decimal fallbackValuationRate)
+    {
+        var items = deliveryItems.ToList();
+        var totalStockQty = items.Sum(d => d.StockQty);
+        if (totalStockQty <= 0)
+        {
+            return fallbackValuationRate;
+        }
+
+        var totalIncomingValue = items.Sum(d => d.StockQty * (d.ValuationRate > 0 ? d.ValuationRate : fallbackValuationRate));
+        return Math.Round(totalIncomingValue / totalStockQty, 4);
+    }
+}
+
+public class GrossProfitResult
+{
+    public decimal TotalRevenue { get; set; }
+    public decimal TotalCost { get; set; }
+    public decimal GrossProfit { get; set; }
+    public decimal GrossProfitPercentage { get; set; }
+    public List<GrossProfitItemDetail> ItemDetails { get; set; } = new();
+}
+
+public class GrossProfitItemDetail
+{
+    public Guid ItemId { get; set; }
+    public string Description { get; set; } = null!;
+    public decimal Quantity { get; set; }
+    public decimal SellingRate { get; set; }
+    public decimal ValuationRate { get; set; }
+    public Guid? DeliveryNoteItemId { get; set; }
+    public Guid? SalesOrderItemId { get; set; }
+    public decimal GrossProfit { get; set; }
+    public decimal GrossProfitPercentage { get; set; }
+}

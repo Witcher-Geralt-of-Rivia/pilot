@@ -1,0 +1,222 @@
+import { Component, inject, OnInit, signal } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { ActivatedRoute, Router, RouterLink } from '@angular/router';
+import { PageModule } from '@abp/ng.components/page';
+import { LocalizationPipe } from '@abp/ng.core';
+import { Confirmation, ConfirmationService, ToasterService } from '@abp/ng.theme.shared';
+import { StockEntryService } from '../../proxy/inventory/stock-entry.service';
+import { StatusBadgeComponent } from '../../shared/components/status-badge/status-badge.component';
+import { BreadcrumbComponent } from '../../shared/components/breadcrumb/breadcrumb.component';
+import { DocumentWorkflowComponent, WorkflowAction } from '../../shared/components/document-workflow/document-workflow.component';
+import { ActivityLogComponent } from '../../shared/components/activity-log/activity-log.component';
+import { VoucherLedgerComponent } from '../../shared/components/voucher-ledger/voucher-ledger.component';
+import { DocumentConnectionsComponent } from '../../shared/components/document-connections/document-connections.component';
+import { StockEntryPrintLayoutComponent } from '../../shared/components/se-print-layout/se-print-layout.component';
+import { CompanyService } from '../../proxy/core/company.service';
+import type { StockEntryDto } from '../../proxy/inventory/models';
+
+@Component({
+  selector: 'app-stock-entry-detail',
+  standalone: true,
+  imports: [CommonModule, PageModule, LocalizationPipe, StatusBadgeComponent, BreadcrumbComponent, DocumentWorkflowComponent, ActivityLogComponent, VoucherLedgerComponent, DocumentConnectionsComponent, RouterLink, StockEntryPrintLayoutComponent],
+  template: `
+    <app-breadcrumb />
+    <abp-page [title]="entry()?.entryNumber || ('StockEntry' | abpLocalization)">
+      @if (!entry()) {
+        <div class="text-center py-5"><i class="fa fa-spinner fa-spin fa-2x"></i></div>
+      } @else {
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <div></div>
+          @if (entry()!.status === 'Draft') {
+            <div class="btn-group btn-group-sm">
+              <a class="btn btn-outline-primary" [routerLink]="['/inventory/stock-entries', entry()!.id, 'edit']">
+                <i class="fa fa-edit me-1"></i>{{ 'Edit' | abpLocalization }}
+              </a>
+              <button class="btn btn-outline-danger" (click)="deleteEntry()">
+                <i class="fa fa-trash me-1"></i>{{ 'Delete' | abpLocalization }}
+              </button>
+            </div>
+          }
+        </div>
+        <app-document-workflow [actions]="workflowActions" (actionClicked)="onAction($event)" />
+
+        <div class="row mb-4">
+          <div class="col-md-6">
+            <div class="card">
+              <div class="card-body">
+                <table class="table table-borderless mb-0">
+                  <tr><td class="text-muted" style="width:40%">{{ 'EntryNumber' | abpLocalization }}</td><td class="fw-bold">{{ entry()!.entryNumber }}</td></tr>
+                  <tr><td class="text-muted">{{ 'Status' | abpLocalization }}</td><td><app-status-badge [status]="entry()!.status!" /></td></tr>
+                  <tr><td class="text-muted">{{ 'EntryType' | abpLocalization }}</td><td>{{ entry()!.entryType }}</td></tr>
+                  <tr><td class="text-muted">{{ 'PostingDate' | abpLocalization }}</td><td>{{ entry()!.postingDate | date:'dd/MM/yyyy' }}</td></tr>
+                </table>
+              </div>
+            </div>
+          </div>
+          <div class="col-md-6">
+            <div class="card">
+              <div class="card-body">
+                <table class="table table-borderless mb-0">
+                  <tr><td class="text-muted" style="width:40%">{{ 'ReferenceType' | abpLocalization }}</td><td>{{ entry()!.referenceType || '-' }}</td></tr>
+                  <tr><td class="text-muted">{{ 'Notes' | abpLocalization }}</td><td>{{ entry()!.notes || '-' }}</td></tr>
+                  <tr><td class="text-muted">{{ 'CreatedDate' | abpLocalization }}</td><td>{{ entry()!.creationTime | date:'dd/MM/yyyy HH:mm' }}</td></tr>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Items Table -->
+        <div class="card mb-4">
+          <div class="card-header"><h6 class="card-title mb-0"><i class="fa fa-boxes-stacked me-2"></i>{{ 'Items' | abpLocalization }}</h6></div>
+          <div class="card-body p-0">
+            <table class="table table-hover mb-0">
+              <thead class="table-light">
+                <tr>
+                  <th>#</th>
+                  <th>{{ 'Item' | abpLocalization }}</th>
+                  <th class="text-end">{{ 'Quantity' | abpLocalization }}</th>
+                  <th>{{ 'Source' | abpLocalization }}</th>
+                  <th>{{ 'Target' | abpLocalization }}</th>
+                  <th class="text-end">{{ 'ValuationRate' | abpLocalization }}</th>
+                  <th class="text-end">{{ 'Amount' | abpLocalization }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                @for (item of entry()!.items; track item.id; let i = $index) {
+                  <tr>
+                    <td>{{ i + 1 }}</td>
+                    <td>{{ item.itemName || item.itemId }}</td>
+                    <td class="text-end">{{ item.quantity | number:'1.0-2' }}</td>
+                    <td>{{ item.sourceWarehouseName || item.sourceWarehouseId || '-' }}</td>
+                    <td>{{ item.targetWarehouseName || item.targetWarehouseId || '-' }}</td>
+                    <td class="text-end">{{ item.valuationRate | number:'1.2-2' }}</td>
+                    <td class="text-end">{{ ((item.quantity ?? 0) * (item.valuationRate ?? 0)) | number:'1.2-2' }}</td>
+                  </tr>
+                }
+              </tbody>
+              <tfoot class="table-light">
+                <tr>
+                  <td colspan="3" class="fw-bold text-end">{{ 'Total' | abpLocalization }}</td>
+                  <td colspan="2"></td>
+                  <td></td>
+                  <td class="text-end fw-bold">{{ totalAmount() | number:'1.2-2' }}</td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </div>
+
+        <app-document-connections [documentType]="'StockEntry'" [documentId]="entry()!.id!" />
+
+        <app-activity-log documentType="StockEntry" [documentId]="entry()!.id!" />
+
+        <!-- Print Button -->
+        <div class="mt-3 text-end">
+          <button class="btn btn-outline-secondary btn-sm" (click)="printDocument()">
+            <i class="fa fa-print me-1"></i>{{ 'Print' | abpLocalization }}
+          </button>
+        </div>
+
+        @if (entry()!.status === 'Posted' || entry()!.status === 'Cancelled') {
+          <app-voucher-ledger
+            voucherType="StockEntry"
+            [voucherId]="entry()!.id!"
+            [showAccounting]="true"
+            [showStock]="true" />
+        }
+
+        <!-- Print Layout (hidden on screen, shown on print) -->
+        <app-se-print-layout
+          [entry]="entry()"
+          [companyName]="companyName"
+          [companyAddress]="companyAddress" />
+      }
+    </abp-page>
+  `
+})
+export class StockEntryDetailComponent implements OnInit {
+  private route = inject(ActivatedRoute);
+  private router = inject(Router);
+  private service = inject(StockEntryService);
+  private confirmation = inject(ConfirmationService);
+  private toaster = inject(ToasterService);
+  private companyService = inject(CompanyService);
+
+  entry = signal<StockEntryDto | null>(null);
+  totalAmount = signal(0);
+  companyName = '';
+  companyAddress = '';
+
+  get workflowActions(): WorkflowAction[] {
+    const e = this.entry();
+    if (!e) return [];
+    const actions: WorkflowAction[] = [];
+    if (e.status === 'Draft') {
+      actions.push({ name: 'submit', label: 'Submit', icon: 'paper-plane', color: 'primary' });
+    }
+    if (e.status === 'Submitted') {
+      actions.push({ name: 'post', label: 'Post', icon: 'check-double', color: 'success' });
+      actions.push({ name: 'cancel', label: 'Cancel', icon: 'ban', color: 'danger' });
+    }
+    return actions;
+  }
+
+  ngOnInit(): void {
+    const id = this.route.snapshot.paramMap.get('id')!;
+    this.service.get(id).subscribe(data => {
+      this.entry.set(data);
+      this.totalAmount.set((data.items || []).reduce((sum: number, i: any) => sum + (i.quantity * i.valuationRate), 0));
+    });
+    this.companyService.getList({ maxResultCount: 200, skipCount: 0, sorting: '' }).subscribe((res: any) => { const companies = res.items || [];
+      if (companies?.length > 0) {
+        this.companyName = companies[0].name || companies[0].companyName || '';
+        this.companyAddress = companies[0].address || '';
+      }
+    });
+  }
+
+  printDocument(): void {
+    window.print();
+  }
+
+  onAction(action: string): void {
+    const id = this.entry()!.id;
+    switch (action) {
+      case 'submit':
+        this.service.submit(id).subscribe({ next: () => this.reload(), error: () => {} });
+        break;
+      case 'post':
+        this.service.post(id).subscribe({ next: () => { this.toaster.success('::SuccessfullyPosted'); this.reload(); }, error: () => {} });
+        break;
+      case 'cancel':
+        this.confirmation.warn('::CancelConfirmation', '::AreYouSure').subscribe(s => {
+          if (s === Confirmation.Status.confirm) {
+            this.service.cancel(id).subscribe({ next: () => this.reload(), error: () => {} });
+          }
+        });
+        break;
+    }
+  }
+
+  private reload(): void {
+    const id = this.route.snapshot.paramMap.get('id')!;
+    this.service.get(id).subscribe({
+      next: (data) => {
+        this.entry.set(data);
+        this.totalAmount.set((data.items || []).reduce((sum: number, i: any) => sum + (i.quantity * i.valuationRate), 0));
+      },
+      error: () => {}
+    });
+  }
+
+  deleteEntry(): void {
+    this.confirmation.warn('::DeleteConfirmation', '::AreYouSure').subscribe((status) => {
+      if (status !== Confirmation.Status.confirm) return;
+      this.service.delete(this.entry()!.id).subscribe({
+        next: () => this.router.navigate(['/inventory/stock-entries']),
+        error: (err: any) => this.toaster.error(err?.error?.error?.message || '::OperationFailed'),
+      });
+    });
+  }
+}

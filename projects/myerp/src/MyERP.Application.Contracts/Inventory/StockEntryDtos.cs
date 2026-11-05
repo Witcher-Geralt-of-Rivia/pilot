@@ -1,0 +1,262 @@
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using MyERP.Manufacturing;
+using Volo.Abp.Application.Dtos;
+
+namespace MyERP.Inventory;
+
+public class StockEntryDto : FullAuditedEntityDto<Guid>
+{
+    public Guid CompanyId { get; set; }
+    public string? EntryNumber { get; set; }
+    public StockEntryType EntryType { get; set; }
+    public DateTime PostingDate { get; set; }
+    public string? ReferenceType { get; set; }
+    public Guid? ReferenceId { get; set; }
+    public Guid? WorkOrderId { get; set; }
+    public Guid? JobCardId { get; set; }
+    public decimal FgCompletedQty { get; set; }
+    public decimal ProcessLossQty { get; set; }
+    public decimal ProcessLossPercentage { get; set; }
+    public bool IsFgConversion { get; set; }
+    public decimal WeightPerPiece { get; set; }
+    public decimal TotalAdditionalCosts { get; set; }
+    public Guid? CostCenterId { get; set; }
+    public Guid? ProjectId { get; set; }
+    public string? Notes { get; set; }
+    public bool IsOpening { get; set; }
+    public bool IsReturn { get; set; }
+    public string Status { get; set; } = null!;
+    public List<StockEntryItemDto> Items { get; set; } = new();
+}
+
+public class StockEntryItemDto
+{
+    public Guid Id { get; set; }
+    public Guid ItemId { get; set; }
+    public string? ItemName { get; set; }
+    public decimal Quantity { get; set; }
+    public Guid? SourceWarehouseId { get; set; }
+    public string? SourceWarehouseName { get; set; }
+    public Guid? TargetWarehouseId { get; set; }
+    public string? TargetWarehouseName { get; set; }
+    public decimal? ValuationRate { get; set; }
+    public decimal AdditionalCost { get; set; }
+    public bool IsFinishedItem { get; set; }
+    public bool SetBasicRateManually { get; set; }
+    public bool AllowZeroValuationRate { get; set; }
+    public string? SecondaryItemType { get; set; }
+    public SecondaryItemValuationType? ValuationType { get; set; }
+    public Guid? BomSecondaryItemId { get; set; }
+    public Guid? CostCenterId { get; set; }
+    public Guid? ExpenseAccountId { get; set; }
+    public Guid? ProjectId { get; set; }
+    public Guid? MaterialRequestItemId { get; set; }
+    public decimal ConversionFactor { get; set; } = 1m;
+    public string StockUom { get; set; } = "Unit";
+    public decimal StockQty { get; set; }
+    public decimal BasicAmount { get; set; }
+    public decimal Amount { get; set; }
+}
+
+public class CreateStockEntryDto
+{
+    [Required]
+    public Guid CompanyId { get; set; }
+
+    [Required]
+    public StockEntryType EntryType { get; set; }
+
+    [Required]
+    public DateTime PostingDate { get; set; }
+
+    [StringLength(StockEntryConsts.MaxReferenceNumberLength)]
+    public string? ReferenceType { get; set; }
+
+    public Guid? ReferenceId { get; set; }
+    public Guid? WorkOrderId { get; set; }
+    public Guid? JobCardId { get; set; }
+    public decimal FgCompletedQty { get; set; }
+    public decimal ProcessLossQty { get; set; }
+    public decimal ProcessLossPercentage { get; set; }
+    public bool IsFgConversion { get; set; }
+    public decimal WeightPerPiece { get; set; }
+    [Range(0, double.MaxValue)] public decimal TotalAdditionalCosts { get; set; }
+    public Guid? CostCenterId { get; set; }
+    public Guid? ProjectId { get; set; }
+
+    [StringLength(StockEntryConsts.MaxNoteLength)]
+    public string? Notes { get; set; }
+    public bool IsOpening { get; set; }
+    public bool IsReturn { get; set; }
+
+    [Required]
+    [MinLength(1)]
+    public List<CreateStockEntryItemDto> Items { get; set; } = new();
+}
+
+public class CreateStockEntryItemDto
+{
+    [Required]
+    public Guid ItemId { get; set; }
+
+    [Required]
+    [Range(0.0001, double.MaxValue)]
+    public decimal Quantity { get; set; }
+
+    public Guid? SourceWarehouseId { get; set; }
+    public Guid? TargetWarehouseId { get; set; }
+
+    [Range(0, double.MaxValue)]
+    public decimal? ValuationRate { get; set; }
+
+    [Range(0, double.MaxValue)]
+    public decimal AdditionalCost { get; set; }
+
+    public bool IsFinishedItem { get; set; }
+    public bool SetBasicRateManually { get; set; }
+    public bool AllowZeroValuationRate { get; set; }
+
+    public string? SecondaryItemType { get; set; }
+    public SecondaryItemValuationType? ValuationType { get; set; }
+    public Guid? BomSecondaryItemId { get; set; }
+
+    public Guid? BatchId { get; set; }
+
+    public Guid? CostCenterId { get; set; }
+    public Guid? ExpenseAccountId { get; set; }
+    public Guid? ProjectId { get; set; }
+    public Guid? MaterialRequestItemId { get; set; }
+    public decimal ConversionFactor { get; set; } = 1m;
+    public string? StockUom { get; set; }
+}
+
+/// <summary>Pre-populated items for a Manufacture stock entry from Work Order BOM.</summary>
+public class ManufactureItemsDto
+{
+    public Guid WorkOrderId { get; set; }
+    public Guid BomId { get; set; }
+    public decimal ProduceQty { get; set; }
+    public Guid FgItemId { get; set; }
+    public Guid? FgWarehouseId { get; set; }
+    public Guid? SourceWarehouseId { get; set; }
+    public System.Collections.Generic.List<ManufactureItemLineDto> Items { get; set; } = new();
+}
+
+public class ManufactureItemLineDto
+{
+    public Guid ItemId { get; set; }
+    public string ItemName { get; set; } = null!;
+    public decimal RequiredQty { get; set; }
+    public decimal Rate { get; set; }
+    public Guid? SourceWarehouseId { get; set; }
+    public Guid? TargetWarehouseId { get; set; }
+    public bool IsRawMaterial { get; set; }
+}
+
+// ─── Transit Transfer DTOs ──────────────────────────────────────────────────
+
+public class CreateTransitTransferDto
+{
+    public Guid CompanyId { get; set; }
+    public Guid SourceWarehouseId { get; set; }
+    public Guid DestinationWarehouseId { get; set; }
+    public DateTime PostingDate { get; set; }
+    public string? Notes { get; set; }
+    public System.Collections.Generic.List<TransitTransferItemDto> Items { get; set; } = new();
+}
+
+public class TransitTransferItemDto
+{
+    public Guid ItemId { get; set; }
+    public decimal Quantity { get; set; }
+    public decimal? ValuationRate { get; set; }
+}
+
+public class PendingTransitTransferDto
+{
+    public Guid StockEntryId { get; set; }
+    public string EntryNumber { get; set; } = null!;
+    public DateTime PostingDate { get; set; }
+    public Guid SourceWarehouseId { get; set; }
+    public string? SourceWarehouseName { get; set; }
+    public decimal TotalQuantity { get; set; }
+    public int ItemCount { get; set; }
+}
+
+/// <summary>DTO for pre-populating Stock Entry from Material Request.</summary>
+public class MaterialRequestItemsForSeDto
+{
+    public Guid MaterialRequestId { get; set; }
+    public string? MaterialRequestNumber { get; set; }
+    public string SuggestedPurpose { get; set; } = null!;
+    public Guid? SourceWarehouseId { get; set; }
+    public Guid? TargetWarehouseId { get; set; }
+    public Guid? WorkOrderId { get; set; }
+    public Guid? JobCardId { get; set; }
+    public Guid? BomId { get; set; }
+    public decimal FgCompletedQty { get; set; }
+    public bool FromBom { get; set; }
+    public List<MaterialRequestItemLineDto> Items { get; set; } = new();
+}
+
+public class MaterialRequestItemLineDto
+{
+    public Guid ItemId { get; set; }
+    public string? ItemName { get; set; }
+    public decimal Quantity { get; set; }
+    public string? Uom { get; set; }
+    public Guid? WarehouseId { get; set; }
+    public Guid MaterialRequestItemId { get; set; }
+    public Guid? JobCardItemId { get; set; }
+}
+
+public class StockEntryFinishedGoodTargetDto
+{
+    public string? SerialNo { get; set; }
+    public Guid? BatchId { get; set; }
+    public string? BatchNo { get; set; }
+    public Guid ItemId { get; set; }
+    public string? ItemName { get; set; }
+    public string TargetType { get; set; } = null!;
+}
+
+public class RawMaterialMappingItemDto
+{
+    public Guid EntryId { get; set; }
+    public Guid BundleId { get; set; }
+    public Guid ItemId { get; set; }
+    public string? ItemName { get; set; }
+    public string? SerialNo { get; set; }
+    public Guid? BatchId { get; set; }
+    public string? BatchNo { get; set; }
+    public decimal Quantity { get; set; }
+    public string? FgSerialNo { get; set; }
+    public string? FgBatchNo { get; set; }
+    public bool IsMapped => !string.IsNullOrWhiteSpace(FgSerialNo) || !string.IsNullOrWhiteSpace(FgBatchNo);
+}
+
+public class StockEntryFgMappingDto
+{
+    public Guid StockEntryId { get; set; }
+    public string? EntryNumber { get; set; }
+    public StockEntryType EntryType { get; set; }
+    public string Status { get; set; } = null!;
+    public List<StockEntryFinishedGoodTargetDto> FinishedGoods { get; set; } = new();
+    public List<RawMaterialMappingItemDto> RawMaterials { get; set; } = new();
+}
+
+public class MapRawMaterialsToFinishedGoodsInput
+{
+    [Required]
+    public List<RawMaterialFgMappingItemInput> Mappings { get; set; } = new();
+}
+
+public class RawMaterialFgMappingItemInput
+{
+    [Required]
+    public Guid EntryId { get; set; }
+    public string? FgSerialNo { get; set; }
+    public string? FgBatchNo { get; set; }
+}

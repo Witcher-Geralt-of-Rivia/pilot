@@ -1,0 +1,61 @@
+using System;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authorization;
+using MyERP.Core.Entities;
+using MyERP.Permissions;
+using MyERP.Shared;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+
+namespace MyERP.Core;
+
+/// <summary>
+/// Read-only access to notification logs — audit trail for all sent notifications.
+/// Tracks: Email, InApp, Push channels with Queued→Sent/Failed status.
+/// Used by: admin dashboard, delivery troubleshooting, compliance audit.
+/// </summary>
+[Authorize(MyERPPermissions.AutomationRules.Default)]
+public class NotificationLogAppService : ApplicationService, INotificationLogAppService
+{
+    private readonly IRepository<NotificationLog, Guid> _repository;
+
+    public NotificationLogAppService(IRepository<NotificationLog, Guid> repository)
+    {
+        _repository = repository;
+    }
+
+    public async Task<PagedResultDto<NotificationLogDto>> GetListAsync(GetNotificationLogListDto input)
+    {
+        var query = await _repository.GetQueryableAsync();
+
+        if (!string.IsNullOrEmpty(input.Channel))
+            query = query.Where(n => n.Channel.ToString() == input.Channel);
+        if (!string.IsNullOrEmpty(input.Status))
+            query = query.Where(n => n.Status.ToString() == input.Status);
+        if (!string.IsNullOrEmpty(input.DocumentType))
+            query = query.Where(n => n.DocumentType == input.DocumentType);
+
+        var count = query.Count();
+        var list = query.OrderByDescending(n => n.CreationTime)
+            .Skip(input.SkipCount).Take(input.MaxResultCount).ToList();
+
+        return new PagedResultDto<NotificationLogDto>(count, list.Select(ObjectMapper.Map<NotificationLog, NotificationLogDto>).ToList());
+    }
+
+    public async Task<NotificationLogDto> GetAsync(Guid id)
+    {
+        var log = await _repository.GetAsync(id);
+        return ObjectMapper.Map<NotificationLog, NotificationLogDto>(log);
+    }
+
+    /// <summary>
+    /// Get failed notification count for dashboard widget.
+    /// </summary>
+    public async Task<int> GetFailedCountAsync()
+    {
+        var query = await _repository.GetQueryableAsync();
+        return query.Count(n => n.Status == NotificationStatus.Failed || n.Status == NotificationStatus.PermanentlyFailed);
+    }
+}

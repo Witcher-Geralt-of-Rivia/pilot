@@ -1,0 +1,481 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Inventory.Entities;
+using MyERP.Manufacturing.Entities;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Domain.Services;
+
+namespace MyERP.Manufacturing.Services;
+
+/// <summary>
+/// Orchestrates production stock movements from Job Card completions.
+/// Per ERPNext v16 architecture (gotcha #962): stock movements are created via Stock Entry
+/// with purpose "Manufacture" when Job Cards complete operations.
+/// 
+/// Key rules:
+/// - Per gotcha #491: consumed_qty cannot exceed transferred_qty when backflush=MaterialTransferred
+/// - Per gotcha #432: only ONE Manufacture SE per Work Order when material_consumption ON
+/// - Per gotcha #453: unconsumed_qty = MIN(wo_qty_unconsumed / wo_qty_to_produce, bom_qty_per_unit)
+/// - Per gotcha #454: from_wip_warehouse gates WIP warehouse resolution
+/// - Per gotcha #524: validate_fg_completed_qty = fg_item_qty + process_loss_qty (exact balance)
+/// </summary>
+public class WorkOrderProductionService : DomainService
+{
+    private readonly IRepository<WorkOrder, Guid> _workOrderRepository;
+    private readonly IRepository<JobCard, Guid>? _jobCardRepository;
+
+    public WorkOrderProductionService(
+        IRepository<WorkOrder, Guid> workOrderRepository,
+        IRepository<JobCard, Guid>? jobCardRepository = null)
+    {
+        _workOrderRepository = workOrderRepository;
+        _jobCardRepository = jobCardRepository;
+    }
+
+    /// <summary>
+    /// Calculates the raw material consumption quantities for a production run.
+    /// Per gotcha #453: req_qty_each = min(wo_qty_unconsumed / wo_qty_to_produce, bom_qty_per_unit)
+    /// Then: qty = req_qty_each × fg_completed_qty
+    /// </summary>
+    public List<MaterialConsumptionItem> CalculateRawMaterialConsumption(
+        WorkOrder workOrder,
+        decimal fgCompletedQty,
+        string backflushMethod = "BOM")
+    {
+        var result = new List<MaterialConsumptionItem>();
+        if (workOrder.Quantity <= 0 || fgCompletedQty <= 0) return result;
+
+        foreach (var item in workOrder.RequiredItems)
+        {
+            decimal consumeQty;
+
+            if (backflushMethod is "Material Transferred" or "Material Transferred for Manufacture")
+            {
+                // Per gotcha #491: consumed cannot exceed transferred
+                var available = item.TransferredQuantity - item.ConsumedQuantity;
+                var proportional = item.RequiredQuantity * (fgCompletedQty / workOrder.Quantity);
+                consumeQty = Math.Min(available, proportional);
+            }
+            else // BOM-based
+            {
+                // Per gotcha #453: MIN-capped formula
+                var unconsumed = item.RequiredQuantity - item.ConsumedQuantity;
+                var perUnit = item.RequiredQuantity / workOrder.Quantity;
+                var reqQtyEach = Math.Min(
+                    workOrder.Quantity > 0 ? unconsumed / workOrder.Quantity : 0,
+                    perUnit);
+                consumeQty = reqQtyEach * fgCompletedQty;
+            }
+
+            if (consumeQty > 0)
+            {
+                result.Add(new MaterialConsumptionItem(
+                    item.ItemId,
+                    item.ItemName,
+                    Math.Round(consumeQty, 4),
+                    item.SourceWarehouseId,
+                    item.OriginalItemId));
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Validates that a production recording is allowed and returns the production parameters.
+    /// Per gotcha #524: fg_completed_qty must equal fg_item_qty + process_loss_qty (exact balance).
+    /// </summary>
+    public ProductionParameters ValidateAndGetProductionParams(
+        WorkOrder workOrder,
+        decimal produceQty,
+        decimal processLossQty,
+        decimal overproductionPercentage = 0)
+    {
+        if (workOrder.Status != WorkOrderStatus.InProcess)
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        // Per ERPNext PR #59567 / commit c625a6bafa: finished good quantity must exceed process loss
+        if (produceQty <= 0)
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", processLossQty > 0
+                    ? $"Qty for Manufacture must be greater than the process loss of {processLossQty} to produce a finished good."
+                    : "Produce quantity must be greater than zero.");
+        }
+
+        // Per gotcha #524: fg_completed_qty = produce_qty + process_loss_qty
+        var totalQty = produceQty + processLossQty;
+
+        // Per DO-NOT and ERPNext PR #58847: overproduction check including previous production and process loss
+        var maxAllowed = workOrder.Quantity * (1 + overproductionPercentage / 100m);
+        var totalManufactured = workOrder.ProducedQuantity + workOrder.ProcessLossQty + totalQty;
+        if (totalManufactured > maxAllowed)
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.WorkOrderOverproduction)
+                .WithData("maxAllowed", maxAllowed)
+                .WithData("produced", workOrder.ProducedQuantity + workOrder.ProcessLossQty)
+                .WithData("attempted", totalQty);
+        }
+
+        return new ProductionParameters(
+            ProduceQty: produceQty,
+            ProcessLossQty: processLossQty,
+            TotalFgQty: totalQty,
+            SourceWarehouseId: workOrder.WipWarehouseId ?? workOrder.SourceWarehouseId,
+            TargetWarehouseId: workOrder.FgWarehouseId);
+    }
+
+    /// <summary>
+    /// Gets the bottleneck completion qty across all Job Cards for a Work Order.
+    /// Per gotcha #760: total_completed_qty = MIN(sub_op.completed_qty for all sub_ops).
+    /// Per gotcha #236: capacity uses bin-packing algorithm (slot-based).
+    /// </summary>
+    public async Task<decimal> GetWorkOrderCompletedQtyAsync(Guid workOrderId)
+    {
+        if (_jobCardRepository != null)
+        {
+            var jcQuery = await _jobCardRepository.GetQueryableAsync();
+            var perOperationQty = jcQuery
+                .Where(jc => jc.WorkOrderId == workOrderId
+                    && jc.Status != JobCardStatus.Cancelled
+                    && !jc.IsCorrective)
+                .GroupBy(jc => jc.BomOperationId ?? jc.OperationId)
+                .Select(g => g.Sum(jc => jc.CompletedQty))
+                .ToList();
+
+            if (perOperationQty.Count > 0)
+            {
+                return perOperationQty.Min();
+            }
+        }
+
+        var wo = await _workOrderRepository.GetAsync(workOrderId);
+        return wo.ProducedQuantity;
+    }
+
+    /// <summary>
+    /// Calculates secondary item (Co-Products, By-Products, Scrap) outputs for a given production quantity.
+    /// Scaled from BOM secondary items proportional to the FG completed quantity.
+    /// </summary>
+    public List<SecondaryItemOutput> CalculateSecondaryItemOutputs(
+        BillOfMaterials bom,
+        decimal fgCompletedQty,
+        Guid? defaultScrapWarehouseId = null,
+        Guid? fgWarehouseId = null)
+    {
+        var result = new List<SecondaryItemOutput>();
+        if (bom.Quantity <= 0 || fgCompletedQty <= 0 || !bom.SecondaryItems.Any())
+            return result;
+
+        var scaleRatio = fgCompletedQty / bom.Quantity;
+
+        foreach (var secItem in bom.SecondaryItems)
+        {
+            var effectiveQty = secItem.EffectiveQuantity * scaleRatio;
+            if (effectiveQty <= 0) continue;
+
+            var targetWarehouseId = secItem.WarehouseId ??
+                (secItem.SecondaryItemType == SecondaryItemType.Scrap
+                    ? (bom.ScrapWarehouseId ?? defaultScrapWarehouseId)
+                    : (bom.TargetWarehouseId ?? fgWarehouseId));
+
+            result.Add(new SecondaryItemOutput(
+                ItemId: secItem.ItemId,
+                ItemName: secItem.ItemName,
+                SecondaryItemType: secItem.SecondaryItemType,
+                Quantity: Math.Round(effectiveQty, 4),
+                Rate: secItem.Rate,
+                CostAllocationPercentage: secItem.CostAllocationPercentage,
+                WarehouseId: targetWarehouseId
+            ));
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Aggregates secondary items (scrap, byproduct, co-product) across completed Job Cards for a Work Order.
+    /// Per ERPNext PR #59129 (commit f97660d10e):
+    /// Groups by (ItemId, SecondaryItemType, BomSecondaryItemId).
+    /// Sums StockQty.
+    /// Derives line-level metadata (StockUom, ItemName, Description) from the representative line
+    /// sorted deterministically by (Idx, CreationTime), avoiding SQL text collation divergence.
+    /// </summary>
+    public async Task<List<JobCardSecondaryItemSummary>> GetSecondaryItemsFromJobCardsAsync(
+        Guid workOrderId,
+        Guid? jobCardId = null)
+    {
+        if (_jobCardRepository == null)
+            return new List<JobCardSecondaryItemSummary>();
+
+        var jcQuery = await _jobCardRepository.GetQueryableAsync();
+        var jcs = jcQuery
+            .Where(jc => jc.WorkOrderId == workOrderId && jc.Status == JobCardStatus.Completed)
+            .WhereIf(jobCardId.HasValue, jc => jc.Id == jobCardId!.Value)
+            .ToList();
+
+        var allSecondaryItems = jcs
+            .SelectMany(jc => jc.SecondaryItems)
+            .ToList();
+
+        if (allSecondaryItems.Count == 0)
+            return new List<JobCardSecondaryItemSummary>();
+
+        var grouped = allSecondaryItems
+            .GroupBy(i => (i.ItemId, i.SecondaryItemType, i.BomSecondaryItemId))
+            .Select(g =>
+            {
+                var totalQty = g.Sum(x => x.StockQty);
+                var rep = g.OrderBy(x => x.Idx).ThenBy(x => x.CreationTime).First();
+
+                return new JobCardSecondaryItemSummary(
+                    ItemId: g.Key.ItemId,
+                    ItemName: rep.ItemName,
+                    Description: rep.Description,
+                    StockQty: totalQty,
+                    StockUom: rep.StockUom,
+                    SecondaryItemType: g.Key.SecondaryItemType,
+                    BomSecondaryItemId: g.Key.BomSecondaryItemId
+                );
+            })
+            .ToList();
+
+        return grouped;
+    }
+
+    /// <summary>
+    /// Calculates the batch breakdown for raw material consumption from Work Order transfers.
+    /// Per ERPNext PR #59600 (commit c9ece88a12):
+    /// - Accumulates batches across ALL Material Transfer for Manufacture entries (not just the last one).
+    /// - Deducts already consumed batch quantities (using Math.Abs(qty)) from prior manufacture/consumption entries.
+    /// Per ERPNext PR #59601 (commit 92d24ba583):
+    /// - Transferred batches are capped at the qty other vouchers have not reserved, when that still covers the required qty.
+    /// - Otherwise, the picks stay as they were and submit reports the reservation conflict.
+    /// Allocates the required consumption quantity across the available batches.
+    /// </summary>
+    public List<(Guid? BatchId, decimal Quantity)> CalculateTransferredBatchConsumption(
+        Guid itemId,
+        decimal requiredQty,
+        IEnumerable<StockEntryItem> transferredItems,
+        IEnumerable<StockEntryItem> priorConsumedItems,
+        IReadOnlyDictionary<Guid, decimal>? unreservedBatchQuantities = null)
+    {
+        var result = new List<(Guid? BatchId, decimal Quantity)>();
+        if (requiredQty <= 0) return result;
+
+        // Accumulate batches across ALL transfers (ERPNext PR #59600 / commit c9ece88a12)
+        var transferredBatches = new Dictionary<Guid, decimal>();
+        decimal nonBatchedTransferred = 0m;
+
+        foreach (var item in transferredItems.Where(i => i.ItemId == itemId && !i.IsFinishedItem))
+        {
+            var itemStockQty = Math.Abs(item.StockQty > 0 ? item.StockQty : item.Quantity);
+            if (item.BatchId.HasValue)
+            {
+                var bId = item.BatchId.Value;
+                transferredBatches[bId] = transferredBatches.GetValueOrDefault(bId) + itemStockQty;
+            }
+            else
+            {
+                nonBatchedTransferred += itemStockQty;
+            }
+        }
+
+        // Deduct already consumed batch quantities using abs(stock_qty) (commit c9ece88a12 & PR #61581)
+        // Per ERPNext PR #61500: require SourceWarehouseId && !TargetWarehouseId so semi-finished output rows are never counted as consumed
+        foreach (var item in priorConsumedItems.Where(i => i.ItemId == itemId && !i.IsFinishedItem && i.SourceWarehouseId.HasValue && !i.TargetWarehouseId.HasValue))
+        {
+            var itemStockQty = Math.Abs(item.StockQty > 0 ? item.StockQty : item.Quantity);
+            if (item.BatchId.HasValue)
+            {
+                var bId = item.BatchId.Value;
+                if (transferredBatches.ContainsKey(bId))
+                {
+                    transferredBatches[bId] = Math.Max(0m, transferredBatches[bId] - itemStockQty);
+                }
+            }
+            else
+            {
+                nonBatchedTransferred = Math.Max(0m, nonBatchedTransferred - itemStockQty);
+            }
+        }
+
+        var availableBatches = transferredBatches.Where(kv => kv.Value > 0).ToDictionary(kv => kv.Key, kv => kv.Value);
+
+        // If no batches were ever transferred for this item, return non-batched line
+        if (availableBatches.Count == 0)
+        {
+            result.Add((null, Math.Round(requiredQty, 4)));
+            return result;
+        }
+
+        // Per ERPNext PR #59601 (commit 92d24ba583):
+        // Transferred batches are capped at the qty other vouchers have not reserved,
+        // when that still covers the row. Otherwise the picks stay as they are and submit reports the reservation conflict.
+        var batchesToConsume = availableBatches;
+        if (unreservedBatchQuantities != null)
+        {
+            var cappedBatches = new Dictionary<Guid, decimal>();
+            foreach (var (batchId, batchQty) in availableBatches)
+            {
+                if (unreservedBatchQuantities.TryGetValue(batchId, out var unreserved) && unreserved > 0)
+                {
+                    cappedBatches[batchId] = Math.Min(batchQty, unreserved);
+                }
+            }
+
+            if (Math.Round(cappedBatches.Values.Sum(), 4) >= Math.Round(requiredQty, 4))
+            {
+                batchesToConsume = cappedBatches;
+            }
+        }
+
+        // Allocate requiredQty across batchesToConsume
+        var remaining = requiredQty;
+        foreach (var (batchId, batchQty) in batchesToConsume.Where(kv => kv.Value > 0))
+        {
+            if (remaining <= 0) break;
+            var alloc = Math.Min(remaining, batchQty);
+            result.Add((batchId, Math.Round(alloc, 4)));
+            remaining -= alloc;
+        }
+
+        if (remaining > 0)
+        {
+            result.Add((null, Math.Round(remaining, 4)));
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Splits raw material consumption across the original item and transferred alternative items
+    /// in the ratio they were transferred to the WIP warehouse.
+    /// Per ERPNext PR #60090 / commit 00efe4e233.
+    /// </summary>
+    public List<MaterialConsumptionSplit> CalculateAlternativeItemConsumption(
+        Guid originalItemId,
+        decimal requiredQty,
+        IEnumerable<StockEntryItem> transferredItems,
+        IEnumerable<StockEntryItem> priorConsumedItems)
+    {
+        var result = new List<MaterialConsumptionSplit>();
+        if (requiredQty <= 0) return result;
+
+        // Filter transfers matching this BOM item (either original item or alternative item)
+        var matchingTransfers = transferredItems
+            .Where(t => !t.IsFinishedItem && ((t.OriginalItemId.HasValue && t.OriginalItemId.Value == originalItemId) || (!t.OriginalItemId.HasValue && t.ItemId == originalItemId)))
+            .ToList();
+
+        // If no alternative item was transferred (only the base item, or nothing), return single item
+        var hasAlternative = matchingTransfers.Any(t => t.OriginalItemId == originalItemId || (t.ItemId != originalItemId && t.OriginalItemId == originalItemId));
+        if (!hasAlternative)
+        {
+            result.Add(new MaterialConsumptionSplit(originalItemId, null, Math.Round(requiredQty, 4)));
+            return result;
+        }
+
+        // Group candidate items transferred against this original item
+        var candidateItemIds = matchingTransfers.Select(t => t.ItemId).Distinct().ToList();
+
+        // Calculate available qty in WIP: transferred - prior consumed
+        var candidates = new List<(Guid ItemId, decimal TransferredQty, decimal AvailableQty)>();
+        foreach (var cItemId in candidateItemIds)
+        {
+            var transferred = matchingTransfers
+                .Where(t => t.ItemId == cItemId)
+                .Sum(t => Math.Abs(t.StockQty > 0 ? t.StockQty : t.Quantity));
+
+            var consumed = priorConsumedItems
+                .Where(c => !c.IsFinishedItem && c.SourceWarehouseId.HasValue && !c.TargetWarehouseId.HasValue && c.ItemId == cItemId && ((c.OriginalItemId.HasValue && c.OriginalItemId.Value == originalItemId) || (!c.OriginalItemId.HasValue && c.ItemId == originalItemId)))
+                .Sum(c => Math.Abs(c.StockQty > 0 ? c.StockQty : c.Quantity));
+
+            var available = Math.Max(0m, transferred - consumed);
+            candidates.Add((cItemId, transferred, available));
+        }
+
+        // If available qty exists, use available ratio; else fallback to transferred ratio (for overproduction)
+        var totalAvailable = candidates.Sum(c => c.AvailableQty);
+        var weights = totalAvailable > 0
+            ? candidates.Select(c => (c.ItemId, Weight: c.AvailableQty)).ToList()
+            : candidates.Select(c => (c.ItemId, Weight: c.TransferredQty)).ToList();
+
+        var totalWeight = weights.Sum(w => w.Weight);
+        if (totalWeight <= 0)
+        {
+            result.Add(new MaterialConsumptionSplit(originalItemId, null, Math.Round(requiredQty, 4)));
+            return result;
+        }
+
+        var activeWeights = weights.Where(w => w.Weight > 0).ToList();
+        var pending = requiredQty;
+        for (int i = 0; i < activeWeights.Count; i++)
+        {
+            var w = activeWeights[i];
+            decimal splitQty;
+            if (i == activeWeights.Count - 1)
+            {
+                splitQty = pending;
+            }
+            else
+            {
+                splitQty = Math.Min(pending, Math.Round(requiredQty * (w.Weight / totalWeight), 4));
+            }
+
+            pending -= splitQty;
+            if (splitQty > 0)
+            {
+                var isAlt = w.ItemId != originalItemId;
+                result.Add(new MaterialConsumptionSplit(w.ItemId, isAlt ? originalItemId : null, splitQty));
+            }
+        }
+
+        return result;
+    }
+}
+
+/// <summary>Split breakdown for raw material consumption when alternative items were transferred (PR #60090).</summary>
+public record MaterialConsumptionSplit(
+    Guid ItemId,
+    Guid? OriginalItemId,
+    decimal Quantity);
+
+/// <summary>Raw material consumption line for production stock entry.</summary>
+public record MaterialConsumptionItem(
+    Guid ItemId,
+    string ItemName,
+    decimal Quantity,
+    Guid? SourceWarehouseId,
+    Guid? OriginalItemId = null,
+    Guid? BatchId = null);
+
+/// <summary>Validated production parameters for stock entry creation.</summary>
+public record ProductionParameters(
+    decimal ProduceQty,
+    decimal ProcessLossQty,
+    decimal TotalFgQty,
+    Guid? SourceWarehouseId,
+    Guid? TargetWarehouseId);
+
+/// <summary>Calculated secondary item output line for production stock entry.</summary>
+public record SecondaryItemOutput(
+    Guid ItemId,
+    string? ItemName,
+    SecondaryItemType SecondaryItemType,
+    decimal Quantity,
+    decimal Rate,
+    decimal CostAllocationPercentage,
+    Guid? WarehouseId);
+
+/// <summary>Summary of Job Card secondary item output across completed job cards.</summary>
+public record JobCardSecondaryItemSummary(
+    Guid ItemId,
+    string ItemName,
+    string? Description,
+    decimal StockQty,
+    string StockUom,
+    SecondaryItemType SecondaryItemType,
+    Guid? BomSecondaryItemId);
+

@@ -1,0 +1,182 @@
+import type { CreatePurchaseOrderDto, PendingMaterialRequestItemDto, PurchaseOrderDto, PurchaseOrderTrackingBoardDto, RecordSupplierConfirmationDto, UpdateDropShipDeliveredQtyDto, UpdateOrderItemsDto, UpdateOrderItemsResultDto } from './models';
+import { RestService, Rest } from '@abp/ng.core';
+import type { PagedResultDto } from '@abp/ng.core';
+import { Injectable, inject } from '@angular/core';
+import type { OrderPaymentDto, OrderReceiptDto } from '../sales/models';
+import type { BulkOperationResultDto, CompanyFilteredPagedRequestDto } from '../shared/models';
+
+@Injectable({
+  providedIn: 'root',
+})
+export class PurchaseOrderService {
+  private restService = inject(RestService);
+  apiName = 'Default';
+  
+
+  amend = (id: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, PurchaseOrderDto>({
+      method: 'POST',
+      url: `/api/app/purchase-order/${id}/amend`,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  bulkSubmit = (ids: string[], config?: Partial<Rest.Config>) =>
+    this.restService.request<any, BulkOperationResultDto>({
+      method: 'POST',
+      url: '/api/app/purchase-order/bulk-submit',
+      body: ids,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  cancel = (id: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, PurchaseOrderDto>({
+      method: 'POST',
+      url: `/api/app/purchase-order/${id}/cancel`,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  close = (id: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, PurchaseOrderDto>({
+      method: 'POST',
+      url: `/api/app/purchase-order/${id}/close`,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  closeItem = (id: string, itemId: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, PurchaseOrderDto>({
+      method: 'POST',
+      url: `/api/app/purchase-order/${id}/close-item/${itemId}`,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  create = (input: CreatePurchaseOrderDto, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, PurchaseOrderDto>({
+      method: 'POST',
+      url: '/api/app/purchase-order',
+      body: input,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  delete = (id: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, void>({
+      method: 'DELETE',
+      url: `/api/app/purchase-order/${id}`,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  get = (id: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, PurchaseOrderDto>({
+      method: 'GET',
+      url: `/api/app/purchase-order/${id}`,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  getList = (input: CompanyFilteredPagedRequestDto, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, PagedResultDto<PurchaseOrderDto>>({
+      method: 'GET',
+      url: '/api/app/purchase-order',
+      params: { companyId: input.companyId, filter: input.filter, status: input.status, fromDate: input.fromDate, toDate: input.toDate, sorting: input.sorting, skipCount: input.skipCount, maxResultCount: input.maxResultCount },
+    },
+    { apiName: this.apiName,...config });
+  
+
+  getOrderPayments = (id: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, OrderPaymentDto[]>({
+      method: 'GET',
+      url: `/api/app/purchase-order/${id}/order-payments`,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  getOrderReceipts = (id: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, OrderReceiptDto[]>({
+      method: 'GET',
+      url: `/api/app/purchase-order/${id}/order-receipts`,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  getPendingMaterialRequestItems = (companyId?: string, supplierId?: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, PendingMaterialRequestItemDto[]>({
+      method: 'GET',
+      url: '/api/app/purchase-order/pending-material-request-items',
+      params: { companyId, supplierId },
+    },
+    { apiName: this.apiName,...config });
+  
+
+  getTrackingBoard = (companyId: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, PurchaseOrderTrackingBoardDto>({
+      method: 'GET',
+      url: `/api/app/purchase-order/tracking-board/${companyId}`,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  recordSupplierConfirmation = (id: string, input: RecordSupplierConfirmationDto, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, PurchaseOrderDto>({
+      method: 'POST',
+      url: `/api/app/purchase-order/${id}/record-supplier-confirmation`,
+      body: input,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  reopen = (id: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, PurchaseOrderDto>({
+      method: 'POST',
+      url: `/api/app/purchase-order/${id}/reopen`,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  reopenItem = (id: string, itemId: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, PurchaseOrderDto>({
+      method: 'POST',
+      url: `/api/app/purchase-order/${id}/reopen-item/${itemId}`,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  submit = (id: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, PurchaseOrderDto>({
+      method: 'POST',
+      url: `/api/app/purchase-order/${id}/submit`,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  update = (id: string, input: CreatePurchaseOrderDto, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, PurchaseOrderDto>({
+      method: 'PUT',
+      url: `/api/app/purchase-order/${id}`,
+      body: input,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  updateDropShipDeliveredQty = (id: string, input: UpdateDropShipDeliveredQtyDto, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, PurchaseOrderDto>({
+      method: 'PUT',
+      url: `/api/app/purchase-order/${id}/drop-ship-delivered-qty`,
+      body: input,
+    },
+    { apiName: this.apiName,...config });
+  
+
+  updateItems = (id: string, input: UpdateOrderItemsDto, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, UpdateOrderItemsResultDto>({
+      method: 'PUT',
+      url: `/api/app/purchase-order/${id}/items`,
+      body: input,
+    },
+    { apiName: this.apiName,...config });
+}

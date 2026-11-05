@@ -1,0 +1,138 @@
+<abp-page [title]="'::OutstandingInvoices' | abpLocalization">
+  <div class="row g-3 mb-4">
+    <div class="col-md-4">
+      <div class="card">
+        <div class="card-body text-center py-3">
+          <p class="fs-3 fw-bold text-danger font-monospace">{{ "" | companyCurrency }} {{ totalOutstanding() | number:'1.2-2' }}</p>
+          <small class="text-muted">{{ '::TotalOutstanding' | abpLocalization }}</small>
+        </div>
+      </div>
+    </div>
+    <div class="col-md-4">
+      <div class="card">
+        <div class="card-body text-center py-3">
+          <p class="fs-3 fw-bold text-warning">{{ overdueCount() }}</p>
+          <small class="text-muted">{{ '::OverdueInvoices' | abpLocalization }}</small>
+        </div>
+      </div>
+    </div>
+    <div class="col-md-4">
+      <div class="card">
+        <div class="card-body text-center py-3">
+          <p class="fs-3 fw-bold">{{ invoices().length }}</p>
+          <small class="text-muted">{{ '::TotalInvoices' | abpLocalization }}</small>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+      <div class="d-flex gap-2 align-items-center">
+        <select class="form-select form-select-sm" style="width: 150px;" [(ngModel)]="partyType" (change)="onPartyTypeChange()">
+          <option value="Customer">{{ '::Receivables' | abpLocalization }}</option>
+          <option value="Supplier">{{ '::Payables' | abpLocalization }}</option>
+        </select>
+      </div>
+      <div class="d-flex gap-2">
+        @if (hasSelection()) {
+          <button class="btn btn-sm btn-success" (click)="createBatchPayment()" [disabled]="isCreatingBatchPayment()">
+            <i class="fa fa-money-bill-transfer me-1"></i>{{ '::CreateBatchPayment' | abpLocalization }}
+            <span class="badge bg-light text-success ms-1">{{ selectionCount() }}</span>
+          </button>
+          <button class="btn btn-sm btn-outline-secondary" (click)="clearSelection()">
+            <i class="fa fa-xmark me-1"></i>{{ '::ClearSelection' | abpLocalization }}
+          </button>
+        }
+        <button class="btn btn-sm btn-outline-secondary" (click)="exportCsv()">
+          <i class="fa fa-download me-1"></i>{{ '::ExportCSV' | abpLocalization }}
+        </button>
+      </div>
+    </div>
+    <div class="card-body">
+      @if (hasSelection()) {
+        <div class="alert alert-info d-flex justify-content-between align-items-center mb-3 py-2">
+          <span>
+            <i class="fa fa-check-circle me-2"></i>
+            <strong>{{ selectionCount() }}</strong> {{ '::InvoicesSelected' | abpLocalization }}
+            — {{ '::Total' | abpLocalization }}: <strong class="font-monospace">{{ "" | companyCurrency }} {{ selectionTotal() | number:'1.2-2' }}</strong>
+          </span>
+        </div>
+      }
+      @if (isLoading()) {
+        <div class="text-center py-4">
+          <div class="spinner-border text-primary" role="status">
+            <span class="visually-hidden">Loading...</span>
+          </div>
+        </div>
+      } @else if (invoices().length === 0) {
+        <div class="text-center py-5">
+          <i class="fa fa-check-circle fa-3x text-success mb-3 d-block"></i>
+          <h6 class="text-muted">{{ '::NoOutstandingInvoices' | abpLocalization }}</h6>
+        </div>
+      } @else {
+        <div class="table-responsive">
+          <table class="table table-hover">
+            <thead>
+              <tr>
+                <th style="width: 40px;">
+                  <input type="checkbox" class="form-check-input" [checked]="selectedIds().size === invoices().length && invoices().length > 0" (change)="toggleSelectAll()">
+                </th>
+                <th>{{ '::InvoiceNumber' | abpLocalization }}</th>
+                <th>{{ partyType }}</th>
+                <th>{{ '::IssueDate' | abpLocalization }}</th>
+                <th>{{ '::DueDate' | abpLocalization }}</th>
+                <th class="text-end">{{ '::Total' | abpLocalization }}</th>
+                <th class="text-end">{{ '::Outstanding' | abpLocalization }}</th>
+                <th class="text-end">{{ '::DaysOverdue' | abpLocalization }}</th>
+                <th class="text-end">{{ '::Actions' | abpLocalization }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (inv of invoices(); track inv.id) {
+                <tr [class.table-primary]="isSelected(inv)">
+                  <td>
+                    <input type="checkbox" class="form-check-input" [checked]="isSelected(inv)" (change)="toggleSelection(inv)">
+                  </td>
+                  <td>
+                    <a [routerLink]="partyType === 'Customer' ? ['/sales/invoices', inv.id] : ['/purchasing/invoices', inv.id]"
+                      class="fw-medium text-decoration-none">{{ inv.invoiceNumber }}</a>
+                  </td>
+                  <td>{{ inv.partyName }}</td>
+                  <td>{{ inv.issueDate | date:'dd/MM/yyyy' }}</td>
+                  <td>{{ inv.dueDate | date:'dd/MM/yyyy' }}</td>
+                  <td class="text-end font-monospace">{{ inv.grandTotal | number:'1.2-2' }}</td>
+                  <td class="text-end font-monospace fw-bold text-danger">{{ inv.outstandingAmount | number:'1.2-2' }}</td>
+                  <td class="text-end">
+                    <span [class]="inv.daysOverdue > 30 ? 'badge bg-danger' : inv.daysOverdue > 0 ? 'badge bg-warning text-dark' : 'badge bg-success'">
+                      {{ inv.daysOverdue }}d
+                    </span>
+                  </td>
+                  <td class="text-end">
+                    <div class="btn-group btn-group-sm">
+                      <button class="btn btn-outline-success" (click)="makePayment(inv)" title="{{ '::MakePayment' | abpLocalization }}">
+                        <i class="fa fa-money-bill"></i>
+                      </button>
+                      @if (inv.daysOverdue > 0) {
+                        <button class="btn btn-outline-warning" (click)="sendReminder(inv)" title="{{ '::SendReminder' | abpLocalization }}">
+                          <i class="fa fa-bell"></i>
+                        </button>
+                      }
+                    </div>
+                  </td>
+                </tr>
+              }
+            </tbody>
+            <tfoot>
+              <tr class="fw-bold">
+                <td colspan="6">{{ '::Total' | abpLocalization }}</td>
+                <td class="text-end font-monospace text-danger">{{ "" | companyCurrency }} {{ totalOutstanding() | number:'1.2-2' }}</td>
+                <td colspan="2"></td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      }
+    </div>
+  </div>
+</abp-page>

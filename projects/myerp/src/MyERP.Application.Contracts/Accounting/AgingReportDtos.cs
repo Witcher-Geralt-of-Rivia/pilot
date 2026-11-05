@@ -1,0 +1,105 @@
+using System;
+
+namespace MyERP.Accounting;
+
+public class AgingReportDto
+{
+    public string ReportType { get; set; } = null!;
+    public DateTime AsOfDate { get; set; }
+    public string CalculateAgeingWith { get; set; } = "Report Date";
+    public string AgeingBasedOn { get; set; } = "Due Date";
+    public string[] BucketLabels { get; set; } = [];
+    public decimal[] BucketTotals { get; set; } = [];
+    /// <summary>Amount not yet due (due date in future relative to asOfDate). Maps to ERPNext range0.</summary>
+    public decimal NotYetDueAmount { get; set; }
+    public decimal TotalOutstanding { get; set; }
+    public int InvoiceCount { get; set; }
+    public bool IncludeRevaluationJournals { get; set; }
+    public AgingDetailEntryDto[] Details { get; set; } = [];
+    public AgingPartySummaryDto[] PartySummaries { get; set; } = [];
+}
+
+/// <summary>
+/// Party-level summary entry for Accounts Receivable / Payable Summary report.
+/// Per ERPNext accounts_receivable_summary.py / PR #60040 (commit 66c9332582):
+/// Aggregates invoiced, paid, advance, outstanding, and ageing buckets per party.
+/// Advance amounts from non-invoice vouchers reflect unallocated credit only.
+/// </summary>
+public class AgingPartySummaryDto
+{
+    public Guid PartyId { get; set; }
+    public string? PartyName { get; set; }
+    public Guid? PartyGroupId { get; set; }
+    public string? PartyGroupName { get; set; }
+    public decimal InvoicedAmount { get; set; }
+    public decimal PaidAmount { get; set; }
+    public decimal CreditNoteAmount { get; set; }
+    public decimal OutstandingAmount { get; set; }
+    /// <summary>
+    /// Advance payments from party. Per ERPNext PR #60040 / commit 66c9332582:
+    /// only unallocated credit (max(paid - invoiced, 0)) on non-invoice vouchers counts as advance.
+    /// </summary>
+    public decimal AdvanceAmount { get; set; }
+    public decimal NotYetDueAmount { get; set; }
+    public decimal[] BucketTotals { get; set; } = [];
+    public decimal TotalDue { get; set; }
+    public int InvoiceCount { get; set; }
+}
+
+public class AgingDetailEntryDto
+{
+    public Guid PartyId { get; set; }
+    public string? PartyName { get; set; }
+    public Guid? PartyGroupId { get; set; }
+    public string? PartyGroupName { get; set; }
+    public Guid DocumentId { get; set; }
+    public string DocumentNumber { get; set; } = null!;
+    public DateTime PostingDate { get; set; }
+    public DateTime DueDate { get; set; }
+    public decimal OutstandingAmount { get; set; }
+    public int AgeDays { get; set; }
+    public string BucketLabel { get; set; } = null!;
+    public Guid? CostCenterId { get; set; }
+    public string? CostCenterName { get; set; }
+}
+
+public class AgingReportRequestDto
+{
+    public Guid CompanyId { get; set; }
+    public DateTime? AsOfDate { get; set; }
+    /// <summary>
+    /// Per ERPNext PR #47580 / commit c67ba2d49b: "Report Date" (default) or "Today Date".
+    /// </summary>
+    public string? CalculateAgeingWith { get; set; } = "Report Date";
+
+    /// <summary>
+    /// "Due Date" (default) or "Posting Date".
+    /// </summary>
+    public string? AgeingBasedOn { get; set; } = "Due Date";
+
+    /// <summary>Optional party filter (Customer for AR, Supplier for AP).</summary>
+    public Guid? PartyId { get; set; }
+
+    /// <summary>
+    /// Optional party group filter (CustomerGroup for AR, SupplierGroup for AP per ERPNext PR #58179).
+    /// </summary>
+    public Guid? PartyGroupId { get; set; }
+
+    /// <summary>Optional invoice posting date range filter.</summary>
+    public DateTime? FromDate { get; set; }
+    public DateTime? ToDate { get; set; }
+
+    /// <summary>
+    /// Per ERPNext PR #59181: Include exchange rate revaluation journal entries in the report.
+    /// </summary>
+    public bool IncludeRevaluationJournals { get; set; }
+}
+
+public class SendPaymentReminderInput
+{
+    public Guid PartyId { get; set; }
+    public string PartyName { get; set; } = null!;
+    public string PartyType { get; set; } = "Customer";
+    public decimal OverdueAmount { get; set; }
+    public int InvoiceCount { get; set; }
+}

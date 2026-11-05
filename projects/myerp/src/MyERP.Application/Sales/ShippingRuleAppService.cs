@@ -1,0 +1,132 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyERP.Permissions;
+using MyERP.Sales.Entities;
+using Microsoft.AspNetCore.Authorization;
+using Volo.Abp.Application.Dtos;
+using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Repositories;
+
+namespace MyERP.Sales;
+
+[Authorize(MyERPPermissions.ShippingRules.Default)]
+public class ShippingRuleAppService : ApplicationService, IShippingRuleAppService
+{
+    private readonly IRepository<ShippingRule, Guid> _repository;
+
+    public ShippingRuleAppService(IRepository<ShippingRule, Guid> repository)
+    {
+        _repository = repository;
+    }
+
+    public async Task<ShippingRuleDto> GetAsync(Guid id)
+    {
+        var rule = await _repository.GetAsync(id);
+        return ObjectMapper.Map<ShippingRule, ShippingRuleDto>(rule);
+    }
+
+    public async Task<PagedResultDto<ShippingRuleDto>> GetListAsync(PagedAndSortedResultRequestDto input)
+    {
+        var query = await _repository.GetQueryableAsync();
+        var count = query.Count();
+        var list = query.OrderBy(x => x.Label)
+            .Skip(input.SkipCount).Take(input.MaxResultCount).ToList();
+
+        return new PagedResultDto<ShippingRuleDto>(count, list.Select(ObjectMapper.Map<ShippingRule, ShippingRuleDto>).ToList());
+    }
+
+    [Authorize(MyERPPermissions.ShippingRules.Create)]
+    public async Task<ShippingRuleDto> CreateAsync(CreateShippingRuleDto input)
+    {
+        if (input.FixedAmount < 0)
+        {
+            throw new Volo.Abp.BusinessException(MyERPDomainErrorCodes.AmountMustBePositive)
+                .WithData("field", "FixedAmount");
+        }
+
+        var rule = new ShippingRule(
+            GuidGenerator.Create(),
+            input.Label,
+            input.RuleType,
+            input.CalculationMode,
+            input.AccountId,
+            input.CompanyId,
+            CurrentTenant.Id);
+
+        rule.FixedAmount = input.FixedAmount;
+        rule.IsEnabled = input.IsEnabled;
+        rule.CostCenterId = input.CostCenterId;
+        rule.ProjectId = input.ProjectId;
+
+        foreach (var cond in input.Conditions)
+        {
+            rule.AddCondition(cond.FromValue, cond.ToValue, cond.ShippingAmount);
+        }
+
+        foreach (var country in input.Countries)
+        {
+            rule.AddCountry(country);
+        }
+
+        // Per ERPNext PR #59142: validate shipping rule account company
+        if (input.CompanyId != Guid.Empty && input.AccountId != Guid.Empty)
+        {
+            var accountRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Accounting.Entities.Account, Guid>>();
+            var account = await accountRepo.FindAsync(input.AccountId);
+            if (account != null)
+            {
+                rule.ValidateAccountCompany(account);
+            }
+        }
+
+        rule.Validate();
+        await _repository.InsertAsync(rule);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "ShippingRule", rule.Id,
+            "Created", rule.CompanyId ?? Guid.Empty,
+            rule.Label, "Draft", "Active", CurrentUser.Id,
+            $"Shipping rule '{rule.Label}' created", CurrentTenant.Id));
+
+        return ObjectMapper.Map<ShippingRule, ShippingRuleDto>(rule);
+    }
+
+    [Authorize(MyERPPermissions.ShippingRules.Edit)]
+    public async Task<ShippingRuleDto> ToggleAsync(Guid id, bool isEnabled)
+    {
+        var rule = await _repository.GetAsync(id);
+        rule.IsEnabled = isEnabled;
+        await _repository.UpdateAsync(rule);
+
+        var activityLogRepo = LazyServiceProvider.LazyGetRequiredService<IRepository<Core.Entities.DocumentActivityLog, Guid>>();
+        await activityLogRepo.InsertAsync(new Core.Entities.DocumentActivityLog(
+            GuidGenerator.Create(), "ShippingRule", rule.Id,
+            isEnabled ? "Enabled" : "Disabled", rule.CompanyId ?? Guid.Empty,
+            rule.Label, isEnabled ? "Disabled" : "Enabled", isEnabled ? "Enabled" : "Disabled", CurrentUser.Id,
+            $"Shipping rule '{rule.Label}' {(isEnabled ? "enabled" : "disabled")}", CurrentTenant.Id));
+
+        return ObjectMapper.Map<ShippingRule, ShippingRuleDto>(rule);
+    }
+
+    [Authorize(MyERPPermissions.ShippingRules.Delete)]
+    public async Task DeleteAsync(Guid id)
+    {
+        await _repository.DeleteAsync(id);
+    }
+
+    /// <summary>
+    /// Calculate shipping charge for a given value and country (preview for UI).
+    /// </summary>
+    public async Task<decimal> CalculateAsync(Guid ruleId, decimal value, string? countryCode = null)
+    {
+        var rule = await _repository.GetAsync(ruleId);
+
+        if (countryCode != null && !rule.AppliesToCountry(countryCode))
+            return 0;
+
+        return rule.Calculate(value);
+    }
+}

@@ -1,0 +1,185 @@
+using System;
+using System.Collections.Generic;
+using Volo.Abp;
+using Volo.Abp.Domain.Entities.Auditing;
+using Volo.Abp.MultiTenancy;
+
+namespace MyERP.CRM.Entities;
+
+public class Opportunity : FullAuditedAggregateRoot<Guid>, IMultiTenant
+{
+    public Guid? TenantId { get; set; }
+
+    public string OpportunityNumber { get; set; } = null!;
+    public string Title { get; set; } = null!;
+    public OpportunityStatus Status { get; private set; }
+    public MyERP.CRM.OpportunityType OpportunityType { get; set; }
+
+    // Source
+    public Guid? LeadId { get; set; }
+    public Guid? CustomerId { get; set; }
+    public string? ContactName { get; set; }
+    public string? ContactEmail { get; set; }
+    public string? ContactPhone { get; set; }
+
+    // Sales pipeline
+    public string? SalesStage { get; set; }
+    public int Probability { get; set; }
+    public DateTime? ExpectedClosingDate { get; set; }
+
+    // Financials
+    public decimal OpportunityAmount { get; set; }
+    public string CurrencyCode { get; set; } = "MYR";
+
+    // Organization
+    public Guid CompanyId { get; set; }
+    public Guid? AssignedUserId { get; set; }
+    public string? Territory { get; set; }
+
+    // Loss tracking
+    public string? LostReason { get; set; }
+    public DateTime? LostOn { get; set; }
+
+    public string? Notes { get; set; }
+
+    // Campaign & UTM tracking (per ERPNext Lead & Opportunity doctypes)
+    public string? CampaignName { get; set; }
+    public string? UtmCampaign { get; set; }
+    public string? UtmSource { get; set; }
+    public string? UtmMedium { get; set; }
+
+    // Multi-currency conversion rate to company base currency
+    public decimal ConversionRate { get; set; } = 1.0m;
+
+    // Response tracking (per ERPNext PR #59922 / commit ab8a279282)
+    public DateTime? FirstRespondedOn { get; set; }
+    public double? FirstResponseTime { get; set; } // duration in seconds
+
+    // Child items
+    public List<OpportunityItem> Items { get; private set; } = new();
+
+    protected Opportunity() { }
+
+    public Opportunity(Guid id, Guid companyId, string opportunityNumber, string title, Guid? tenantId = null)
+        : base(id)
+    {
+        CompanyId = companyId;
+        OpportunityNumber = opportunityNumber;
+        Title = title;
+        Status = OpportunityStatus.Open;
+        Probability = 20;
+        SalesStage = "Prospecting";
+        TenantId = tenantId;
+    }
+
+    /// <summary>Creates a note-thread entry for this Opportunity.</summary>
+    public CrmNote AddNote(Guid noteId, string noteText, Guid addedByUserId) =>
+        new(noteId, "Opportunity", Id, noteText, addedByUserId, TenantId);
+
+    public void MarkReplied()
+    {
+        if (Status != OpportunityStatus.Open)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = OpportunityStatus.Replied;
+        if (!FirstRespondedOn.HasValue)
+        {
+            FirstRespondedOn = DateTime.UtcNow;
+            FirstResponseTime = Math.Max(0, (FirstRespondedOn.Value - CreationTime).TotalSeconds);
+        }
+    }
+
+    /// <summary>
+    /// Explicitly sets first response date and computes duration in seconds.
+    /// Per ERPNext PR #59922 / commit ab8a279282.
+    /// </summary>
+    public void SetFirstResponseTime(DateTime respondedOn)
+    {
+        FirstRespondedOn = respondedOn;
+        FirstResponseTime = Math.Max(0, (respondedOn - CreationTime).TotalSeconds);
+    }
+
+    public void MarkQuotation()
+    {
+        if (Status is not (OpportunityStatus.Open or OpportunityStatus.Replied))
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = OpportunityStatus.Quotation;
+    }
+
+    public void Convert()
+    {
+        if (Status is not (OpportunityStatus.Open or OpportunityStatus.Quotation or OpportunityStatus.Replied))
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = OpportunityStatus.Converted;
+    }
+
+    /// <summary>Reverts converted opportunity back to Quotation status when Sales Order is cancelled.</summary>
+    public void RevertToQuotation()
+    {
+        if (Status != OpportunityStatus.Converted)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = OpportunityStatus.Quotation;
+    }
+
+    public void DeclareLost(string? reason = null)
+    {
+        if (Status == OpportunityStatus.Converted)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = OpportunityStatus.Lost;
+        LostReason = reason;
+        LostOn = DateTime.UtcNow.Date;
+    }
+
+    public void Close()
+    {
+        if (Status == OpportunityStatus.Converted)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = OpportunityStatus.Closed;
+    }
+
+    public void Reopen()
+    {
+        if (Status is not (OpportunityStatus.Lost or OpportunityStatus.Closed or OpportunityStatus.Quotation))
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = OpportunityStatus.Open;
+        LostReason = null;
+        LostOn = null;
+    }
+
+    public void ValidateItems()
+    {
+        foreach (var item in Items)
+        {
+            if (item.Quantity <= 0)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Quantity must be greater than 0 for item '{item.Description}'.");
+            }
+        }
+    }
+
+    public void AddItem(string description, decimal quantity, decimal unitPrice, Guid? itemId = null, string? uom = null)
+    {
+        if (quantity <= 0)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"Quantity must be greater than 0 for item '{description}'.");
+        }
+
+        var item = new OpportunityItem(Guid.NewGuid(), Id, description, quantity, unitPrice)
+        {
+            ItemId = itemId,
+            Uom = uom
+        };
+        Items.Add(item);
+        RecalculateAmount();
+    }
+
+    public void RecalculateAmount()
+    {
+        OpportunityAmount = 0;
+        foreach (var item in Items)
+        {
+            OpportunityAmount += item.Amount;
+        }
+    }
+}

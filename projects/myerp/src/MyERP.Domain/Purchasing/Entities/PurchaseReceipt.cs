@@ -1,0 +1,338 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using MyERP.Accounting.DomainServices;
+using MyERP.Core;
+using Volo.Abp;
+using Volo.Abp.Domain.Entities.Auditing;
+using Volo.Abp.MultiTenancy;
+
+namespace MyERP.Purchasing.Entities;
+
+/// <summary>
+/// Purchase Receipt — records goods received from supplier.
+/// Maps to ERPNext stock/doctype/purchase_receipt.
+/// Links to Purchase Order; subsequently linked by Purchase Invoice.
+/// On submit: increases warehouse stock via stock ledger.
+/// </summary>
+public class PurchaseReceipt : FullAuditedAggregateRoot<Guid>, IMultiTenant, IAccountableDocument, IAmendable
+{
+    public Guid? TenantId { get; set; }
+    public Guid CompanyId { get; set; }
+    public Guid? BranchId { get; set; }
+
+    public string ReceiptNumber { get; set; } = null!;
+    public DateTime PostingDate { get; set; }
+
+    public Guid SupplierId { get; set; }
+
+    /// <summary>Reference to Purchase Order this receipt fulfills.</summary>
+    public Guid? PurchaseOrderId { get; set; }
+
+    /// <summary>Target warehouse where goods are received.</summary>
+    public Guid WarehouseId { get; set; }
+
+    /// <summary>Supplier's delivery note / DO number.</summary>
+    public string? SupplierDeliveryNote { get; set; }
+
+    /// <summary>
+    /// Total purchase expense after deducting LCV amounts (for SRBNB/Purchase Expense GL entries).
+    /// </summary>
+    public decimal PurchaseExpenseTotal => _items.Sum(i => i.GetPurchaseExpenseGlAmount(ExchangeRate));
+
+    public string CurrencyCode { get; set; } = "MYR";
+    public decimal NetTotal { get; set; }
+    public decimal TaxAmount { get; set; }
+    public decimal GrandTotal { get; set; }
+
+    /// <summary>Whether this is a return receipt (reversal).</summary>
+    public bool IsReturn { get; set; }
+
+    /// <summary>If IsReturn, reference to the original purchase receipt.</summary>
+    public Guid? ReturnAgainstId { get; set; }
+
+    /// <summary>Whether this receipt is for a subcontracted purchase order.</summary>
+    public bool IsSubcontracted { get; set; }
+
+    public string? Notes { get; set; }
+
+    // Amendment support
+    public Guid? AmendedFromId { get; set; }
+    public int AmendmentIndex { get; set; }
+
+    public DocumentStatus Status { get; private set; } = DocumentStatus.Draft;
+
+    /// <summary>Exchange rate for multi-currency receipts (transaction → company currency).</summary>
+    public decimal ExchangeRate { get; set; } = 1m;
+
+    /// <summary>
+    /// Whether the exchange rate was fetched for the receipt's posting date rather than copied from the Purchase Order.
+    /// Per ERPNext PR #60180 (Buying Settings: use_transaction_date_exchange_rate).
+    /// </summary>
+    public bool UseTransactionDateExchangeRate { get; set; }
+
+    // IAccountableDocument
+    string IAccountableDocument.DocumentType => "PurchaseReceipt";
+    Guid? IAccountableDocument.CustomerId => null;
+    Guid? IAccountableDocument.SupplierId => SupplierId;
+    decimal IAccountableDocument.PurchaseExpenseTotal => PurchaseExpenseTotal;
+
+    private readonly List<PurchaseReceiptItem> _items = new();
+    /// <summary>Rows in document order (Idx), since the database gives no ordering guarantee.</summary>
+    public IReadOnlyList<PurchaseReceiptItem> Items => _items.OrderBy(i => i.Idx).ThenBy(i => i.CreationTime).ToList();
+
+    /// <summary>
+    /// Billing completion percentage. Uses MIN% formula per ERPNext StatusUpdater.
+    /// Excludes closed rows (settled by close, per ERPNext PR #57596).
+    /// </summary>
+    public decimal PerBilled
+    {
+        get
+        {
+            if (!_items.Any()) return 0m;
+            var openItems = _items.Where(i => !i.IsClosed).ToList();
+            var basis = openItems.Count > 0 ? openItems : _items;
+            if (basis.Count == 0) return 0m;
+
+            var basisTotal = basis.Sum(i => i.BillableQty * i.UnitPrice);
+            if (basisTotal > 0)
+            {
+                var billedAmount = basis.Sum(i => Math.Min(i.BillableQty, Math.Abs(i.BilledQty)) * i.UnitPrice);
+                return Math.Min(100m, Math.Round(billedAmount / basisTotal * 100m, 2));
+            }
+
+            var totalNetQty = basis.Sum(i => i.BillableQty);
+            if (totalNetQty > 0)
+            {
+                var billedQty = basis.Sum(i => Math.Min(i.BillableQty, Math.Abs(i.BilledQty)));
+                return Math.Min(100m, Math.Round(billedQty / totalNetQty * 100m, 2));
+            }
+
+            return 100m;
+        }
+    }
+
+    /// <summary>
+    /// Purchase Receipt Billing Status indicator per ERPNext status updater:
+    /// Draft -> To Bill (0%) -> Partially Billed (0-100%) -> Completed (100%) / Return / Cancelled / Closed
+    /// </summary>
+    public string BillingStatus
+    {
+        get
+        {
+            if (Status == DocumentStatus.Draft) return "Draft";
+            if (Status == DocumentStatus.Cancelled) return "Cancelled";
+            if (Status == DocumentStatus.Closed) return "Closed";
+            if (PerBilled >= 100m) return "Completed";
+            if (IsReturn) return "Return";
+            if (PerBilled > 0m || _items.Any(i => i.BilledQty > 0)) return "Partially Billed";
+            return "To Bill";
+        }
+    }
+
+    protected PurchaseReceipt() { }
+
+    public PurchaseReceipt(Guid id, Guid companyId, Guid supplierId, Guid warehouseId, string receiptNumber, DateTime postingDate, Guid? tenantId = null)
+        : base(id)
+    {
+        CompanyId = Check.NotDefaultOrNull<Guid>(companyId, nameof(companyId));
+        SupplierId = Check.NotDefaultOrNull<Guid>(supplierId, nameof(supplierId));
+        WarehouseId = Check.NotDefaultOrNull<Guid>(warehouseId, nameof(warehouseId));
+        ReceiptNumber = Check.NotNullOrWhiteSpace(receiptNumber, nameof(receiptNumber), 50);
+        PostingDate = postingDate;
+        TenantId = tenantId;
+    }
+
+    /// <summary>
+    /// Adds a received line. <paramref name="warehouseId"/> is an item-level override of the
+    /// receipt's target warehouse — set by putaway allocation, which splits one ordered qty across
+    /// several warehouses. Null keeps the receipt-level warehouse.
+    /// Supports rejected quantity per ERPNext PR #58885 / commit 3761eb8cbe.
+    /// </summary>
+    public void AddItem(
+        Guid itemId,
+        string description,
+        decimal quantity,
+        decimal unitPrice,
+        decimal taxAmount,
+        string uom = "Unit",
+        Guid? purchaseOrderItemId = null,
+        Guid? warehouseId = null,
+        decimal rejectedQty = 0,
+        Guid? rejectedWarehouseId = null,
+        decimal receivedQty = 0,
+        Guid? fromWarehouseId = null,
+        Guid? materialRequestItemId = null,
+        bool returnQtyFromRejectedWarehouse = false)
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        // Per DO-NOT: returns must always have negative qty or negative rejected qty (PR #59280 / commit b3d55db893)
+        if (!IsReturn && quantity <= 0 && rejectedQty <= 0)
+            throw new ArgumentException("Quantity or RejectedQty must be positive for non-return receipts.", nameof(quantity));
+        if (IsReturn && (quantity > 0 || rejectedQty > 0 || (quantity == 0 && rejectedQty == 0)))
+            throw new ArgumentException("Quantity or RejectedQty must be negative for return receipts.", nameof(quantity));
+
+        var item = new PurchaseReceiptItem(
+            Guid.NewGuid(), Id, itemId, description, quantity, unitPrice, taxAmount, uom, purchaseOrderItemId, materialRequestItemId)
+        {
+            WarehouseId = warehouseId,
+            FromWarehouseId = fromWarehouseId,
+            RejectedQty = rejectedQty,
+            RejectedWarehouseId = rejectedWarehouseId,
+            ReturnQtyFromRejectedWarehouse = returnQtyFromRejectedWarehouse,
+            ReceivedQty = receivedQty != 0 ? receivedQty : (quantity + rejectedQty),
+        };
+        item.Idx = _items.Count;
+        _items.Add(item);
+
+        RecalculateTotals();
+    }
+
+    public void ClearItems()
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        _items.Clear();
+        RecalculateTotals();
+    }
+
+    public void ValidatePostingDateWithPo(DateTime poTransactionDate)
+    {
+        if (PostingDate.Date < poTransactionDate.Date)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Posting Date cannot be before the linked Purchase Order date.");
+        }
+    }
+
+    public void Submit()
+    {
+        if (Status != DocumentStatus.Draft)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        if (!_items.Any())
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        var maxAllowedDate = DateTime.Today > DateTime.UtcNow.Date ? DateTime.Today : DateTime.UtcNow.Date;
+        if (PostingDate.Date > maxAllowedDate)
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Posting Date cannot be in the future for Purchase Receipts.");
+        }
+
+        // Validate from_warehouse, UOM conversion factor, and accepted/rejected quantities per ERPNext buying/stock controller
+        foreach (var item in _items)
+        {
+            item.ValidateAcceptedRejectedQty(IsReturn);
+
+            var targetWarehouse = item.WarehouseId ?? WarehouseId;
+
+            // Validate rejected warehouse per ERPNext buying/subcontracting controller
+            if (item.RejectedQty != 0 && !item.RejectedWarehouseId.HasValue)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Rejected Warehouse is mandatory for rejected Item {item.Description}.");
+            }
+
+            if (item.RejectedWarehouseId.HasValue && item.RejectedWarehouseId.Value == targetWarehouse)
+            {
+                throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                    .WithData("detail", $"Accepted Warehouse and Rejected Warehouse cannot be the same for Item {item.Description}.");
+            }
+
+            // Auto-correct conversion factor when UOM equals StockUOM (gotcha #6171)
+            if (!string.IsNullOrEmpty(item.Uom) && !string.IsNullOrEmpty(item.StockUom)
+                && string.Equals(item.Uom, item.StockUom, StringComparison.OrdinalIgnoreCase)
+                && item.ConversionFactor != 1.0m)
+            {
+                item.ConversionFactor = 1.0m;
+            }
+
+            // From Warehouse validation (gotcha #6179)
+            if (item.FromWarehouseId.HasValue)
+            {
+                if (IsSubcontracted)
+                    throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                        .WithData("detail", "From Warehouse cannot be set for subcontracted receipts.");
+
+                if (item.FromWarehouseId.Value == targetWarehouse)
+                    throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                        .WithData("detail", "From Warehouse and Target Warehouse cannot be the same.");
+            }
+        }
+
+        if (IsReturn && !_items.Any(i => i.Quantity < 0 || i.RejectedQty < 0))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "At least one item must be entered with negative quantity in a return document.");
+        }
+
+        Status = DocumentStatus.Submitted;
+    }
+
+    public void Cancel()
+    {
+        if (Status != DocumentStatus.Submitted)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+
+        Status = DocumentStatus.Cancelled;
+    }
+
+    /// <summary>Closes an individual item row (per ERPNext PR #57596).</summary>
+    public void CloseItem(Guid itemRowId)
+    {
+        var item = _items.FirstOrDefault(i => i.Id == itemRowId);
+        if (item == null || item.IsClosed) return;
+        if (Math.Abs(item.BilledQty) >= Math.Abs(item.Quantity))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", $"Item {item.Description} is already completed in full, so there is nothing to close.");
+        }
+        item.IsClosed = true;
+        if (_items.All(i => i.IsClosed))
+        {
+            Status = DocumentStatus.Closed;
+        }
+    }
+
+    /// <summary>Reopens an individual item row.</summary>
+    public void ReopenItem(Guid itemRowId)
+    {
+        var item = _items.FirstOrDefault(i => i.Id == itemRowId);
+        if (item == null || !item.IsClosed) return;
+        item.IsClosed = false;
+        if (Status == DocumentStatus.Closed)
+        {
+            Status = DocumentStatus.Submitted;
+        }
+    }
+
+    /// <summary>Closes the Purchase Receipt.</summary>
+    public void Close()
+    {
+        if (Status != DocumentStatus.Submitted)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        Status = DocumentStatus.Closed;
+    }
+
+    /// <summary>Reopens a closed Purchase Receipt.</summary>
+    public void Reopen()
+    {
+        if (Status != DocumentStatus.Closed)
+            throw new BusinessException(MyERPDomainErrorCodes.InvalidStatusTransition);
+        if (_items.Count > 0 && _items.All(i => i.IsClosed))
+        {
+            throw new BusinessException(MyERPDomainErrorCodes.ValidationFailed)
+                .WithData("detail", "Every row of Purchase Receipt is closed. Reopen the rows you need instead.");
+        }
+        Status = DocumentStatus.Submitted;
+    }
+
+    private void RecalculateTotals()
+    {
+        NetTotal = _items.Sum(i => i.LineTotal);
+        TaxAmount = _items.Sum(i => i.TaxAmount);
+        GrandTotal = NetTotal + TaxAmount;
+    }
+}

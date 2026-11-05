@@ -1,0 +1,44 @@
+//-----------------------------------------------------------------------
+// <copyright file="ItemTaxGroup.cs" company="AccountGo">
+// Copyright (c) 2015-2026 Marvin Perez and AccountGo contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+// <author>Marvin Perez</author>
+// <date>1/11/2015 9:48:38 AM</date>
+// </copyright>
+//-----------------------------------------------------------------------
+
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace Core.Domain.TaxSystem
+{
+    [Table("ItemTaxGroup")]
+    public partial class ItemTaxGroup : BaseEntity, ICompanyOwned
+    {
+        public ItemTaxGroup()
+        {
+            ItemTaxGroupTax = new HashSet<ItemTaxGroupTax>();
+        }
+
+        public int CompanyId { get; set; }
+        public string Name { get; set; }
+
+        [Display(Name = "Fully Exempt")]
+        public bool IsFullyExempt { get; set; }
+
+        public virtual ICollection<ItemTaxGroupTax> ItemTaxGroupTax { get; set; }
+    }
+
+    [Table("ItemTaxGroupTax")]
+    public partial class ItemTaxGroupTax : BaseEntity, ICompanyOwned
+    {
+        public int CompanyId { get; set; }
+        public int TaxId { get; set; }
+        public int ItemTaxGroupId { get; set; }
+        public bool IsExempt { get; set; }
+        
+        public virtual Tax Tax { get; set; }
+        public virtual ItemTaxGroup ItemTaxGroup { get; set; }
+    }
+}

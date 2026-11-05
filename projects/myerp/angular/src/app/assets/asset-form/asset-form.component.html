@@ -1,0 +1,161 @@
+<abp-page [title]="(isEdit() ? ('::Edit' | abpLocalization) : ('::Assets:NewAsset' | abpLocalization))">
+  <form [formGroup]="form" (ngSubmit)="save()">
+    <div class="card mb-3">
+      <div class="card-header">
+        <h5 class="card-title mb-0">{{ '::GeneralInformation' | abpLocalization }}</h5>
+      </div>
+      <div class="card-body">
+        <div class="row">
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::Company' | abpLocalization }} <span class="text-danger">*</span></label>
+            <select class="form-select" formControlName="companyId"
+              [class.is-invalid]="form.get('companyId')?.invalid && form.get('companyId')?.touched">
+              <option value="">{{ '::SelectCompany' | abpLocalization }}</option>
+              @for (c of companies(); track c.id) {
+                <option [value]="c.id">{{ c.name }}</option>
+              }
+            </select>
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::Name' | abpLocalization }} <span class="text-danger">*</span></label>
+            <input type="text" class="form-control" formControlName="assetName"
+              [class.is-invalid]="form.get('assetName')?.invalid && form.get('assetName')?.touched" />
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::AssetCategory' | abpLocalization }}</label>
+            <select class="form-select" formControlName="assetCategoryId">
+              <option [ngValue]="null">—</option>
+              @for (cat of categories(); track cat.id) {
+                <option [ngValue]="cat.id">{{ cat.categoryName }}</option>
+              }
+            </select>
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::Item' | abpLocalization }}</label>
+            <app-item-picker formControlName="itemId" [companyId]="form.get('companyId')?.value || null" />
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::Location' | abpLocalization }}</label>
+            <select class="form-select" formControlName="locationId">
+              <option [ngValue]="null">—</option>
+              @for (loc of locations(); track loc.id) {
+                <option [ngValue]="loc.id">{{ loc.locationName }}</option>
+              }
+            </select>
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::Custodian' | abpLocalization }}</label>
+            <select class="form-select" formControlName="custodianEmployeeId">
+              <option [ngValue]="null">—</option>
+              @for (emp of employees(); track emp.id) {
+                <option [ngValue]="emp.id">{{ emp.fullName || emp.firstName || emp.employeeId }}</option>
+              }
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header">
+        <h5 class="card-title mb-0">{{ '::PurchaseDetails' | abpLocalization }}</h5>
+      </div>
+      <div class="card-body">
+        <div class="row">
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::Assets:PurchaseDate' | abpLocalization }} <span class="text-danger">*</span></label>
+            <input type="date" class="form-control" formControlName="purchaseDate" />
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::AvailableForUseDate' | abpLocalization }}</label>
+            <input type="date" class="form-control" formControlName="availableForUseDate" />
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::Assets:PurchaseAmount' | abpLocalization }} <span class="text-danger">*</span></label>
+            <input type="number" class="form-control" formControlName="purchaseAmount" min="0" step="0.01" />
+          </div>
+          <div class="col-12 col-md-6 mb-3">
+            <label class="form-label">{{ '::AdditionalCost' | abpLocalization }}</label>
+            <input type="number" class="form-control" formControlName="additionalCost" min="0" step="0.01" />
+          </div>
+          @if (!isEdit()) {
+            <div class="col-12 col-md-6 mb-3">
+              <label class="form-label">{{ '::Assets:AssetQuantity' | abpLocalization }}</label>
+              <input type="number" class="form-control" formControlName="assetQuantity" min="1" step="1" />
+              <small class="form-text text-muted">{{ '::Assets:AssetQuantityHint' | abpLocalization }}</small>
+            </div>
+          }
+        </div>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="card-title mb-0">{{ '::Depreciation' | abpLocalization }}</h5>
+        <div class="form-check form-switch mb-0">
+          <input class="form-check-input" type="checkbox" id="calcDeprSwitch" formControlName="calculateDepreciation" />
+          <label class="form-check-label" for="calcDeprSwitch">{{ '::CalculateDepreciation' | abpLocalization }}</label>
+        </div>
+      </div>
+      @if (form.get('calculateDepreciation')?.value) {
+        <div class="card-body">
+          <div class="row">
+            <div class="col-12 col-md-6 mb-3">
+              <label class="form-label">{{ '::DepreciationMethod' | abpLocalization }}</label>
+              <select class="form-select" formControlName="depreciationMethod">
+                @for (m of depreciationMethods; track m.value) {
+                  <option [ngValue]="m.value">{{ m.key }}</option>
+                }
+              </select>
+            </div>
+            <div class="col-12 col-md-6 mb-3">
+              <label class="form-label">{{ '::UsefulLife' | abpLocalization }}</label>
+              <div class="input-group">
+                <input type="number" class="form-control" formControlName="usefulLifeMonths" min="1" />
+                <span class="input-group-text">months</span>
+              </div>
+            </div>
+            <div class="col-12 col-md-4 mb-3">
+              <label class="form-label">{{ '::DepreciationRate' | abpLocalization }} (%)</label>
+              <div class="input-group">
+                <input type="number" class="form-control" formControlName="depreciationRate" min="0" max="100" step="0.01" />
+                <span class="input-group-text">%</span>
+              </div>
+            </div>
+            <div class="col-12 col-md-4 mb-3">
+              <label class="form-label">{{ '::Frequency' | abpLocalization }}</label>
+              <div class="input-group">
+                <input type="number" class="form-control" formControlName="frequencyMonths" min="1" />
+                <span class="input-group-text">months</span>
+              </div>
+            </div>
+            <div class="col-12 col-md-4 mb-3">
+              <label class="form-label">{{ '::OpeningAccumulatedDepreciation' | abpLocalization }}</label>
+              <input type="number" class="form-control" formControlName="openingAccumulatedDepreciation" min="0" step="0.01" />
+            </div>
+          </div>
+        </div>
+      }
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header">
+        <h5 class="card-title mb-0">{{ '::Notes' | abpLocalization }}</h5>
+      </div>
+      <div class="card-body">
+        <textarea class="form-control" formControlName="notes" rows="3" placeholder="Enter asset notes..."></textarea>
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-body d-flex justify-content-end gap-2">
+        <button type="button" class="btn btn-outline-secondary" (click)="cancel()">
+          <i class="fa fa-times me-1"></i> {{ '::Cancel' | abpLocalization }}
+        </button>
+        <button type="submit" class="btn btn-primary" [disabled]="form.invalid">
+          <i class="fa fa-save me-1"></i> {{ '::Save' | abpLocalization }}
+        </button>
+      </div>
+    </div>
+  </form>
+</abp-page>
